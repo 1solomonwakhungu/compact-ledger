@@ -13,27 +13,24 @@ Long coding sessions hit context compaction right when precision matters most. L
 
 - **Zero LLM calls** — 100% deterministic, local, reproducible output.
 - **Zero third-party runtime dependencies** — Python `>=3.11` standard library only.
-- **Fast (<50 ms)** — linear-time scanning and atomic JSON storage.
-- **Fail-open hooks** — hook commands exit `0` without polluting stdout on malformed input or unexpected errors (unless `--strict` is passed) so a hook issue never disrupts a live agent session.
+- **Linear-time & lightweight** — O(N) scanning with atomic JSON storage (runs all 20 seeded eval cases in ~30 ms and scales linearly with transcript size).
+- **Fail-open hooks** — hook commands exit `0` without polluting stdout on malformed input, bad flags, broken pipes, or unexpected errors (unless `--strict` is passed) so a hook issue never disrupts a live agent session.
 
 ---
 
 ## Installation
 
-Run without permanent installation using [`uvx`](https://docs.astral.sh/uv/):
+Install directly from GitHub today with `uv` or `pip` (or via `uvx` / PyPI once published):
 
 ```bash
-uvx compact-ledger --version
-```
+# Run directly with uvx (from GitHub)
+uvx --from git+https://github.com/1solomonwakhungu/compact-ledger.git compact-ledger --version
 
-Install globally as a CLI tool:
-
-```bash
-# Recommended (uv)
-uv tool install compact-ledger
+# Install globally as a CLI tool (uv)
+uv tool install git+https://github.com/1solomonwakhungu/compact-ledger.git
 
 # Or via pip
-pip install compact-ledger
+pip install git+https://github.com/1solomonwakhungu/compact-ledger.git
 ```
 
 Local development from source:
@@ -125,8 +122,8 @@ Store location precedence for hooks: `--store-dir` > `COMPACT_LEDGER_DIR` env va
 - [DO NOT] [turn 2] Never touch migrations under db/migrations/.
 
 ### Active Test Failures & Thrash Warnings
-- [OSCILLATING] tests/test_billing.py::test_tax_cap (pytest): OSCILLATING: tests/test_billing.py::test_tax_cap [400 -> 200 -> 400; expected 100]
-- [PROGRESSING] tests/test_billing.py::test_proration (pytest): PROGRESSING: tests/test_billing.py::test_proration [400 -> 200 -> 150; expected 100]
+- [OSCILLATING] tests/test_billing.py::test_tax_cap (pytest): OSCILLATING: tests/test_billing.py::test_tax_cap [400 -> 200 -> 400; expected 100] @ tests/test_billing.py:88
+- [PROGRESSING] tests/test_billing.py::test_proration (pytest): PROGRESSING: tests/test_billing.py::test_proration [400 -> 200 -> 150; expected 100] @ tests/test_billing.py:42
 - [THRASH/REVERT] src/billing/tax.py (2 edits, 3 failures): Reverted prior edit from turn 8 on src/billing/tax.py while failures persisted (2 edits, 3 failures)
 
 ### Modified Files

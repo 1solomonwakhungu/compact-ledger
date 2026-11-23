@@ -10,8 +10,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shlex
-import sys
+import stat
 import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ DEFAULT_CLAUDE_SETTINGS_RELPATH = Path(".claude") / "settings.json"
 SESSION_START_SOURCES: frozenset[str] = frozenset({"compact", "resume"})
 SESSION_START_MATCHER = "compact|resume"
 _MAX_STDIN_BYTES = 4 * 1024 * 1024  # 4 MiB hard cap for hook stdin payloads
+_COMPACTION_MATCHER_RE = re.compile(r"(?:^|\|)(?:compact|resume)(?:\||$)", re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -71,25 +73,27 @@ def _read_stream_bytes(stream: TextIO | BinaryIO, *, max_bytes: int = _MAX_STDIN
     return str(data).encode("utf-8", errors="surrogatepass")
 
 
-def _parse_hook_stdin(raw_input: str | bytes | TextIO | BinaryIO) -> dict[str, Any]:
+def _parse_hook_stdin(raw_input: str | bytes | TextIO | BinaryIO | None) -> dict[str, Any]:
     """Parse a Claude Code hook JSON object payload from raw bytes, text, or a stream."""
+    if raw_input is None:
+        raise ValueError("Hook stdin stream is closed")
     if isinstance(raw_input, bytes):
         if len(raw_input) > _MAX_STDIN_BYTES:
             raise ValueError(f"Hook stdin payload exceeds {_MAX_STDIN_BYTES} bytes")
         try:
-            text = raw_input.decode("utf-8")
+            text = raw_input.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             raise ValueError(f"Hook stdin is not valid UTF-8: {exc}") from exc
     elif isinstance(raw_input, str):
         if len(raw_input.encode("utf-8", errors="surrogatepass")) > _MAX_STDIN_BYTES:
             raise ValueError(f"Hook stdin payload exceeds {_MAX_STDIN_BYTES} bytes")
-        text = raw_input
+        text = raw_input.removeprefix("\ufeff")
     else:
         raw_bytes = _read_stream_bytes(raw_input)
         if len(raw_bytes) > _MAX_STDIN_BYTES:
             raise ValueError(f"Hook stdin payload exceeds {_MAX_STDIN_BYTES} bytes")
         try:
-            text = raw_bytes.decode("utf-8")
+            text = raw_bytes.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             raise ValueError(f"Hook stdin is not valid UTF-8: {exc}") from exc
 
@@ -131,7 +135,7 @@ def resolve_hook_store(
 
     Precedence:
     1. Explicit ``store_dir`` (``--store-dir``)
-    2. ``COMPACT_LEDGER_DIR`` environment variable
+    2. ``COMPACT_LEDGER_DIR`` environment variable (when non-whitespace)
     3. Payload ``cwd`` (when it points to an existing directory)
     4. ``fallback_cwd`` or current working directory (``Path.cwd()``)
     """
@@ -140,8 +144,8 @@ def resolve_hook_store(
 
     env_map = os.environ if env is None else env
     env_dir = env_map.get(ENV_STORE_DIR)
-    if env_dir:
-        return SessionStore(store_dir=env_dir)
+    if env_dir and env_dir.strip():
+        return SessionStore(store_dir=env_dir.strip())
 
     valid_cwd = _is_valid_existing_dir(payload_cwd)
     if valid_cwd is not None:
@@ -252,7 +256,7 @@ def _is_snapshot_non_empty(snapshot: CompactionSnapshot) -> bool:
 
 
 def handle_pre_compact(
-    raw_input: str | bytes | TextIO | BinaryIO,
+    raw_input: str | bytes | TextIO | BinaryIO | None,
     *,
     store_dir: str | Path | None = None,
     strict: bool = False,
@@ -300,7 +304,7 @@ def handle_pre_compact(
 
 
 def handle_session_start(
-    raw_input: str | bytes | TextIO | BinaryIO,
+    raw_input: str | bytes | TextIO | BinaryIO | None,
     *,
     store_dir: str | Path | None = None,
     max_chars: int = DEFAULT_MAX_CHARS,
@@ -370,43 +374,57 @@ def _validate_command_prefix(command: str) -> str:
         raise ValueError("--command must be a non-empty command string")
     if "\x00" in command or "\n" in command or "\r" in command:
         raise ValueError("--command must be a single-line command without control characters")
-    return command.strip()
+    trimmed = command.strip()
+    if any(ch.isspace() for ch in trimmed):
+        # If the user passed an unquoted filesystem path with spaces, shell-quote it safely
+        # while leaving multi-token commands like "uvx compact-ledger" intact.
+        with contextlib.suppress(OSError):
+            if Path(trimmed).expanduser().is_file():
+                return shlex.quote(trimmed)
+    return trimmed
 
 
 def _hook_command_for(command_prefix: str, hook_subcommand: str) -> str:
     return f"{command_prefix} hook {hook_subcommand}"
 
 
-def _is_compact_ledger_hook_entry(
+def _parse_tokens(cmd: str) -> list[str]:
+    try:
+        return shlex.split(cmd)
+    except ValueError:
+        return cmd.split()
+
+
+def _match_compact_ledger_hook(
     hook_item: Any,
     hook_subcommand: str,
     *,
-    expected_command: str | None = None,
-) -> bool:
-    """Return True if ``hook_item`` is a compact-ledger command hook for ``hook_subcommand``."""
+    expected_prefix_tokens: list[str],
+) -> tuple[bool, list[str]]:
+    """Check if ``hook_item`` is a compact-ledger command hook for ``hook_subcommand``.
+
+    Returns ``(is_match, trailing_args)`` where ``trailing_args`` preserves any
+    user-supplied CLI flags after ``hook <hook_subcommand>`` (such as
+    ``--max-chars``, ``--store-dir``, ``--strict``, or ``--always``).
+    """
     if not isinstance(hook_item, dict):
-        return False
+        return False, []
     if hook_item.get("type") != "command":
-        return False
+        return False, []
     cmd = hook_item.get("command")
     if not isinstance(cmd, str) or not cmd.strip():
-        return False
+        return False, []
 
-    if expected_command is not None and cmd.strip() == expected_command.strip():
-        return True
-
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        tokens = cmd.split()
-
+    tokens = _parse_tokens(cmd)
     if len(tokens) < 3:
-        return False
+        return False, []
 
-    # Look for "hook <subcommand>" paired with compact-ledger / compact_ledger in preceding tokens.
     for idx in range(len(tokens) - 1):
         if tokens[idx] == "hook" and tokens[idx + 1] == hook_subcommand:
             prefix_tokens = tokens[:idx]
+            trailing = tokens[idx + 2 :]
+            if prefix_tokens == expected_prefix_tokens:
+                return True, trailing
             for tok in prefix_tokens:
                 base = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
                 if (
@@ -418,8 +436,22 @@ def _is_compact_ledger_hook_entry(
                     )
                     or "compact-ledger" in base
                 ):
-                    return True
-    return False
+                    return True, trailing
+    return False, []
+
+
+def _matcher_covers_event(event_name: str, matcher_value: Any) -> bool:
+    """Return True if ``matcher_value`` fires for compact-ledger's target lifecycle events."""
+    if event_name != "SessionStart":
+        return True
+    if matcher_value is None:
+        return True
+    if not isinstance(matcher_value, str):
+        return False
+    stripped = matcher_value.strip()
+    if stripped in ("", "*", ".*"):
+        return True
+    return bool(_COMPACTION_MATCHER_RE.search(stripped))
 
 
 def build_claude_code_hooks_config(
@@ -462,9 +494,16 @@ def _upsert_event_hook(
     event_name: str,
     matcher: str,
     hook_subcommand: str,
-    full_command: str,
+    command_prefix: str,
 ) -> None:
-    """Idempotently insert or update compact-ledger's hook entry for ``event_name``."""
+    """Idempotently insert or update compact-ledger's hook entry for ``event_name``.
+
+    - Never modifies unrelated hooks or their matchers.
+    - Preserves user-supplied CLI flags (e.g. ``--max-chars``, ``--store-dir``,
+      ``--strict``, ``--always``) and existing matchers on compact-ledger hooks.
+    - For ``SessionStart``, leaves non-compaction custom entries (such as a
+      ``startup`` matcher) untouched and ensures a compaction-covering entry exists.
+    """
     existing_entries = hooks_dict.get(event_name)
     if existing_entries is None:
         event_list: list[Any] = []
@@ -476,49 +515,61 @@ def _upsert_event_hook(
             f"got {type(existing_entries).__name__}"
         )
 
-    new_hook_obj = {"type": "command", "command": full_command}
+    base_command = _hook_command_for(command_prefix, hook_subcommand)
+    expected_prefix_tokens = _parse_tokens(command_prefix)
     found = False
     updated_entries: list[Any] = []
 
     for entry in event_list:
-        if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
-            entry_hooks = list(entry["hooks"])
-            new_entry_hooks: list[Any] = []
-            entry_had_match = False
-            for h in entry_hooks:
-                if _is_compact_ledger_hook_entry(
-                    h,
-                    hook_subcommand,
-                    expected_command=full_command,
-                ):
-                    entry_had_match = True
-                    if not found:
-                        updated_h = dict(h)
-                        updated_h["type"] = "command"
-                        updated_h["command"] = full_command
-                        new_entry_hooks.append(updated_h)
-                        found = True
-                    # Drop any duplicate compact-ledger hooks for the same event.
-                else:
-                    new_entry_hooks.append(h)
-
-            if entry_had_match and not new_entry_hooks:
-                # Entry only held duplicate compact-ledger hook(s); drop empty wrapper.
-                continue
-
-            entry_copy = dict(entry)
-            entry_copy["hooks"] = new_entry_hooks
-            if entry_had_match and len(new_entry_hooks) == 1:
-                entry_copy["matcher"] = matcher
-            updated_entries.append(entry_copy)
-        else:
+        if not (isinstance(entry, dict) and isinstance(entry.get("hooks"), list)):
             updated_entries.append(entry)
+            continue
+
+        # Leave SessionStart entries with non-compaction matchers (e.g. "startup") untouched.
+        if not _matcher_covers_event(event_name, entry.get("matcher")):
+            updated_entries.append(entry)
+            continue
+
+        entry_hooks = list(entry["hooks"])
+        new_entry_hooks: list[Any] = []
+        entry_had_match = False
+
+        for h in entry_hooks:
+            is_match, trailing_args = _match_compact_ledger_hook(
+                h,
+                hook_subcommand,
+                expected_prefix_tokens=expected_prefix_tokens,
+            )
+            if is_match:
+                entry_had_match = True
+                if not found:
+                    rebuilt = (
+                        f"{base_command} {shlex.join(trailing_args)}"
+                        if trailing_args
+                        else base_command
+                    )
+                    updated_h = dict(h)
+                    updated_h["type"] = "command"
+                    updated_h["command"] = rebuilt
+                    new_entry_hooks.append(updated_h)
+                    found = True
+                # Drop any duplicate compact-ledger hooks for the same event.
+            else:
+                new_entry_hooks.append(h)
+
+        if entry_had_match and not new_entry_hooks:
+            # Entry only held duplicate compact-ledger hook(s); drop empty wrapper.
+            continue
+
+        entry_copy = dict(entry)
+        entry_copy["hooks"] = new_entry_hooks
+        updated_entries.append(entry_copy)
 
     if not found:
         updated_entries.append(
             {
                 "matcher": matcher,
-                "hooks": [new_hook_obj],
+                "hooks": [{"type": "command", "command": base_command}],
             }
         )
 
@@ -553,21 +604,30 @@ def merge_claude_code_settings(
         event_name="PreCompact",
         matcher="",
         hook_subcommand="pre-compact",
-        full_command=_hook_command_for(prefix, "pre-compact"),
+        command_prefix=prefix,
     )
     _upsert_event_hook(
         hooks_dict,
         event_name="SessionStart",
         matcher=SESSION_START_MATCHER,
         hook_subcommand="session-start",
-        full_command=_hook_command_for(prefix, "session-start"),
+        command_prefix=prefix,
     )
 
     merged["hooks"] = hooks_dict
     return merged
 
 
-def _atomic_write_text(target: Path, content: str) -> None:
+def _reject_json_constant(token: str) -> Any:
+    raise ValueError(f"Non-standard JSON constant {token!r} is not allowed")
+
+
+def _atomic_write_text(target: Path, content: str, *, mode: int | None = None) -> None:
+    if target.is_symlink():
+        raise ValueError(f"Refusing to overwrite symlinked settings file: {target}")
+    if target.parent.is_symlink():
+        raise ValueError(f"Refusing to use symlinked settings directory: {target.parent}")
+
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Path | None = None
     try:
@@ -583,6 +643,9 @@ def _atomic_write_text(target: Path, content: str) -> None:
             tmp_file.write(content)
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
+        target_mode = mode if mode is not None else 0o644
+        with contextlib.suppress(OSError):
+            os.chmod(tmp_path, target_mode)
         os.replace(tmp_path, target)
         tmp_path = None
         if hasattr(os, "O_RDONLY"):
@@ -608,8 +671,8 @@ def init_claude_code_settings(
     """Build or merge Claude Code settings and optionally write them atomically.
 
     Returns ``(merged_config, resolved_settings_path, wrote_file)``.
-    Raises ``ValueError`` if the existing settings file contains invalid JSON or
-    a non-object top-level structure (never corrupting the existing file).
+    Raises ``ValueError`` if the settings path is a symlink or contains invalid
+    JSON or a non-object top-level structure (never corrupting the existing file).
     """
     prefix = _validate_command_prefix(command)
     if settings_path is not None:
@@ -618,10 +681,18 @@ def init_claude_code_settings(
         base = cwd if cwd is not None else Path.cwd()
         target = base / DEFAULT_CLAUDE_SETTINGS_RELPATH
 
+    if target.is_symlink():
+        raise ValueError(f"Refusing to operate on symlinked settings file: {target}")
+    if target.parent.is_symlink():
+        raise ValueError(f"Refusing to operate on symlinked settings directory: {target.parent}")
+
     existing_data: dict[str, Any] | None = None
+    existing_mode: int | None = None
     if target.exists():
         if not target.is_file():
             raise ValueError(f"Settings path exists but is not a regular file: {target}")
+        with contextlib.suppress(OSError):
+            existing_mode = stat.S_IMODE(target.stat().st_mode)
         try:
             raw_text = target.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError) as exc:
@@ -632,7 +703,7 @@ def init_claude_code_settings(
                 f"Existing settings file {target} is empty (invalid JSON); refusing to overwrite."
             )
         try:
-            parsed = json.loads(raw_text)
+            parsed = json.loads(raw_text, parse_constant=_reject_json_constant)
         except (json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ValueError(
                 f"Existing settings file {target} contains invalid JSON: {exc}"
@@ -645,17 +716,13 @@ def init_claude_code_settings(
         existing_data = parsed
 
     merged = merge_claude_code_settings(existing_data, command=prefix)
+    try:
+        serialized = json.dumps(merged, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Merged settings contain non-JSON values: {exc}") from exc
+
     if write:
-        serialized = json.dumps(merged, indent=2, ensure_ascii=False) + "\n"
-        _atomic_write_text(target, serialized)
+        _atomic_write_text(target, serialized, mode=existing_mode)
         return merged, target, True
 
     return merged, target, False
-
-
-def _emit_hook_result(result: HookResult) -> int:
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-    if result.stdout:
-        sys.stdout.write(result.stdout)
-    return result.exit_code

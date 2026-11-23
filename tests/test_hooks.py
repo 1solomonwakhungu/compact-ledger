@@ -536,3 +536,295 @@ def test_hook_handles_text_io_stream_directly(tmp_path: Path) -> None:
     res = handle_session_start(stream, store_dir=store_dir, env={})
     assert res.exit_code == 0
     assert "Stream pin works." in json.loads(res.stdout)["hookSpecificOutput"]["additionalContext"]
+
+
+def test_hook_fail_open_on_bad_flags_broken_pipe_and_closed_fds(tmp_path: Path) -> None:
+    import os
+
+    store_dir = tmp_path / "fd-store"
+    store = SessionStore(store_dir=store_dir)
+    store.add_manual_pin("fd-s1", "Keep hooks fail-open under all I/O faults.")
+
+    # 1. Bad CLI flags exit 0 without --strict and exit 2 with --strict
+    bad_flag_invocations = [
+        ["hook", "pre-compact", "--bogus"],
+        ["hook", "session-start", "--max-chars", "abc"],
+        ["hook", "session-start", "--max-chars"],
+        ["hook", "pre-compact", "extra-positional"],
+        ["--store-dir", str(store_dir), "hook", "session-start", "--unknown-flag"],
+    ]
+    for argv in bad_flag_invocations:
+        proc_open = subprocess.run(
+            [sys.executable, "-m", "compact_ledger", *argv],
+            input=b"{}",
+            capture_output=True,
+            check=False,
+        )
+        assert proc_open.returncode == 0, f"Expected fail-open exit 0 for {argv}: {proc_open}"
+        assert proc_open.stdout == b""
+
+        proc_strict = subprocess.run(
+            [sys.executable, "-m", "compact_ledger", *argv, "--strict"],
+            input=b"{}",
+            capture_output=True,
+            check=False,
+        )
+        assert proc_strict.returncode == 2, f"Expected strict exit 2 for {argv}: {proc_strict}"
+
+    # 2. Broken stdout pipe (reader closes immediately) must exit 0, NOT 120
+    payload = json.dumps({"session_id": "fd-s1", "source": "compact"}).encode("utf-8")
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        broken_pipe_proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "compact_ledger",
+                "hook",
+                "session-start",
+                "--store-dir",
+                str(store_dir),
+            ],
+            input=payload,
+            stdout=write_fd,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+    finally:
+        os.close(write_fd)
+    assert broken_pipe_proc.returncode == 0, broken_pipe_proc.stderr
+
+    # 3. Closed stdout (>&-) on session-start exits 0 without traceback
+    closed_out = subprocess.run(
+        f'"{sys.executable}" -m compact_ledger hook session-start --store-dir "{store_dir}" >&-',
+        shell=True,
+        input=payload,
+        capture_output=True,
+        check=False,
+    )
+    assert closed_out.returncode == 0, closed_out.stderr
+    assert b"Traceback" not in closed_out.stderr
+
+    # 4. Closed stderr (2>&-) on malformed stdin and bad flags exits 0 for both hooks
+    for sub in ("pre-compact", "session-start"):
+        closed_err = subprocess.run(
+            f'"{sys.executable}" -m compact_ledger hook {sub} --store-dir "{store_dir}" 2>&-',
+            shell=True,
+            input=b"{broken-json",
+            capture_output=True,
+            check=False,
+        )
+        assert closed_err.returncode == 0
+        assert closed_err.stdout == b""
+
+        closed_err_bad_flag = subprocess.run(
+            f'"{sys.executable}" -m compact_ledger hook {sub} --bogus 2>&-',
+            shell=True,
+            input=b"{}",
+            capture_output=True,
+            check=False,
+        )
+        assert closed_err_bad_flag.returncode == 0
+        assert closed_err_bad_flag.stdout == b""
+
+        closed_in = subprocess.run(
+            f'"{sys.executable}" -m compact_ledger hook {sub} --store-dir "{store_dir}" <&-',
+            shell=True,
+            capture_output=True,
+            check=False,
+        )
+        assert closed_in.returncode == 0
+        assert closed_in.stdout == b""
+
+
+def test_init_claude_code_refuses_symlinks_preserves_mode_and_rejects_nan(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import stat
+
+    # 1. Valid symlinked settings.json must be refused without touching target or link
+    real_target = tmp_path / "real-settings.json"
+    real_target.write_text('{"model": "original"}\n', encoding="utf-8")
+    link_path = tmp_path / "settings-link.json"
+    link_path.symlink_to(real_target)
+
+    rc = main(["init", "--claude-code", "--write", "--settings-path", str(link_path)])
+    assert rc == 1
+    assert "symlink" in capsys.readouterr().err.lower()
+    assert link_path.is_symlink()
+    assert json.loads(real_target.read_text(encoding="utf-8")) == {"model": "original"}
+
+    # 2. Broken symlink must also be refused without replacing it
+    broken_link = tmp_path / "broken-settings.json"
+    broken_link.symlink_to(tmp_path / "does-not-exist.json")
+    rc = main(["init", "--claude-code", "--write", "--settings-path", str(broken_link)])
+    assert rc == 1
+    assert "symlink" in capsys.readouterr().err.lower()
+    assert broken_link.is_symlink()
+
+    # 3. Symlinked parent directory refused
+    real_dir = tmp_path / "real-claude"
+    real_dir.mkdir()
+    link_dir = tmp_path / "link-claude"
+    link_dir.symlink_to(real_dir)
+    rc = main(
+        ["init", "--claude-code", "--write", "--settings-path", str(link_dir / "settings.json")]
+    )
+    assert rc == 1
+    assert "symlink" in capsys.readouterr().err.lower()
+
+    # 4. Existing file permissions (0o644) are preserved on write
+    regular = tmp_path / "regular-settings.json"
+    regular.write_text('{"model": "keep"}\n', encoding="utf-8")
+    regular.chmod(0o644)
+    rc = main(["init", "--claude-code", "--write", "--settings-path", str(regular)])
+    assert rc == 0
+    capsys.readouterr()
+    assert stat.S_IMODE(regular.stat().st_mode) == 0o644
+
+    # 5. Non-standard JSON values like 1e999 (Infinity) are refused instead of emitting invalid JSON
+    inf_file = tmp_path / "inf-settings.json"
+    inf_file.write_text('{"limit": 1e999}\n', encoding="utf-8")
+    rc = main(["init", "--claude-code", "--write", "--settings-path", str(inf_file)])
+    assert rc == 1
+    assert "Error:" in capsys.readouterr().err
+    assert inf_file.read_text(encoding="utf-8") == '{"limit": 1e999}\n'
+
+
+def test_init_claude_code_merge_preserves_custom_flags_matchers_and_unrelated_hooks(
+    tmp_path: Path,
+) -> None:
+    # 1. Duplicate compact-ledger hook sharing entry with unrelated hook must NOT mutate matcher
+    seed_shared = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "compact",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": (
+                                "compact-ledger hook session-start --max-chars 3000 --strict"
+                            ),
+                        }
+                    ],
+                },
+                {
+                    "matcher": "compact|resume",
+                    "hooks": [
+                        {"type": "command", "command": "compact-ledger hook session-start"},
+                        {"type": "command", "command": "echo unrelated-hook"},
+                    ],
+                },
+            ],
+            "PreCompact": [
+                {
+                    "matcher": "auto",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "compact-ledger hook pre-compact --store-dir /tmp/custom",
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+    merged = merge_claude_code_settings(seed_shared, command="uvx compact-ledger")
+
+    # First SessionStart keeps custom matcher "compact" AND preserves --max-chars 3000 --strict
+    ss_entries = merged["hooks"]["SessionStart"]
+    assert len(ss_entries) == 2
+    assert ss_entries[0]["matcher"] == "compact"
+    assert (
+        ss_entries[0]["hooks"][0]["command"]
+        == "uvx compact-ledger hook session-start --max-chars 3000 --strict"
+    )
+    # Second entry keeps its unrelated hook and does not duplicate compact-ledger
+    assert ss_entries[1]["matcher"] == "compact|resume"
+    assert ss_entries[1]["hooks"] == [{"type": "command", "command": "echo unrelated-hook"}]
+
+    # PreCompact keeps custom matcher "auto" and --store-dir flag
+    pc_entries = merged["hooks"]["PreCompact"]
+    assert len(pc_entries) == 1
+    assert pc_entries[0]["matcher"] == "auto"
+    assert (
+        pc_entries[0]["hooks"][0]["command"]
+        == "uvx compact-ledger hook pre-compact --store-dir /tmp/custom"
+    )
+
+    # 2. Startup entry containing compact-ledger --always + unrelated hook is untouched
+    #    and a compact|resume entry is added cleanly (idempotent on second merge)
+    seed_startup = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "startup",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "compact-ledger hook session-start --always",
+                        },
+                        {"type": "command", "command": "echo unrelated-startup-hook"},
+                    ],
+                }
+            ]
+        }
+    }
+    m1 = merge_claude_code_settings(seed_startup)
+    m2 = merge_claude_code_settings(m1)
+    assert m1 == m2
+    assert m1["hooks"]["SessionStart"][0] == seed_startup["hooks"]["SessionStart"][0]
+    assert len(m1["hooks"]["SessionStart"]) == 2
+    assert m1["hooks"]["SessionStart"][1]["matcher"] == "compact|resume"
+
+
+def test_hook_tight_budget_bom_whitespace_store_and_task_notification_filter(
+    tmp_path: Path,
+) -> None:
+    # 1. Whitespace-only store_dir rejected; whitespace-only COMPACT_LEDGER_DIR ignored
+    with pytest.raises(ValueError, match="non-empty"):
+        SessionStore(store_dir="   ")
+    fallback = tmp_path / "fallback"
+    fallback.mkdir()
+    resolved = resolve_hook_store(
+        store_dir=None,
+        payload_cwd=None,
+        env={ENV_STORE_DIR: "   "},
+        fallback_cwd=fallback,
+    )
+    assert resolved.root_dir == fallback / ".compact-ledger"
+
+    # 2. Tight max_chars in SessionStart genuinely truncates long ledger while keeping manual pin
+    store_dir = tmp_path / "budget-store"
+    store = SessionStore(store_dir=store_dir)
+    store.add_manual_pin("b-sess", "PIN_MUST_SURVIVE")
+    transcript = tmp_path / "t.jsonl"
+    _write_rich_claude_transcript(transcript, session_id="b-sess")
+    pre_res = handle_pre_compact(
+        b"\xef\xbb\xbf"
+        + json.dumps({"session_id": "b-sess", "transcript_path": str(transcript)}).encode("utf-8"),
+        store_dir=store_dir,
+        strict=True,
+        env={},
+    )
+    assert pre_res.exit_code == 0
+
+    full_res = handle_session_start(
+        json.dumps({"session_id": "b-sess", "source": "compact"}),
+        store_dir=store_dir,
+        max_chars=6000,
+        env={},
+    )
+    tight_res = handle_session_start(
+        json.dumps({"session_id": "b-sess", "source": "compact"}),
+        store_dir=store_dir,
+        max_chars=180,
+        env={},
+    )
+    full_ctx = json.loads(full_res.stdout)["hookSpecificOutput"]["additionalContext"]
+    tight_ctx = json.loads(tight_res.stdout)["hookSpecificOutput"]["additionalContext"]
+    assert len(tight_ctx) <= 180 < len(full_ctx)
+    assert "PIN_MUST_SURVIVE" in tight_ctx

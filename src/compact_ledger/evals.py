@@ -291,6 +291,12 @@ def _case_01_negative_constraints_claude_code(tmp: Path) -> None:
     sid = "eval-01"
     records = [
         _cc_user(sid, "Never use mock DB in integration tests.", "2026-02-01T10:00:00Z"),
+        _cc_user(
+            sid,
+            "<task-notification><status>completed</status>"
+            "Must ignore this harness notification.</task-notification>",
+            "2026-02-01T10:00:30Z",
+        ),
         _cc_user(sid, "ok", "2026-02-01T10:01:00Z"),
         _cc_user(
             sid,
@@ -304,7 +310,11 @@ def _case_01_negative_constraints_claude_code(tmp: Path) -> None:
     snap, md, js = _run_pipeline(tmp, records, session_id=sid)
 
     texts = [p.text for p in snap.pins]
-    _require(len(snap.pins) == 3, f"Expected 3 constraints (chatter filtered), got {texts}")
+    _require(len(snap.pins) == 3, f"Expected 3 constraints (chatter/harness filtered), got {texts}")
+    _require(
+        all("task-notification" not in t for t in texts),
+        f"Harness <task-notification> leaked into pins: {texts}",
+    )
     _require(
         "Never use mock DB in integration tests." in md,
         "Negative constraint missing from rendered markdown",
@@ -874,6 +884,13 @@ def _case_15_edit_thrash_hunk_revert_and_stalled_loop(tmp: Path) -> None:
     node = "tests/test_pricing.py::test_total"
     records = [
         _cc_user(sid, "Fix total pricing calculation.", "2026-02-01T10:00:00Z"),
+        *_cc_bash(
+            sid,
+            "t0",
+            "pytest tests/test_pricing.py",
+            _pytest_fail_output(node, "tests/test_pricing.py:10", "200", "100"),
+            is_error=True,
+        ),
         *_cc_edit(sid, "e1", "src/pricing.py", "return total * 2", "return total * 1.5"),
         *_cc_bash(
             sid,
@@ -882,7 +899,7 @@ def _case_15_edit_thrash_hunk_revert_and_stalled_loop(tmp: Path) -> None:
             _pytest_fail_output(node, "tests/test_pricing.py:10", "150", "100"),
             is_error=True,
         ),
-        # Revert back to prior hunk!
+        # Revert back to prior hunk -> value oscillates back to 200!
         *_cc_edit(sid, "e2", "src/pricing.py", "return total * 1.5", "return total * 2"),
         *_cc_bash(
             sid,
@@ -896,7 +913,9 @@ def _case_15_edit_thrash_hunk_revert_and_stalled_loop(tmp: Path) -> None:
     _require(len(snap.thrash_entries) == 1, f"Expected 1 thrash entry, got {snap.thrash_entries}")
     entry = snap.thrash_entries[0]
     _require(entry.path == "src/pricing.py" and entry.reverted is True, str(entry))
-    _require("[THRASH/REVERT]" in md and "src/pricing.py" in md, md)
+    traj = next((t for t in snap.trajectories if t.test_id == node), None)
+    _require(traj is not None and traj.status == "OSCILLATING", f"Expected OSCILLATING: {traj}")
+    _require("[THRASH/REVERT]" in md and "src/pricing.py" in md and "[OSCILLATING]" in md, md)
 
 
 def _case_16_clean_edit_then_pass_no_false_thrash(tmp: Path) -> None:
@@ -974,6 +993,9 @@ def _case_17_tight_budget_pins_survive_400_1200_6000(tmp: Path) -> None:
         manual_pins=[("CRITICAL_PIN: Preserve backward-compatible API.", ["api"], False)],
     )
 
+    full_md = render_snapshot(snap, max_chars=20000, output_format="markdown")
+    _require(len(full_md) > 1200, f"Fixture must exceed 1200 chars to test cap, got {len(full_md)}")
+
     for budget in (400, 1200, 6000):
         md = render_snapshot(snap, max_chars=budget, output_format="markdown")
         js_raw = render_snapshot(snap, max_chars=budget, output_format="json")
@@ -985,9 +1007,11 @@ def _case_17_tight_budget_pins_survive_400_1200_6000(tmp: Path) -> None:
             any("CRITICAL_PIN" in p["text"] for p in js.get("pins", [])),
             f"JSON pin lost at {budget}: {js}",
         )
+        if budget in (400, 1200):
+            _require(len(md) < len(full_md), f"Expected truncation at budget {budget}")
+            _require("July 31" in md, f"Active override should survive at {budget} chars")
         if budget == 400:
             _require("src/module_14.py" not in md, "Low-priority files should be truncated at 400")
-            _require("July 31" in md, "Active override should survive at 400 chars")
 
 
 def _case_18_long_override_does_not_starve_negative_constraints(tmp: Path) -> None:
@@ -1068,6 +1092,7 @@ def _case_19_hook_pre_compact_to_session_start_roundtrip(tmp: Path) -> None:
     pre_res = handle_pre_compact(pre_payload, env={})
     _require(pre_res.exit_code == 0 and pre_res.stdout == "", f"PreCompact failed: {pre_res}")
 
+    full_ctx = ""
     for source in ("compact", "RESUME"):
         start_payload = json.dumps(
             {
@@ -1082,10 +1107,26 @@ def _case_19_hook_pre_compact_to_session_start_roundtrip(tmp: Path) -> None:
         hook_out = parsed_out["hookSpecificOutput"]
         _require(hook_out["hookEventName"] == "SessionStart", str(parsed_out))
         ctx = hook_out["additionalContext"]
+        full_ctx = ctx
         _require(len(ctx) <= 2500, f"additionalContext exceeded max_chars: {len(ctx)}")
         _require("Never weaken TLS verification." in ctx, f"Manual pin missing:\n{ctx}")
         _require("TLS 1.3" in ctx and "[OVERRIDE]" in ctx, f"Override missing:\n{ctx}")
         _require("[PROGRESSING]" in ctx and "400 -> 301" in ctx, f"Trajectory missing:\n{ctx}")
+
+    # Verify tight max_chars genuinely truncates SessionStart additionalContext while keeping pin
+    _require(len(full_ctx) > 220, f"Full ledger too short for tight cap test: {len(full_ctx)}")
+    tight_res = handle_session_start(
+        json.dumps({"session_id": sid, "source": "compact", "cwd": str(workspace)}),
+        max_chars=220,
+        env={},
+    )
+    _require(tight_res.exit_code == 0 and tight_res.stdout != "", f"Tight hook failed: {tight_res}")
+    tight_ctx = json.loads(tight_res.stdout)["hookSpecificOutput"]["additionalContext"]
+    _require(
+        len(tight_ctx) <= 220 < len(full_ctx),
+        f"Tight hook cap not enforced: {len(tight_ctx)} vs full {len(full_ctx)}",
+    )
+    _require("Never weaken TLS verification." in tight_ctx, f"Manual pin dropped:\n{tight_ctx}")
 
 
 def _case_20_hook_session_start_gating_and_fail_open(tmp: Path) -> None:
@@ -1129,6 +1170,11 @@ def _case_20_hook_session_start_gating_and_fail_open(tmp: Path) -> None:
     _require(r_ss_open.exit_code == 0 and r_ss_open.stdout == "", str(r_ss_open))
     r_ss_strict = handle_session_start("{broken", store_dir=store_dir, strict=True, env={})
     _require(r_ss_strict.exit_code != 0, str(r_ss_strict))
+
+    # UTF-8 BOM on stdin is accepted cleanly
+    bom_payload = b"\xef\xbb\xbf" + json.dumps({"session_id": sid, "source": "compact"}).encode()
+    r_bom = handle_session_start(bom_payload, store_dir=store_dir, env={})
+    _require(r_bom.exit_code == 0 and "Keep hook latency under 50ms." in r_bom.stdout, str(r_bom))
 
 
 # ---------------------------------------------------------------------------

@@ -57,7 +57,8 @@ _CODEX_HEADER_PREFIXES = (
 )
 _CLAUDE_NOISE_EXACT = frozenset({"[Request interrupted by user]"})
 _CLAUDE_WRAPPER_TAG_RE = re.compile(
-    r"^\s*<(?:command-name|command-message|command-args|local-command-stdout|local-command-caveat)>"
+    r"^\s*<(?:command-name|command-message|command-args|local-command-stdout|"
+    r"local-command-caveat|task-notification|system-reminder)>"
 )
 _CODEX_HARNESS_PREFIXES = (
     "<environment_context>",

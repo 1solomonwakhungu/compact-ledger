@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import json
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import TextIO
 
 from compact_ledger import __version__
 from compact_ledger.evals import (
@@ -36,12 +39,64 @@ def _configure_io_streams() -> None:
                 reconfigure(errors="replace")
 
 
+def _neutralize_broken_stdio(stream: TextIO) -> None:
+    """Prevent CPython shutdown from exiting 120 when stdout/stderr pipe breaks or is closed."""
+    if stream not in (sys.__stdout__, sys.__stderr__):
+        return
+    with contextlib.suppress(OSError, ValueError):
+        fd = stream.fileno()
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull_fd, fd)
+        finally:
+            os.close(devnull_fd)
+
+
+def _safe_write_stream(stream: TextIO | None, text: str, *, fail_open: bool) -> None:
+    """Write and flush ``text`` safely without raising BrokenPipeError or EBADF in fail-open."""
+    if not text:
+        return
+    if stream is None:
+        if not fail_open:
+            raise OSError("Output stream is closed")
+        return
+    try:
+        stream.write(text)
+        stream.flush()
+    except BrokenPipeError:
+        _neutralize_broken_stdio(stream)
+    except OSError:
+        _neutralize_broken_stdio(stream)
+        if not fail_open:
+            raise
+
+
 def _write_bounded_stdout(rendered: str, max_chars: int) -> None:
     """Write ``rendered`` ensuring total stdout length never exceeds ``max_chars``."""
-    if len(rendered) + 1 <= max_chars:
-        sys.stdout.write(rendered + "\n")
-    else:
-        sys.stdout.write(rendered)
+    payload = rendered + "\n" if len(rendered) + 1 <= max_chars else rendered
+    _safe_write_stream(sys.stdout, payload, fail_open=False)
+
+
+def _is_fail_open_hook_argv(argv: Sequence[str]) -> bool:
+    """Return True if ``argv`` invokes ``hook`` without ``--strict`` or ``--help``."""
+    tokens = list(argv)
+    if any(tok in ("--strict", "-h", "--help") for tok in tokens):
+        return False
+
+    idx = 0
+    while idx < len(tokens):
+        tok = tokens[idx]
+        if tok == "--store-dir":
+            idx += 2
+            continue
+        if tok.startswith("--store-dir="):
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            idx += 1
+            continue
+        return tok == "hook"
+    return False
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -332,9 +387,12 @@ def _cmd_inject(args: argparse.Namespace, store: SessionStore) -> int:
 
     try:
         snapshot = store.load_snapshot(args.session_id)
-    except (ValueError, CorruptSnapshotError) as exc:
+    except CorruptSnapshotError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
 
     if snapshot is None:
         print(f"No snapshot found for session {args.session_id!r}.", file=sys.stderr)
@@ -388,9 +446,12 @@ def _cmd_status(args: argparse.Namespace, store: SessionStore) -> int:
     if args.session_id is not None:
         try:
             snapshot = store.load_snapshot(args.session_id)
-        except (ValueError, CorruptSnapshotError) as exc:
+        except CorruptSnapshotError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
 
         if snapshot is None:
             print(f"No snapshot found for session {args.session_id!r}.", file=sys.stderr)
@@ -475,11 +536,13 @@ def _cmd_clear(args: argparse.Namespace, store: SessionStore) -> int:
 
 def _cmd_hook(args: argparse.Namespace) -> int:
     hook_cmd = getattr(args, "hook_command", None)
+    strict = bool(getattr(args, "strict", False))
+
     if hook_cmd == "pre-compact":
         result = handle_pre_compact(
             sys.stdin,
             store_dir=args.store_dir,
-            strict=args.strict,
+            strict=strict,
         )
     elif hook_cmd == "session-start":
         result = handle_session_start(
@@ -487,19 +550,18 @@ def _cmd_hook(args: argparse.Namespace) -> int:
             store_dir=args.store_dir,
             max_chars=args.max_chars,
             always=args.always,
-            strict=args.strict,
+            strict=strict,
         )
     else:
-        print(
-            "Error: specify a hook subcommand: 'pre-compact' or 'session-start'.",
-            file=sys.stderr,
+        _safe_write_stream(
+            sys.stderr,
+            "Error: specify a hook subcommand: 'pre-compact' or 'session-start'.\n",
+            fail_open=True,
         )
-        return 2
+        return 0 if not strict else 2
 
-    if result.stderr:
-        sys.stderr.write(result.stderr)
-    if result.stdout:
-        sys.stdout.write(result.stdout)
+    _safe_write_stream(sys.stderr, result.stderr, fail_open=True)
+    _safe_write_stream(sys.stdout, result.stdout, fail_open=not strict)
     return result.exit_code
 
 
@@ -524,7 +586,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if wrote:
         print(f"Updated Claude Code hook settings in {target_path}")
     else:
-        print(json.dumps(merged, indent=2, ensure_ascii=False))
+        print(json.dumps(merged, indent=2, ensure_ascii=False, allow_nan=False))
     return 0
 
 
@@ -541,7 +603,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the ``compact-ledger`` CLI."""
     _configure_io_streams()
     parser = _build_parser()
-    args = parser.parse_args(argv)
+    effective_argv = list(sys.argv[1:] if argv is None else argv)
+    hook_fail_open = _is_fail_open_hook_argv(effective_argv)
+
+    try:
+        err_ctx = (
+            contextlib.redirect_stderr(io.StringIO())
+            if hook_fail_open and sys.stderr is None
+            else contextlib.nullcontext()
+        )
+        with err_ctx:
+            args = parser.parse_args(effective_argv)
+    except SystemExit as exc:
+        if hook_fail_open and exc.code not in (0, None):
+            return 0
+        raise
+    except (OSError, AttributeError):
+        if hook_fail_open:
+            if sys.stderr is not None:
+                _neutralize_broken_stdio(sys.stderr)
+            return 0
+        raise
 
     if args.command is None:
         parser.print_help()
@@ -569,8 +651,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "clear":
             return _cmd_clear(args, store)
     except BrokenPipeError:
+        _neutralize_broken_stdio(sys.stdout)
         return 0
     except (OSError, ValueError) as exc:
+        if hook_fail_open:
+            _safe_write_stream(sys.stderr, f"compact-ledger hook: {exc}\n", fail_open=True)
+            return 0
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
