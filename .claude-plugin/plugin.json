@@ -1,0 +1,12 @@
+{
+  "name": "compact-ledger",
+  "version": "0.1.0",
+  "description": "Keeps user rules, corrections and failed test attempts alive across context compaction. Deterministic, local, no LLM calls.",
+  "author": {
+    "name": "Solomon Wakhungu"
+  },
+  "homepage": "https://github.com/1solomonwakhungu/compact-ledger",
+  "repository": "https://github.com/1solomonwakhungu/compact-ledger",
+  "license": "MIT",
+  "keywords": ["compaction", "memory", "hooks", "context", "constraints"]
+}

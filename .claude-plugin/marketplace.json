@@ -1,0 +1,14 @@
+{
+  "name": "compact-ledger",
+  "description": "compact-ledger: compaction memory for Claude Code that keeps user rules and failed attempts.",
+  "owner": {
+    "name": "Solomon Wakhungu"
+  },
+  "plugins": [
+    {
+      "name": "compact-ledger",
+      "source": "./",
+      "description": "Keeps user rules, corrections and failed test attempts alive across context compaction."
+    }
+  ]
+}
