@@ -29,6 +29,7 @@ from compact_ledger.store import (
 )
 
 __all__ = [
+    "DOCTOR_SCHEMA_VERSION",
     "DoctorCheck",
     "DoctorReport",
     "format_doctor_report_json",
@@ -36,9 +37,12 @@ __all__ = [
     "run_doctor",
 ]
 
+DOCTOR_SCHEMA_VERSION = 1
 CheckStatus = Literal["ok", "warn", "fail"]
 
 _INSTALL_CMD = "uv tool install git+https://github.com/1solomonwakhungu/compact-ledger.git"
+_LOCAL_CLAUDE_SETTINGS_RELPATH = Path(".claude") / "settings.local.json"
+_INSTALLED_PLUGINS_RELPATH = Path(".claude") / "plugins" / "installed_plugins.json"
 
 
 @dataclass(slots=True)
@@ -69,6 +73,7 @@ class DoctorReport:
     project_root: str
     store_dir: str
     settings_path: str
+    schema_version: int = DOCTOR_SCHEMA_VERSION
 
     @property
     def ok(self) -> bool:
@@ -90,6 +95,7 @@ class DoctorReport:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": self.schema_version,
             "ok": self.ok,
             "has_warnings": self.has_warnings,
             "project_root": self.project_root,
@@ -183,15 +189,77 @@ def _check_python_version(version_info: tuple[int, int, int]) -> DoctorCheck:
         name="python_version",
         status="fail",
         summary=f"Python {ver_str} is below required >= 3.11",
-        fix="uv python install 3.12",
+        fix=(
+            "uv tool install --python 3.12 "
+            "git+https://github.com/1solomonwakhungu/compact-ledger.git"
+        ),
         details={"version": ver_str, "executable": sys.executable},
     )
 
 
+def _has_installed_plugin_in_settings(settings_data: dict[str, Any]) -> bool:
+    enabled = settings_data.get("enabledPlugins")
+    if isinstance(enabled, dict):
+        for key, val in enabled.items():
+            if not isinstance(key, str):
+                continue
+            base = key.split("@", 1)[0].strip().lower()
+            if base == "compact-ledger" and bool(val):
+                return True
+    elif isinstance(enabled, list):
+        for item in enabled:
+            if isinstance(item, str) and item.split("@", 1)[0].strip().lower() == "compact-ledger":
+                return True
+    return False
+
+
+def _has_installed_plugin_file(home_dir: Path | None) -> bool:
+    if home_dir is None:
+        return False
+    installed_path = home_dir / _INSTALLED_PLUGINS_RELPATH
+    try:
+        if not installed_path.is_file():
+            return False
+        data = json.loads(installed_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+    if isinstance(data, dict):
+        plugins = data.get("plugins")
+        if isinstance(plugins, dict):
+            return any(
+                isinstance(k, str) and k.split("@", 1)[0].strip().lower() == "compact-ledger"
+                for k in plugins
+            )
+        if isinstance(plugins, list):
+            return any(
+                isinstance(p, dict)
+                and isinstance(p.get("name"), str)
+                and p["name"].strip().lower() == "compact-ledger"
+                for p in plugins
+            )
+    return False
+
+
 def _check_claude_plugin(project_root: Path) -> tuple[DoctorCheck, bool]:
-    """Inspect ``.claude-plugin/`` if present. Returns ``(check, plugin_provides_hooks)``."""
+    """Inspect local ``.claude-plugin/`` ONLY when it belongs to ``compact-ledger``.
+
+    Returns ``(check, local_plugin_valid)``.
+    """
     plugin_dir = project_root / ".claude-plugin"
-    if not plugin_dir.exists():
+    try:
+        plugin_dir_exists = plugin_dir.exists()
+    except OSError as exc:
+        return (
+            DoctorCheck(
+                name="claude_plugin",
+                status="fail",
+                summary=f"Cannot inspect {plugin_dir}: {exc}",
+                details={"present": False, "error": str(exc)},
+            ),
+            False,
+        )
+
+    if not plugin_dir_exists:
         return (
             DoctorCheck(
                 name="claude_plugin",
@@ -211,55 +279,104 @@ def _check_claude_plugin(project_root: Path) -> tuple[DoctorCheck, bool]:
     plugin_version: str | None = None
     hooks_ok = False
 
-    if not manifest_path.is_file():
-        issues.append("missing .claude-plugin/plugin.json")
-    else:
+    try:
+        if not manifest_path.is_file():
+            # Unrelated repo with a .claude-plugin/ directory that has no compact-ledger manifest.
+            return (
+                DoctorCheck(
+                    name="claude_plugin",
+                    status="ok",
+                    summary="Local .claude-plugin/ has no compact-ledger manifest (skipped)",
+                    details={"present": False},
+                ),
+                False,
+            )
+
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if not isinstance(manifest, dict):
-                issues.append(".claude-plugin/plugin.json is not a JSON object")
-            else:
-                plugin_name = (
-                    manifest.get("name") if isinstance(manifest.get("name"), str) else None
-                )
-                plugin_version = (
-                    manifest.get("version") if isinstance(manifest.get("version"), str) else None
-                )
-                if not plugin_name:
-                    issues.append(".claude-plugin/plugin.json missing 'name'")
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            issues.append(f"invalid .claude-plugin/plugin.json: {exc}")
+            return (
+                DoctorCheck(
+                    name="claude_plugin",
+                    status="fail",
+                    summary=f"Invalid .claude-plugin/plugin.json: {exc}",
+                    details={"present": True, "manifest_path": str(manifest_path)},
+                ),
+                False,
+            )
 
-    if hooks_path.is_file():
-        try:
-            hooks_data = json.loads(hooks_path.read_text(encoding="utf-8"))
-            if isinstance(hooks_data, dict):
-                has_pre, has_start, _, _ = _inspect_hooks_object(
-                    hooks_data.get("hooks"), env_path=None
-                )
-                hooks_ok = has_pre and has_start
-                if not hooks_ok:
-                    missing = [
-                        name
-                        for name, ok in (("PreCompact", has_pre), ("SessionStart", has_start))
-                        if not ok
-                    ]
-                    issues.append(f"hooks/hooks.json missing {', '.join(missing)}")
-            else:
-                issues.append("hooks/hooks.json is not a JSON object")
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            issues.append(f"invalid hooks/hooks.json: {exc}")
-    else:
-        issues.append("missing hooks/hooks.json")
+        if not isinstance(manifest, dict):
+            return (
+                DoctorCheck(
+                    name="claude_plugin",
+                    status="fail",
+                    summary=".claude-plugin/plugin.json is not a JSON object",
+                    details={"present": True, "manifest_path": str(manifest_path)},
+                ),
+                False,
+            )
 
-    launcher_exec = False
-    if launcher_path.is_file():
-        launcher_exec = os.access(launcher_path, os.X_OK) or sys.platform == "win32"
-        if not launcher_exec:
-            issues.append("bin/compact-ledger is not executable")
-            fix = f"chmod +x {shlex.quote(str(launcher_path))}"
-    else:
-        issues.append("missing bin/compact-ledger launcher")
+        raw_name = manifest.get("name")
+        plugin_name = raw_name.strip() if isinstance(raw_name, str) and raw_name.strip() else None
+        plugin_version = (
+            manifest.get("version") if isinstance(manifest.get("version"), str) else None
+        )
+        # Never fail an unrelated project that happens to ship its own Claude Code plugin!
+        if plugin_name is not None and plugin_name != "compact-ledger":
+            return (
+                DoctorCheck(
+                    name="claude_plugin",
+                    status="ok",
+                    summary=(
+                        f"Local .claude-plugin/ belongs to {plugin_name!r}, not compact-ledger"
+                    ),
+                    details={"present": False, "unrelated_plugin": plugin_name},
+                ),
+                False,
+            )
+        if plugin_name is None:
+            issues.append(".claude-plugin/plugin.json missing 'name'")
+
+        if hooks_path.is_file():
+            try:
+                hooks_data = json.loads(hooks_path.read_text(encoding="utf-8"))
+                if isinstance(hooks_data, dict):
+                    has_pre, has_start, _, _ = _inspect_hooks_object(
+                        hooks_data.get("hooks"), env_path=None
+                    )
+                    hooks_ok = has_pre and has_start
+                    if not hooks_ok:
+                        missing = [
+                            name
+                            for name, ok in (("PreCompact", has_pre), ("SessionStart", has_start))
+                            if not ok
+                        ]
+                        issues.append(f"hooks/hooks.json missing {', '.join(missing)}")
+                else:
+                    issues.append("hooks/hooks.json is not a JSON object")
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                issues.append(f"invalid hooks/hooks.json: {exc}")
+        else:
+            issues.append("missing hooks/hooks.json")
+
+        launcher_exec = False
+        if launcher_path.is_file():
+            launcher_exec = os.access(launcher_path, os.X_OK) or sys.platform == "win32"
+            if not launcher_exec:
+                issues.append("bin/compact-ledger is not executable")
+                fix = f"chmod +x {shlex.quote(str(launcher_path))}"
+        else:
+            issues.append("missing bin/compact-ledger launcher")
+    except OSError as exc:
+        return (
+            DoctorCheck(
+                name="claude_plugin",
+                status="fail",
+                summary=f"Cannot inspect local plugin files: {exc}",
+                details={"present": True, "error": str(exc)},
+            ),
+            False,
+        )
 
     details = {
         "present": True,
@@ -276,7 +393,9 @@ def _check_claude_plugin(project_root: Path) -> tuple[DoctorCheck, bool]:
             DoctorCheck(
                 name="claude_plugin",
                 status="ok",
-                summary=f"Valid local Claude Code plugin ({label}); hooks and launcher ready",
+                summary=(
+                    f"Valid local Claude Code plugin ({label}); hooks/hooks.json and launcher ready"
+                ),
                 details=details,
             ),
             True,
@@ -320,12 +439,41 @@ def _check_cli_on_path(env_path: str | None, *, plugin_ready: bool) -> DoctorChe
     )
 
 
+def _read_settings_file(path: Path) -> tuple[dict[str, Any] | None, str | None, bool]:
+    """Read one Claude Code settings file safely.
+
+    Returns ``(parsed_dict_or_None, error_message_or_None, file_existed)``.
+    """
+    try:
+        exists = path.exists() or path.is_symlink()
+    except OSError as exc:
+        return None, f"cannot access {path}: {exc}", False
+    if not exists:
+        return None, None, False
+    try:
+        if not path.is_file():
+            return None, f"{path} exists but is not a regular file", True
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        return None, f"cannot read {path}: {exc}", True
+    if not raw.strip():
+        return None, f"{path} is empty (invalid JSON)", True
+    try:
+        parsed = json.loads(raw)
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
+        return None, f"invalid JSON in {path}: {exc}", True
+    if not isinstance(parsed, dict):
+        return None, f"{path} must contain a JSON object at top level", True
+    return parsed, None, True
+
+
 def _check_claude_hooks(
     settings_target: Path,
     *,
+    project_root: Path,
     explicit_settings_path: bool,
     env_path: str | None,
-    plugin_ready: bool,
+    local_plugin_valid: bool,
     home_dir: Path | None,
 ) -> DoctorCheck:
     init_fix = (
@@ -334,59 +482,102 @@ def _check_claude_hooks(
         else "compact-ledger init --write"
     )
 
-    def _read_settings(path: Path) -> tuple[dict[str, Any] | None, str | None]:
-        if not path.exists():
-            return None, None
-        if not path.is_file():
-            return None, f"{path} exists but is not a regular file"
-        try:
-            raw = path.read_text(encoding="utf-8")
-            if not raw.strip():
-                return None, f"{path} is empty (invalid JSON)"
-            parsed = json.loads(raw)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
-            return None, f"invalid JSON in {path}: {exc}"
-        if not isinstance(parsed, dict):
-            return None, f"{path} must contain a JSON object at top level"
-        return parsed, None
+    scopes: list[tuple[str, Path]] = [
+        ("target" if explicit_settings_path else "project", settings_target)
+    ]
+    if not explicit_settings_path:
+        local_settings = project_root / _LOCAL_CLAUDE_SETTINGS_RELPATH
+        if local_settings != settings_target:
+            scopes.append(("project_local", local_settings))
+        if home_dir is not None:
+            user_settings = home_dir / DEFAULT_CLAUDE_SETTINGS_RELPATH
+            if user_settings not in (settings_target, local_settings):
+                scopes.append(("user", user_settings))
 
-    data, error = _read_settings(settings_target)
-    if error is not None:
+    merged_pre = False
+    merged_start = False
+    commands_found: list[str] = []
+    missing_execs: list[str] = []
+    wired_sources: list[str] = []
+    read_errors: list[tuple[str, Path, str]] = []
+    disabled_paths: list[str] = []
+    plugin_enabled_in_settings = False
+    target_existed = False
+
+    for scope_name, path in scopes:
+        data, err, existed = _read_settings_file(path)
+        if path == settings_target:
+            target_existed = existed
+        if err is not None:
+            read_errors.append((scope_name, path, err))
+            continue
+        if data is None:
+            continue
+        if data.get("disableAllHooks") is True:
+            disabled_paths.append(str(path))
+        if _has_installed_plugin_in_settings(data):
+            plugin_enabled_in_settings = True
+        pre, start, cmds, missing = _inspect_hooks_object(data.get("hooks"), env_path=env_path)
+        if pre or start:
+            wired_sources.append(str(path))
+        merged_pre = merged_pre or pre
+        merged_start = merged_start or start
+        commands_found.extend(cmds)
+        for exe in missing:
+            if exe not in missing_execs:
+                missing_execs.append(exe)
+
+    # Report corrupt / unreadable target settings file directly with a repairable fix.
+    for scope_name, err_path, err_msg in read_errors:
+        if err_path == settings_target or (not merged_pre and not merged_start):
+            return DoctorCheck(
+                name="claude_hooks",
+                status="fail",
+                summary=err_msg,
+                fix=(
+                    f"Fix {shlex.quote(str(err_path))} so it contains valid JSON, "
+                    f"then run: {init_fix}"
+                ),
+                details={
+                    "settings_path": str(err_path),
+                    "scope": scope_name,
+                    "pre_compact": merged_pre,
+                    "session_start": merged_start,
+                },
+            )
+
+    if disabled_paths:
         return DoctorCheck(
             name="claude_hooks",
             status="fail",
-            summary=error,
-            fix=init_fix,
+            summary=(
+                f"Claude Code hooks are disabled (disableAllHooks: true in {disabled_paths[0]})"
+            ),
+            fix=f'Set "disableAllHooks": false (or remove it) in {shlex.quote(disabled_paths[0])}',
             details={
-                "settings_path": str(settings_target),
-                "pre_compact": False,
-                "session_start": False,
+                "settings_path": disabled_paths[0],
+                "disable_all_hooks": True,
+                "pre_compact": merged_pre,
+                "session_start": merged_start,
             },
         )
 
-    has_pre = False
-    has_start = False
-    commands_found: list[str] = []
-    missing_execs: list[str] = []
-    if data is not None:
-        has_pre, has_start, commands_found, missing_execs = _inspect_hooks_object(
-            data.get("hooks"), env_path=env_path
-        )
-
-    if has_pre and has_start:
+    if merged_pre and merged_start:
         details = {
-            "settings_path": str(settings_target),
+            "settings_path": wired_sources[0] if wired_sources else str(settings_target),
+            "wired_sources": wired_sources,
             "pre_compact": True,
             "session_start": True,
             "commands": commands_found,
             "missing_executables": missing_execs,
         }
+        source_desc = ", ".join(wired_sources)
         if missing_execs:
             return DoctorCheck(
                 name="claude_hooks",
                 status="warn",
                 summary=(
-                    f"PreCompact and SessionStart wired in {settings_target}, "
+                    f"PreCompact and SessionStart wired in {source_desc}, "
                     f"but command not on PATH: {', '.join(missing_execs)}"
                 ),
                 fix=_INSTALL_CMD,
@@ -395,68 +586,47 @@ def _check_claude_hooks(
         return DoctorCheck(
             name="claude_hooks",
             status="ok",
-            summary=f"PreCompact and SessionStart hooks wired in {settings_target}",
+            summary=f"PreCompact and SessionStart hooks wired in {source_desc}",
             details=details,
         )
 
-    # Check user-level ~/.claude/settings.json when project settings were not explicitly overridden
-    if not explicit_settings_path and home_dir is not None:
-        global_settings = home_dir / DEFAULT_CLAUDE_SETTINGS_RELPATH
-        if global_settings != settings_target:
-            g_data, g_err = _read_settings(global_settings)
-            if g_err is None and g_data is not None:
-                g_pre, g_start, g_cmds, g_missing = _inspect_hooks_object(
-                    g_data.get("hooks"), env_path=env_path
-                )
-                if g_pre and g_start:
-                    details = {
-                        "settings_path": str(global_settings),
-                        "scope": "user",
-                        "pre_compact": True,
-                        "session_start": True,
-                        "commands": g_cmds,
-                        "missing_executables": g_missing,
-                    }
-                    if g_missing:
-                        return DoctorCheck(
-                            name="claude_hooks",
-                            status="warn",
-                            summary=(
-                                f"Hooks wired globally in {global_settings}, "
-                                f"but command not on PATH: {', '.join(g_missing)}"
-                            ),
-                            fix=_INSTALL_CMD,
-                            details=details,
-                        )
-                    return DoctorCheck(
-                        name="claude_hooks",
-                        status="ok",
-                        summary=(
-                            f"PreCompact and SessionStart hooks wired globally in {global_settings}"
-                        ),
-                        details=details,
-                    )
-
-    if not explicit_settings_path and plugin_ready:
+    installed_plugin = (not explicit_settings_path) and (
+        plugin_enabled_in_settings or _has_installed_plugin_file(home_dir)
+    )
+    if installed_plugin:
         return DoctorCheck(
             name="claude_hooks",
             status="ok",
-            summary=(
-                "No project .claude/settings.json hooks "
-                "(provided by local .claude-plugin/hooks/hooks.json)"
-            ),
+            summary="compact-ledger Claude Code plugin is installed/enabled",
             details={
                 "settings_path": str(settings_target),
-                "pre_compact": has_pre,
-                "session_start": has_start,
-                "provided_by_plugin": True,
+                "pre_compact": True,
+                "session_start": True,
+                "provided_by_installed_plugin": True,
+            },
+        )
+
+    if not explicit_settings_path and local_plugin_valid:
+        return DoctorCheck(
+            name="claude_hooks",
+            status="warn",
+            summary=(
+                "Local plugin hooks/hooks.json is valid, but hooks are not wired in "
+                ".claude/settings.json or enabled as an installed plugin"
+            ),
+            fix=init_fix,
+            details={
+                "settings_path": str(settings_target),
+                "pre_compact": merged_pre,
+                "session_start": merged_start,
+                "local_plugin_source_only": True,
             },
         )
 
     missing_events = [
-        name for name, ok in (("PreCompact", has_pre), ("SessionStart", has_start)) if not ok
+        name for name, ok in (("PreCompact", merged_pre), ("SessionStart", merged_start)) if not ok
     ]
-    if data is None:
+    if not target_existed and not wired_sources:
         summary = f"{settings_target} not found (missing {', '.join(missing_events)} hooks)"
     else:
         summary = f"Missing {', '.join(missing_events)} hook(s) in {settings_target}"
@@ -467,8 +637,8 @@ def _check_claude_hooks(
         fix=init_fix,
         details={
             "settings_path": str(settings_target),
-            "pre_compact": has_pre,
-            "session_start": has_start,
+            "pre_compact": merged_pre,
+            "session_start": merged_start,
             "missing_events": missing_events,
         },
     )
@@ -477,8 +647,11 @@ def _check_claude_hooks(
 def _nearest_existing_ancestor(path: Path) -> Path | None:
     cur = path
     for _ in range(64):
-        if cur.exists():
-            return cur
+        try:
+            if cur.exists():
+                return cur
+        except OSError:
+            return None
         if cur.parent == cur:
             break
         cur = cur.parent
@@ -487,18 +660,34 @@ def _nearest_existing_ancestor(path: Path) -> Path | None:
 
 def _store_is_gitignored(store_root: Path, project_root: Path) -> bool:
     store_ignore = store_root / ".gitignore"
-    if store_ignore.is_file() and not store_ignore.is_symlink():
-        with contextlib.suppress(OSError, UnicodeDecodeError):
+    try:
+        if store_ignore.is_file() and not store_ignore.is_symlink():
             lines = [ln.strip() for ln in store_ignore.read_text(encoding="utf-8").splitlines()]
             if "*" in lines or "/*" in lines:
                 return True
+    except (OSError, UnicodeDecodeError):
+        pass
+
     repo_ignore = project_root / ".gitignore"
-    if repo_ignore.is_file() and not repo_ignore.is_symlink():
-        with contextlib.suppress(OSError, UnicodeDecodeError):
+    store_names = {DEFAULT_DIR_NAME, store_root.name}
+    try:
+        if repo_ignore.is_file() and not repo_ignore.is_symlink():
             for ln in repo_ignore.read_text(encoding="utf-8").splitlines():
-                stripped = ln.strip().strip("/")
-                if stripped == DEFAULT_DIR_NAME or stripped == store_root.name:
+                entry = ln.strip()
+                if not entry or entry.startswith("#") or entry.startswith("!"):
+                    continue
+                if entry.startswith("**/"):
+                    entry = entry[3:]
+                entry = entry.lstrip("/")
+                if entry.endswith("/*"):
+                    entry = entry[:-2]
+                elif entry.endswith("/**"):
+                    entry = entry[:-3]
+                entry = entry.rstrip("/")
+                if entry in store_names:
                     return True
+    except (OSError, UnicodeDecodeError):
+        pass
     return False
 
 
@@ -506,38 +695,61 @@ def _check_store(store: SessionStore, project_root: Path) -> DoctorCheck:
     root = store.root_dir
     sessions_dir = store.sessions_dir
 
-    if root.is_symlink() or sessions_dir.is_symlink():
+    try:
+        root_is_symlink = root.is_symlink()
+        sessions_is_symlink = False if root_is_symlink else sessions_dir.is_symlink()
+    except OSError as exc:
         return DoctorCheck(
             name="store",
             status="fail",
-            summary=f"Store path uses a symlink (refused for safety): {root}",
-            fix=f"rm {shlex.quote(str(root))} && mkdir -p {shlex.quote(str(root))}",
+            summary=f"Cannot inspect store path {root}: {exc}",
+            details={"store_dir": str(root), "writable": False, "error": str(exc)},
+        )
+
+    if root_is_symlink or sessions_is_symlink:
+        symlink_target = root if root_is_symlink else sessions_dir
+        quoted_sym = shlex.quote(str(symlink_target))
+        return DoctorCheck(
+            name="store",
+            status="fail",
+            summary=f"Store path uses a symlink (refused for safety): {symlink_target}",
+            fix=f"rm {quoted_sym} && mkdir -p {quoted_sym}",
             details={"store_dir": str(root), "exists": True, "writable": False},
         )
 
-    exists = root.exists()
-    if exists:
-        if not root.is_dir():
-            return DoctorCheck(
-                name="store",
-                status="fail",
-                summary=f"Store path exists but is not a directory: {root}",
-                details={"store_dir": str(root), "exists": True, "writable": False},
-            )
-        writable = os.access(root, os.W_OK | os.X_OK)
-        if sessions_dir.exists():
-            if not sessions_dir.is_dir():
+    try:
+        exists = root.exists()
+        if exists:
+            if not root.is_dir():
                 return DoctorCheck(
                     name="store",
                     status="fail",
-                    summary=f"Sessions path exists but is not a directory: {sessions_dir}",
+                    summary=f"Store path exists but is not a directory: {root}",
                     details={"store_dir": str(root), "exists": True, "writable": False},
                 )
-            writable = writable and os.access(sessions_dir, os.W_OK | os.X_OK)
-    else:
-        ancestor = _nearest_existing_ancestor(root)
-        writable = bool(
-            ancestor is not None and ancestor.is_dir() and os.access(ancestor, os.W_OK | os.X_OK)
+            writable = os.access(root, os.W_OK | os.X_OK)
+            if sessions_dir.exists():
+                if not sessions_dir.is_dir():
+                    return DoctorCheck(
+                        name="store",
+                        status="fail",
+                        summary=f"Sessions path exists but is not a directory: {sessions_dir}",
+                        details={"store_dir": str(root), "exists": True, "writable": False},
+                    )
+                writable = writable and os.access(sessions_dir, os.W_OK | os.X_OK)
+        else:
+            ancestor = _nearest_existing_ancestor(root)
+            writable = bool(
+                ancestor is not None
+                and ancestor.is_dir()
+                and os.access(ancestor, os.W_OK | os.X_OK)
+            )
+    except OSError as exc:
+        return DoctorCheck(
+            name="store",
+            status="fail",
+            summary=f"Cannot inspect store permissions for {root}: {exc}",
+            details={"store_dir": str(root), "writable": False, "error": str(exc)},
         )
 
     if not writable:
@@ -559,35 +771,43 @@ def _check_store(store: SessionStore, project_root: Path) -> DoctorCheck:
     total_trajectories = 0
     corrupt_count = 0
 
-    if sessions_dir.is_dir():
-        sessions = store.list_sessions()
-        for entry in sorted(sessions_dir.glob("*.json")):
-            if entry.is_symlink() or not entry.is_file() or entry.name.startswith("."):
-                continue
-            try:
-                raw_data = json.loads(entry.read_text(encoding="utf-8"))
-                sid = raw_data.get("session_id") if isinstance(raw_data, dict) else None
-                if not isinstance(sid, str) or not sid.strip():
+    try:
+        if sessions_dir.is_dir():
+            sessions = store.list_sessions()
+            for entry in sorted(sessions_dir.glob("*.json")):
+                if entry.is_symlink() or not entry.is_file() or entry.name.startswith("."):
+                    continue
+                try:
+                    raw_data = json.loads(entry.read_text(encoding="utf-8"))
+                    sid = raw_data.get("session_id") if isinstance(raw_data, dict) else None
+                    if not isinstance(sid, str) or not sid.strip():
+                        corrupt_count += 1
+                        continue
+                    snap = store.load_snapshot(sid)
+                    if snap is None:
+                        continue
+                    if snap.metadata.get("hook_event") == "PreCompact":
+                        hook_sessions += 1
+                    total_pins += len(snap.pins)
+                    total_trajectories += len(snap.trajectories)
+                    if latest_created_at is None or snap.created_at > latest_created_at:
+                        latest_created_at = snap.created_at
+                        latest_session_id = snap.session_id
+                except (
+                    CorruptSnapshotError,
+                    OSError,
+                    UnicodeDecodeError,
+                    json.JSONDecodeError,
+                    ValueError,
+                ):
                     corrupt_count += 1
-                    continue
-                snap = store.load_snapshot(sid)
-                if snap is None:
-                    continue
-                if snap.metadata.get("hook_event") == "PreCompact":
-                    hook_sessions += 1
-                total_pins += len(snap.pins)
-                total_trajectories += len(snap.trajectories)
-                if latest_created_at is None or snap.created_at > latest_created_at:
-                    latest_created_at = snap.created_at
-                    latest_session_id = snap.session_id
-            except (
-                CorruptSnapshotError,
-                OSError,
-                UnicodeDecodeError,
-                json.JSONDecodeError,
-                ValueError,
-            ):
-                corrupt_count += 1
+    except OSError as exc:
+        return DoctorCheck(
+            name="store",
+            status="fail",
+            summary=f"Cannot read sessions in {sessions_dir}: {exc}",
+            details={"store_dir": str(root), "exists": exists, "writable": writable},
+        )
 
     details: dict[str, Any] = {
         "store_dir": str(root),
@@ -604,6 +824,16 @@ def _check_store(store: SessionStore, project_root: Path) -> DoctorCheck:
     }
 
     if exists and not gitignored:
+        ignore_path = root / ".gitignore"
+        ignore_quoted = shlex.quote(str(ignore_path))
+        ignore_is_symlink = False
+        with contextlib.suppress(OSError):
+            ignore_is_symlink = ignore_path.is_symlink()
+        fix_cmd = (
+            f"rm {ignore_quoted} && printf '*\\n' > {ignore_quoted}"
+            if ignore_is_symlink
+            else f"printf '*\\n' > {ignore_quoted}"
+        )
         return DoctorCheck(
             name="store",
             status="warn",
@@ -611,7 +841,7 @@ def _check_store(store: SessionStore, project_root: Path) -> DoctorCheck:
                 f"Store {root} is writable ({len(sessions)} session(s)), "
                 "but missing .gitignore (snapshots hold verbatim user messages)"
             ),
-            fix=f"printf '*\\n' > {shlex.quote(str(root / '.gitignore'))}",
+            fix=fix_cmd,
             details=details,
         )
 
@@ -691,13 +921,14 @@ def run_doctor(
     py_ver = python_version if python_version is not None else sys.version_info[:3]
 
     py_check = _check_python_version(py_ver)
-    plugin_check, plugin_ready = _check_claude_plugin(project_root)
-    path_check = _check_cli_on_path(env_path, plugin_ready=plugin_ready)
+    plugin_check, local_plugin_valid = _check_claude_plugin(project_root)
+    path_check = _check_cli_on_path(env_path, plugin_ready=local_plugin_valid)
     hooks_check = _check_claude_hooks(
         resolved_settings,
+        project_root=project_root,
         explicit_settings_path=explicit_settings,
         env_path=env_path,
-        plugin_ready=plugin_ready,
+        local_plugin_valid=local_plugin_valid,
         home_dir=resolved_home,
     )
     store_check = _check_store(store, project_root)

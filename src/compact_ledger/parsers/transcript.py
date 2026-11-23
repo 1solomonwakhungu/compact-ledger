@@ -216,11 +216,11 @@ def _parse_apply_patch(
     timestamp: str | None,
     call_id: str | None = None,
     next_seq: Any = None,
-) -> tuple[list[FileEdit], list[str]]:
+) -> tuple[list[FileEdit], list[tuple[str, str]]]:
     """Parse Codex ``apply_patch`` format into contiguous ``FileEdit`` records."""
     edits: list[FileEdit] = []
-    extra_paths: list[str] = []
-    seen_extra: set[str] = set()
+    extra_moves: list[tuple[str, str]] = []
+    seen_moves: set[tuple[str, str]] = set()
 
     current_path: str | None = None
     current_op: FileOperation | None = None
@@ -281,9 +281,12 @@ def _parse_apply_patch(
             current_op = "delete"
         elif line.startswith("*** Move to:"):
             if current_path is not None:
-                _add_modified_file(extra_paths, seen_extra, current_path)
                 moved = line.split(":", 1)[1].strip()
                 if moved:
+                    pair = (moved, current_path)
+                    if pair not in seen_moves:
+                        seen_moves.add(pair)
+                        extra_moves.append(pair)
                     current_path = moved
         elif line.startswith(_END_PATCH_MARKER) or line.startswith("*** End of File"):
             _flush_file()
@@ -299,7 +302,7 @@ def _parse_apply_patch(
                 old_lines.append(line[1:])
 
     _flush_file()
-    return edits, extra_paths
+    return edits, extra_moves
 
 
 def _parse_unified_diff_hunks(
@@ -514,13 +517,59 @@ def _read_js_balanced(code: str, start: int, open_ch: str, close_ch: str) -> tup
     return code[start + 1 :], n
 
 
+def _read_js_string_expr(
+    code: str,
+    start: int,
+    str_vars: dict[str, str],
+) -> tuple[str | None, int]:
+    """Read a JS string literal or simple ``+`` concatenation expression in O(len)."""
+    n = len(code)
+    pos = _skip_js_ws_and_comments(code, start)
+    if pos >= n:
+        return None, start
+
+    parts: list[str] = []
+    has_string = False
+    while pos < n:
+        ch = code[pos]
+        if ch in ("'", '"', "`"):
+            sval, next_pos = _read_js_string(code, pos)
+            if sval is None:
+                break
+            parts.append(sval)
+            has_string = True
+            pos = next_pos
+        elif ch.isalpha() or ch in ("_", "$"):
+            ident, next_pos = _read_js_ident(code, pos)
+            if ident in str_vars:
+                parts.append(str_vars[ident])
+                has_string = True
+            elif has_string:
+                parts.append(f"${ident}")
+            else:
+                return None, start
+            pos = next_pos
+        else:
+            break
+
+        after = _skip_js_ws_and_comments(code, pos)
+        if after < n and code[after] == "+" and (after + 1 >= n or code[after + 1] != "+"):
+            pos = _skip_js_ws_and_comments(code, after + 1)
+            continue
+        break
+
+    if not has_string:
+        return None, start
+    return "".join(parts), pos
+
+
 def _extract_js_object_field(
     obj_body: str,
     field_names: frozenset[str],
     str_vars: dict[str, str],
     arr_vars: dict[str, list[str]],
 ) -> str | list[str] | None:
-    """Extract a top-level string or string-array property from a JS object body."""
+    """Extract a top-level string or string-array property from a JS object body in O(N)."""
     i = 0
     n = len(obj_body)
     depth = 0
@@ -542,24 +591,38 @@ def _extract_js_object_field(
                     val_pos = _skip_js_ws_and_comments(obj_body, colon_pos + 1)
                     if key in field_names and val_pos < n:
                         vch = obj_body[val_pos]
-                        if vch in ("'", '"', "`"):
-                            sval, _ = _read_js_string(obj_body, val_pos)
-                            if sval is not None:
-                                return sval
-                        elif vch == "[":
+                        if vch == "[":
                             aval, _ = _read_js_string_array(obj_body, val_pos)
                             if aval:
                                 return aval
-                        elif vch.isalpha() or vch in ("_", "$"):
-                            ident, _ = _read_js_ident(obj_body, val_pos)
-                            if ident in str_vars:
-                                return str_vars[ident]
-                            if ident in arr_vars:
-                                return arr_vars[ident]
+                        else:
+                            sval, _ = _read_js_string_expr(obj_body, val_pos, str_vars)
+                            if sval is not None:
+                                return sval
+                            if vch.isalpha() or vch in ("_", "$"):
+                                ident, _ = _read_js_ident(obj_body, val_pos)
+                                if ident in arr_vars:
+                                    return arr_vars[ident]
                     i = colon_pos + 1
                     continue
+                # JS object shorthand property: ``{ cmd }`` or ``{ cmd, workdir: ... }``
+                if (
+                    ch not in ("'", '"', "`")
+                    and key in field_names
+                    and (colon_pos >= n or obj_body[colon_pos] in (",", "}"))
+                ):
+                    if key in str_vars:
+                        return str_vars[key]
+                    if key in arr_vars:
+                        return arr_vars[key]
+                # Advance past the full identifier/string token so scanning stays strictly O(N).
+                i = max(after_key, i + 1)
+                continue
         if ch in ("'", '"', "`"):
             _, i = _read_js_string(obj_body, i)
+            continue
+        if ch.isalpha() or ch in ("_", "$"):
+            _, i = _read_js_ident(obj_body, i)
             continue
         if ch in ("{", "[", "("):
             depth += 1
@@ -751,8 +814,31 @@ class _PendingCodexExec:
     turn_index: int
     timestamp: str | None
     seq: int
-    had_cmd_events: bool = False
-    had_file_events: bool = False
+    expected_cmds: list[str]
+    expected_patches: list[str]
+    expected_patch_paths: list[frozenset[str]]
+    matched_cmd_indices: set[int]
+    matched_patch_indices: set[int]
+
+
+@dataclass(slots=True)
+class _FallbackPatchRecord:
+    paths: frozenset[str]
+    edits: list[FileEdit]
+    moves: list[tuple[str | None, str | None, str]]
+
+
+def _extract_patch_paths(patch_text: str) -> frozenset[str]:
+    """Quickly collect file paths referenced by an ``apply_patch`` payload."""
+    paths: set[str] = set()
+    for line in sanitize_unicode(patch_text).replace("\r\n", "\n").split("\n"):
+        for prefix in ("*** Update File:", "*** Add File:", "*** Delete File:", "*** Move to:"):
+            if line.startswith(prefix):
+                val = line.split(":", 1)[1].strip()
+                if val:
+                    paths.add(val)
+                break
+    return frozenset(paths)
 
 
 def _iter_json_records(lines: Iterable[str]) -> list[dict[str, Any]]:
@@ -1252,10 +1338,12 @@ def parse_codex_records(
     pending_tools: dict[str, ToolExecution] = {}
     pending_execs: dict[str, _PendingCodexExec] = {}
     open_exec_order: list[str] = []
+    fallback_cmd_execs: list[ToolExecution] = []
+    fallback_patch_records: list[_FallbackPatchRecord] = []
     failed_call_ids: set[str] = set()
     turn_index = 0
     seq = 0
-    last_user_origin: str | None = None
+    last_user_origins: set[str] = set()
     activity_since_last_user = True
 
     def _next_seq() -> int:
@@ -1263,14 +1351,79 @@ def parse_codex_records(
         seq += 1
         return seq
 
-    def _active_pending_exec() -> _PendingCodexExec | None:
-        while open_exec_order:
-            cid = open_exec_order[-1]
+    def _live_pending_execs() -> list[_PendingCodexExec]:
+        live: list[_PendingCodexExec] = []
+        cleaned_order: list[str] = []
+        for cid in open_exec_order:
             pending = pending_execs.get(cid)
             if pending is not None:
-                return pending
-            open_exec_order.pop()
-        return None
+                cleaned_order.append(cid)
+                live.append(pending)
+        open_exec_order[:] = cleaned_order
+        return live
+
+    def _claim_open_exec_cmd(cmd: str | None) -> bool:
+        if not cmd:
+            return False
+        for pending in _live_pending_execs():
+            for idx, exp_cmd in enumerate(pending.expected_cmds):
+                if idx not in pending.matched_cmd_indices and exp_cmd == cmd:
+                    pending.matched_cmd_indices.add(idx)
+                    return True
+        return False
+
+    def _claim_open_exec_patch(paths: frozenset[str]) -> bool:
+        live = _live_pending_execs()
+        if paths:
+            for pending in live:
+                for idx, exp_paths in enumerate(pending.expected_patch_paths):
+                    if idx not in pending.matched_patch_indices and (exp_paths & paths):
+                        pending.matched_patch_indices.add(idx)
+                        return True
+        for pending in live:
+            for idx in range(len(pending.expected_patches)):
+                if idx not in pending.matched_patch_indices:
+                    pending.matched_patch_indices.add(idx)
+                    return True
+        return False
+
+    def _reconcile_fallback_cmd(
+        cmd: str | None,
+        *,
+        output: str,
+        exit_code: int | None,
+        is_error: bool,
+        timestamp: str | None,
+        call_id: str | None,
+    ) -> bool:
+        if not cmd:
+            return False
+        for idx, fb_exec in enumerate(fallback_cmd_execs):
+            if fb_exec.command == cmd:
+                fb_exec.output = output
+                fb_exec.exit_code = exit_code
+                fb_exec.is_error = is_error
+                if call_id:
+                    fb_exec.call_id = call_id
+                if timestamp:
+                    fb_exec.timestamp = timestamp
+                fallback_cmd_execs.pop(idx)
+                return True
+        return False
+
+    def _remove_fallback_patch(paths: frozenset[str]) -> bool:
+        if not paths:
+            return False
+        for idx, fb in enumerate(fallback_patch_records):
+            if fb.paths & paths:
+                drop_ids = {id(e) for e in fb.edits}
+                file_edits[:] = [e for e in file_edits if id(e) not in drop_ids]
+                if fb.moves:
+                    drop_moves = set(fb.moves)
+                    extra_move_paths[:] = [m for m in extra_move_paths if m not in drop_moves]
+                fallback_patch_records.pop(idx)
+                return True
+        return False
 
     def _finalize_exec_call(
         pending: _PendingCodexExec,
@@ -1278,6 +1431,7 @@ def parse_codex_records(
         *,
         explicit_is_error: bool | None,
         out_timestamp: str | None,
+        is_eof_leftover: bool = False,
     ) -> None:
         raw_joined = (
             _join_codex_content_blocks(raw_output)
@@ -1289,97 +1443,118 @@ def parse_codex_records(
             raw_output,
             is_shell=explicit_is_error is not False,
         )
-        if header_exit is not None and header_exit != 0:
-            script_failed = True
-
-        shell_calls, patch_texts = _extract_codex_exec_js_calls(pending.code)
         ts = pending.timestamp or out_timestamp
 
-        if not pending.had_file_events and patch_texts and not script_failed:
+        unmatched_patches = [
+            patch_text
+            for idx, patch_text in enumerate(pending.expected_patches)
+            if idx not in pending.matched_patch_indices
+        ]
+        if unmatched_patches and not script_failed and not is_eof_leftover:
             lower_body = unwrapped_body.lower()
             patch_failed = any(marker in lower_body for marker in _CODEX_PATCH_FAIL_MARKERS)
             if not patch_failed:
-                for patch_text in patch_texts:
-                    _record_patch(
+                for patch_text in unmatched_patches:
+                    new_edits, new_moves = _record_patch(
                         patch_text,
                         ts,
                         pending.call_id,
                         edit_turn_index=pending.turn_index,
                     )
+                    if new_edits:
+                        fallback_patch_records.append(
+                            _FallbackPatchRecord(
+                                paths=frozenset(
+                                    [e.path for e in new_edits] + [m[2] for m in new_moves]
+                                ),
+                                edits=new_edits,
+                                moves=new_moves,
+                            )
+                        )
 
-        if not pending.had_cmd_events:
-            if shell_calls:
-                structured = _extract_codex_exec_results(unwrapped_body)
-                if structured is not None:
-                    for idx, (_, formatted_cmd) in enumerate(shell_calls):
-                        out_text, ec = structured[idx] if idx < len(structured) else ("", None)
-                        is_err = (ec is not None and ec != 0) or (
-                            script_failed and ec is None and idx == len(shell_calls) - 1
-                        )
-                        tool_executions.append(
-                            ToolExecution(
-                                turn_index=pending.turn_index,
-                                tool_name="exec_command",
-                                command=formatted_cmd,
-                                output=out_text,
-                                exit_code=ec,
-                                is_error=is_err,
-                                timestamp=ts,
-                                call_id=(
-                                    pending.call_id
-                                    if len(shell_calls) == 1
-                                    else (f"{pending.call_id}#{idx}" if pending.call_id else None)
-                                ),
-                                seq=pending.seq if idx == 0 else _next_seq(),
-                            )
-                        )
-                else:
-                    for idx, (_, formatted_cmd) in enumerate(shell_calls):
-                        is_last = idx == len(shell_calls) - 1
-                        out_text = unwrapped_body if is_last else ""
-                        ec = header_exit if is_last else None
-                        is_err = is_last and (script_failed or (ec is not None and ec != 0))
-                        tool_executions.append(
-                            ToolExecution(
-                                turn_index=pending.turn_index,
-                                tool_name="exec_command",
-                                command=formatted_cmd,
-                                output=out_text,
-                                exit_code=ec,
-                                is_error=is_err,
-                                timestamp=ts,
-                                call_id=(
-                                    pending.call_id
-                                    if len(shell_calls) == 1
-                                    else (f"{pending.call_id}#{idx}" if pending.call_id else None)
-                                ),
-                                seq=pending.seq if idx == 0 else _next_seq(),
-                            )
-                        )
-            elif not pending.had_file_events:
-                tool_executions.append(
-                    ToolExecution(
-                        turn_index=pending.turn_index,
-                        tool_name="exec",
-                        command=None,
-                        output=unwrapped_body,
-                        exit_code=header_exit,
-                        is_error=script_failed,
-                        timestamp=ts,
-                        call_id=pending.call_id,
-                        seq=pending.seq,
+        unmatched_cmds = [
+            cmd
+            for idx, cmd in enumerate(pending.expected_cmds)
+            if idx not in pending.matched_cmd_indices
+        ]
+        if unmatched_cmds:
+            structured = _extract_codex_exec_results(unwrapped_body)
+            if structured is not None:
+                # Align to the tail when fewer structured results were printed than commands run.
+                offset = max(0, len(unmatched_cmds) - len(structured))
+                for idx, formatted_cmd in enumerate(unmatched_cmds):
+                    res_idx = idx - offset
+                    if 0 <= res_idx < len(structured):
+                        out_text, ec = structured[res_idx]
+                    else:
+                        out_text, ec = "", None
+                    is_err = (ec is not None and ec != 0) or (
+                        script_failed and ec is None and idx == len(unmatched_cmds) - 1
                     )
+                    exe = ToolExecution(
+                        turn_index=pending.turn_index,
+                        tool_name="exec_command",
+                        command=formatted_cmd,
+                        output=out_text,
+                        exit_code=ec,
+                        is_error=is_err,
+                        timestamp=ts,
+                        call_id=(
+                            pending.call_id
+                            if len(unmatched_cmds) == 1
+                            else (f"{pending.call_id}#{idx}" if pending.call_id else None)
+                        ),
+                        seq=pending.seq if idx == 0 else _next_seq(),
+                    )
+                    tool_executions.append(exe)
+                    fallback_cmd_execs.append(exe)
+            elif not is_eof_leftover:
+                for idx, formatted_cmd in enumerate(unmatched_cmds):
+                    is_last = idx == len(unmatched_cmds) - 1
+                    out_text = unwrapped_body if is_last else ""
+                    ec = header_exit if is_last else None
+                    is_err = is_last and (script_failed or (ec is not None and ec != 0))
+                    exe = ToolExecution(
+                        turn_index=pending.turn_index,
+                        tool_name="exec_command",
+                        command=formatted_cmd,
+                        output=out_text,
+                        exit_code=ec,
+                        is_error=is_err,
+                        timestamp=ts,
+                        call_id=(
+                            pending.call_id
+                            if len(unmatched_cmds) == 1
+                            else (f"{pending.call_id}#{idx}" if pending.call_id else None)
+                        ),
+                        seq=pending.seq if idx == 0 else _next_seq(),
+                    )
+                    tool_executions.append(exe)
+                    fallback_cmd_execs.append(exe)
+        elif (
+            not pending.expected_cmds
+            and not pending.expected_patches
+            and not pending.matched_cmd_indices
+            and not pending.matched_patch_indices
+            and not is_eof_leftover
+        ):
+            tool_executions.append(
+                ToolExecution(
+                    turn_index=pending.turn_index,
+                    tool_name="exec",
+                    command=None,
+                    output=unwrapped_body,
+                    exit_code=header_exit,
+                    is_error=script_failed or (header_exit is not None and header_exit != 0),
+                    timestamp=ts,
+                    call_id=pending.call_id,
+                    seq=pending.seq,
                 )
+            )
 
     def _record_file_change_event(item: dict[str, Any], timestamp: str | None) -> None:
         status = (_as_str(item.get("status")) or "completed").lower()
         call_id = _as_str(item.get("id"))
-        active_exec = _active_pending_exec()
-        if active_exec is not None:
-            active_exec.had_file_events = True
-        if status in _CODEX_FAILED_STATUSES or status in _CODEX_SKIPPED_STATUSES:
-            return
-
         raw_changes = item.get("changes")
         entries: list[tuple[str, dict[str, Any]]] = []
         if isinstance(raw_changes, dict):
@@ -1394,6 +1569,21 @@ def parse_codex_records(
                 path_str = _as_str(change.get("path")) or _as_str(change.get("file_path"))
                 if path_str:
                     entries.append((path_str.strip(), change))
+
+        event_paths: set[str] = set()
+        for path_str, change in entries:
+            if path_str:
+                event_paths.add(path_str)
+                mp = _as_str(change.get("move_path"))
+                if mp and mp.strip():
+                    event_paths.add(mp.strip())
+        frozen_paths = frozenset(event_paths)
+
+        if not _claim_open_exec_patch(frozen_paths):
+            _remove_fallback_patch(frozen_paths)
+
+        if status in _CODEX_FAILED_STATUSES or status in _CODEX_SKIPPED_STATUSES:
+            return
 
         for path_str, change in entries:
             if not path_str:
@@ -1443,23 +1633,30 @@ def parse_codex_records(
                 )
 
     def _record_user_turn(text: str, timestamp: str | None, origin: str) -> None:
-        nonlocal turn_index, last_user_origin, activity_since_last_user
+        nonlocal turn_index, activity_since_last_user
         cleaned = sanitize_unicode(text).strip()
         if not cleaned or _is_codex_harness_user_text(cleaned):
             return
-        # Codex frequently logs both response_item(message/user) and event_msg(user_message)
-        # for the exact same user turn; deduplicate consecutive cross-origin emissions even
-        # when one copy has extra attachment/image wrapper text.
-        if (
-            user_turns
-            and not activity_since_last_user
-            and last_user_origin is not None
-            and last_user_origin != origin
-        ):
+        # Codex frequently logs multiple records (response_item/message, event_msg/user_message,
+        # event_msg/item_completed/UserMessage) for the exact same user turn; deduplicate
+        # consecutive cross-origin emissions without merging distinct short replies like "ok".
+        if user_turns and not activity_since_last_user and origin not in last_user_origins:
             prev_text = user_turns[-1].text
-            if prev_text == cleaned or cleaned in prev_text or prev_text in cleaned:
+            shorter, longer = (
+                (prev_text, cleaned) if len(prev_text) <= len(cleaned) else (cleaned, prev_text)
+            )
+            is_same_turn = prev_text == cleaned or (
+                shorter in longer
+                and (
+                    longer.startswith(shorter)
+                    or longer.endswith(shorter)
+                    or (len(shorter) >= 20 and len(shorter) * 2 >= len(longer))
+                )
+            )
+            if is_same_turn:
                 if len(cleaned) > len(prev_text):
                     user_turns[-1].text = cleaned
+                last_user_origins.add(origin)
                 return
         turn_index += 1
         user_turns.append(
@@ -1471,7 +1668,8 @@ def parse_codex_records(
                 seq=_next_seq(),
             )
         )
-        last_user_origin = origin
+        last_user_origins.clear()
+        last_user_origins.add(origin)
         activity_since_last_user = False
 
     def _record_patch(
@@ -1480,8 +1678,8 @@ def parse_codex_records(
         call_id: str | None,
         *,
         edit_turn_index: int | None = None,
-    ) -> None:
-        patch_edits, move_sources = _parse_apply_patch(
+    ) -> tuple[list[FileEdit], list[tuple[str | None, str | None, str]]]:
+        patch_edits, move_pairs = _parse_apply_patch(
             patch_text,
             turn_index=turn_index if edit_turn_index is None else edit_turn_index,
             timestamp=timestamp,
@@ -1489,8 +1687,12 @@ def parse_codex_records(
             next_seq=_next_seq,
         )
         file_edits.extend(patch_edits)
-        for src_path in move_sources:
-            extra_move_paths.append((call_id, None, src_path))
+        added_moves: list[tuple[str | None, str | None, str]] = []
+        for target_path, src_path in move_pairs:
+            entry = (call_id, target_path, src_path)
+            extra_move_paths.append(entry)
+            added_moves.append(entry)
+        return patch_edits, added_moves
 
     for record in records:
         rec_type = _as_str(record.get("type"))
@@ -1518,12 +1720,9 @@ def parse_codex_records(
                     if completed_type == "UserMessage":
                         msg_text = _extract_text_from_content(completed.get("content"))
                         if msg_text:
-                            _record_user_turn(msg_text, timestamp, origin="event_msg")
+                            _record_user_turn(msg_text, timestamp, origin="item_completed")
                     elif completed_type == "CommandExecution":
                         activity_since_last_user = True
-                        active_exec = _active_pending_exec()
-                        if active_exec is not None:
-                            active_exec.had_cmd_events = True
                         status = (_as_str(completed.get("status")) or "").lower()
                         raw_cmd = completed.get("command") or completed.get("cmd")
                         cmd = _format_command_arg(raw_cmd)
@@ -1535,6 +1734,7 @@ def parse_codex_records(
                             stderr = _as_str(completed.get("stderr")) or ""
                             out_text = "\n".join(part for part in (stdout, stderr) if part)
                         exit_code = _as_int(completed.get("exit_code"))
+                        claimed_open = _claim_open_exec_cmd(cmd)
                         if not (
                             status in _CODEX_SKIPPED_STATUSES and exit_code is None and not out_text
                         ):
@@ -1542,19 +1742,32 @@ def parse_codex_records(
                                 exit_code is not None and exit_code != 0
                             )
                             ev_call_id = _as_str(completed.get("id"))
-                            tool_executions.append(
-                                ToolExecution(
-                                    turn_index=turn_index,
-                                    tool_name="exec_command",
-                                    command=cmd,
+                            reconciled = (
+                                False
+                                if claimed_open
+                                else _reconcile_fallback_cmd(
+                                    cmd,
                                     output=out_text or "",
                                     exit_code=exit_code,
                                     is_error=is_error,
                                     timestamp=timestamp,
                                     call_id=ev_call_id,
-                                    seq=_next_seq(),
                                 )
                             )
+                            if not reconciled:
+                                tool_executions.append(
+                                    ToolExecution(
+                                        turn_index=turn_index,
+                                        tool_name="exec_command",
+                                        command=cmd,
+                                        output=out_text or "",
+                                        exit_code=exit_code,
+                                        is_error=is_error,
+                                        timestamp=timestamp,
+                                        call_id=ev_call_id,
+                                        seq=_next_seq(),
+                                    )
+                                )
                             if not is_error:
                                 shell_patch = _extract_patch_from_shell_command(raw_cmd, cmd)
                                 if shell_patch:
@@ -1635,13 +1848,20 @@ def parse_codex_records(
             raw_input = item.get("input")
 
             if tool_name == "exec" and isinstance(raw_input, str):
+                clean_code = sanitize_unicode(raw_input)
+                shell_calls, patch_texts = _extract_codex_exec_js_calls(clean_code)
                 exec_key = call_id or f"__anon_exec_{_next_seq()}"
                 pending_execs[exec_key] = _PendingCodexExec(
                     call_id=call_id,
-                    code=sanitize_unicode(raw_input),
+                    code=clean_code,
                     turn_index=turn_index,
                     timestamp=timestamp,
                     seq=_next_seq(),
+                    expected_cmds=[fmt_cmd for _, fmt_cmd in shell_calls],
+                    expected_patches=patch_texts,
+                    expected_patch_paths=[_extract_patch_paths(p) for p in patch_texts],
+                    matched_cmd_indices=set(),
+                    matched_patch_indices=set(),
                 )
                 open_exec_order.append(exec_key)
                 continue
@@ -1767,6 +1987,7 @@ def parse_codex_records(
             "",
             explicit_is_error=None,
             out_timestamp=None,
+            is_eof_leftover=True,
         )
     pending_execs.clear()
 

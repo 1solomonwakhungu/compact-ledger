@@ -741,7 +741,9 @@ def test_doctor_validates_repo_claude_plugin_cleanly(tmp_path: Path) -> None:
     assert by_name["claude_plugin"].status == "ok"
     assert by_name["claude_plugin"].details["present"] is True
     assert by_name["claude_plugin"].details["hooks_valid"] is True
-    assert by_name["claude_hooks"].status == "ok"
+    # Local plugin source alone warns (does not falsely report hooks active unless installed/wired)
+    assert by_name["claude_hooks"].status == "warn"
+    assert by_name["claude_hooks"].fix == "compact-ledger init --write"
 
 
 def test_doctor_cli_returns_nonzero_when_failing(
@@ -759,5 +761,502 @@ def test_doctor_cli_returns_nonzero_when_failing(
     rc = main(["doctor", "--json"])
     assert rc == 1
     data = json.loads(capsys.readouterr().out)
+    assert data["schema_version"] == 1
     assert data["ok"] is False
     assert "compact-ledger init --write" in data["fixes"]
+
+
+# ---------------------------------------------------------------------------
+# 4. Adversarial regression tests from Fable 5.2 review (B1, B2, M1-M5)
+# ---------------------------------------------------------------------------
+
+
+def test_codex_late_yielded_and_parallel_exec_events_never_double_count() -> None:
+    fail_out = (
+        "=================================== FAILURES ===================================\n"
+        "_________________________________ test_x _______________________________________\n"
+        ">       assert calc() == 100\n"
+        "E       assert 400 == 100\n\n"
+        "tests/test_x.py:10: AssertionError\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_x.py::test_x - assert 400 == 100\n"
+        "============================== 1 failed in 0.04s ===============================\n"
+    )
+    # 1. Late CommandExecution after Script completed (B1)
+    late_records: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": {"id": "codex-late"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "late_1",
+                "input": (
+                    'const r = await tools.exec_command({cmd: "pytest tests/test_x.py"}); '
+                    "text(r.output);"
+                ),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "late_1",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "Script completed\nWall time 0.2 seconds\nOutput:\n",
+                    },
+                    {"type": "input_text", "text": fail_out},
+                ],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "cmd-late-1",
+                    "command": ["/bin/zsh", "-lc", "pytest tests/test_x.py"],
+                    "status": "failed",
+                    "exit_code": 1,
+                    "aggregated_output": fail_out,
+                },
+            },
+        },
+    ]
+    parsed_late = parse_transcript_lines(_jsonl(late_records))
+    assert len(parsed_late.tool_executions) == 1
+    assert parsed_late.tool_executions[0].exit_code == 1
+    _, trajs, _ = build_attempt_ledger(parsed_late)
+    assert len(trajs) == 1
+    assert trajs[0].status == "SINGLE_FAILURE"
+    assert len(trajs[0].attempts) == 1
+
+    # 2. Yielded exec ("Script running with cell ID ...") followed later by CommandExecution
+    yielded_records: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": {"id": "codex-yield"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "y1",
+                "input": 'await tools.exec_command({cmd: "pytest tests/test_x.py"});',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "y1",
+                "output": "Script running with cell ID g1:1",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "cmd-y1",
+                    "command": ["/bin/zsh", "-lc", "pytest tests/test_x.py"],
+                    "status": "failed",
+                    "exit_code": 1,
+                    "aggregated_output": fail_out,
+                },
+            },
+        },
+    ]
+    parsed_yield = parse_transcript_lines(_jsonl(yielded_records))
+    assert len(parsed_yield.tool_executions) == 1
+    assert parsed_yield.tool_executions[0].exit_code == 1
+    assert "assert 400 == 100" in parsed_yield.tool_executions[0].output
+
+    # 3. Two parallel execs open at once + late FileChange after exec output
+    parallel_records: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": {"id": "codex-par"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "p1",
+                "input": 'await tools.exec_command({cmd: "pytest tests/test_a.py"});',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "p2",
+                "input": 'await tools.exec_command({cmd: "pytest tests/test_b.py"});',
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "ev-a",
+                    "command": ["pytest", "tests/test_a.py"],
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregated_output": "1 passed",
+                },
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "ev-b",
+                    "command": ["pytest", "tests/test_b.py"],
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregated_output": "1 passed",
+                },
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": "p1", "output": "ok"},
+        },
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": "p2", "output": "ok"},
+        },
+        # Late FileChange after custom_tool_call_output must replace fallback, not duplicate
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "p_fc",
+                "input": (
+                    'await tools.apply_patch("*** Begin Patch\\n'
+                    '*** Update File: src/a.py\\n@@\\n-1\\n+2\\n*** End Patch");'
+                ),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": "p_fc", "output": "{}"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "FileChange",
+                    "id": "fc-late",
+                    "status": "completed",
+                    "changes": {
+                        "src/a.py": {
+                            "type": "update",
+                            "unified_diff": "@@ -1,1 +1,1 @@\n-1\n+2\n",
+                        }
+                    },
+                },
+            },
+        },
+    ]
+    parsed_par = parse_transcript_lines(_jsonl(parallel_records))
+    assert len(parsed_par.tool_executions) == 2
+    assert len(parsed_par.file_edits) == 1
+    assert parsed_par.modified_files == ["src/a.py"]
+
+
+def test_codex_patch_survives_failing_cmd_tail_alignment_shorthand_and_quadratic_guard() -> None:
+    # M2: apply_patch followed by failing pytest in the SAME exec script keeps the patch!
+    # M3: 2 commands run, only the 2nd structured JSON result printed -> aligns to tail!
+    records: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": {"id": "codex-m2-m3"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "combo_1",
+                "input": (
+                    'await tools.apply_patch("*** Begin Patch\\n'
+                    '*** Update File: src/calc.py\\n@@\\n-return 1\\n+return 2\\n*** End Patch");\n'
+                    'await tools.exec_command({cmd: "ruff check ."});\n'
+                    'const r = await tools.exec_command({cmd: "pytest tests/test_calc.py"});\n'
+                    "text(JSON.stringify(r));"
+                ),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "combo_1",
+                "output": json.dumps({"exit_code": 1, "output": "FAILED test_calc"}),
+            },
+        },
+        # Shorthand {cmd} + string concatenation
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "short_1",
+                "input": 'const cmd = "pytest -q"; await tools.exec_command({cmd});',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "short_1",
+                "output": json.dumps({"exit_code": 0, "output": "1 passed"}),
+            },
+        },
+        # Aborted exec at EOF with no output must NOT record apply_patch as applied
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "aborted_eof",
+                "input": (
+                    'await tools.apply_patch("*** Begin Patch\\n'
+                    '*** Add File: src/aborted.py\\n+x=1\\n*** End Patch");'
+                ),
+            },
+        },
+    ]
+    parsed = parse_transcript_lines(_jsonl(records))
+    assert parsed.modified_files == ["src/calc.py"]
+    assert "src/aborted.py" not in parsed.modified_files
+    by_cmd = {e.command: e for e in parsed.tool_executions}
+    assert by_cmd["ruff check ."].exit_code is None
+    assert by_cmd["ruff check ."].output == ""
+    assert by_cmd["pytest tests/test_calc.py"].exit_code == 1
+    assert "FAILED test_calc" in by_cmd["pytest tests/test_calc.py"].output
+    assert by_cmd["pytest -q"].exit_code == 0
+
+    # M5: 40KB identifier in object must stay strictly O(N) (< 0.2s)
+    huge_ident = "a" * 40_000
+    perf_records = [
+        {"type": "session_meta", "payload": {"id": "codex-m5"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "m5",
+                "input": f"await tools.exec_command({{cmd: {huge_ident}}});",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": "m5", "output": "ok"},
+        },
+    ]
+    t0 = time.perf_counter()
+    parse_transcript_lines(_jsonl(perf_records))
+    assert time.perf_counter() - t0 < 0.2
+
+
+def test_codex_three_origin_user_dedup_and_short_reply_isolation() -> None:
+    records: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": {"id": "codex-dedup"}},
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "Never use tokio."}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Never use tokio."}],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "UserMessage",
+                    "content": [{"type": "text", "text": "Never use tokio."}],
+                },
+            },
+        },
+        # Short distinct message "ok" must NOT be merged into "Never use tokio."
+        {"type": "event_msg", "payload": {"type": "user_message", "message": "ok"}},
+    ]
+    parsed = parse_transcript_lines(_jsonl(records))
+    assert [t.text for t in parsed.user_turns] == ["Never use tokio.", "ok"]
+
+
+@pytest.mark.parametrize(
+    ("ban", "later_turn"),
+    [
+        (
+            "Don't add any new third-party dependencies.",
+            "Actually use the existing third-party dependencies for retries.",
+        ),
+        ("Never use os.system.", "Actually use os.path.join for paths."),
+        ("Never use console.log.", "Actually use console.table for the debug output."),
+        ("Never use Python 2.", "Actually use Python 3.12."),
+        ("Never use port 22.", "Actually use port 8080."),
+        ("Never use TLS 1.0.", "Actually use TLS 1.3 for external traffic."),
+        ("Never use sudo.", "Actually use apt without sudo."),
+        ("Never use lodash.", "Actually use anything but lodash."),
+        ("Never use mocks.", "Actually use real services unless you must use mocks."),
+        ("Never use mocks.", "Actually we no longer use mocks anywhere, keep it that way."),
+        ("Never use tabs.", "Actually the old code used to use tabs, keep ignoring that."),
+        ("Never use redis.", "Actually use port 9090. Also we could use redis later maybe."),
+        ("Never use mocks in integration tests.", "Actually use mocks in unit tests."),
+        ("Never use console.log.", "Actually use console.log in the debug script."),
+    ],
+)
+def test_b2_adversarial_overrides_never_falsely_retire_unrelated_bans(
+    ban: str,
+    later_turn: str,
+) -> None:
+    pins = extract_pins(_turns(ban, later_turn))
+    active = _active_texts(pins)
+    assert ban in active, f"Ban {ban!r} was falsely retired by {later_turn!r}! active={active}"
+
+
+def test_m1_retracting_override_reactivates_extra_retired_ban() -> None:
+    # Retracting with "Scratch that." reactivates "Never use spaces."
+    pins = extract_pins(
+        _turns(
+            "Use tabs. Never use spaces.",
+            "Actually use 2 spaces instead of tabs.",
+            "Scratch that.",
+        )
+    )
+    active = _active_texts(pins)
+    assert "Never use spaces." in active
+
+    # Follow-up override that STILL adopts spaces keeps "Never use spaces." retired!
+    still_spaces = extract_pins(
+        _turns(
+            "Use tabs. Never use spaces.",
+            "Actually use 2 spaces instead of tabs.",
+            "Actually use 4 spaces instead of 2 spaces.",
+        )
+    )
+    assert "Never use spaces." not in _active_texts(still_spaces)
+    assert "Actually use 4 spaces instead of 2 spaces." in _active_texts(still_spaces)
+
+    # Switching back to tabs reactivates "Never use spaces."!
+    back_to_tabs = extract_pins(
+        _turns(
+            "Use tabs. Never use spaces.",
+            "Actually use 2 spaces instead of tabs.",
+            "Actually use tabs instead of spaces.",
+        )
+    )
+    assert "Never use spaces." in _active_texts(back_to_tabs)
+
+
+def test_m4_doctor_scopes_unrelated_plugin_disable_all_hooks_and_symlink_fixes(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    _make_fake_cli(fake_bin)
+
+    # 1. Unrelated .claude-plugin/ repo with hooks in settings.local.json -> completely OK!
+    proj = tmp_path / "other-plugin-repo"
+    proj.mkdir()
+    (proj / ".git").mkdir()
+    (proj / ".claude-plugin").mkdir()
+    (proj / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "my-other-plugin", "version": "1.0.0"}), encoding="utf-8"
+    )
+    (proj / ".claude").mkdir()
+    (proj / ".claude" / "settings.local.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreCompact": [
+                        {
+                            "matcher": "",
+                            "hooks": [
+                                {"type": "command", "command": "compact-ledger hook pre-compact"}
+                            ],
+                        }
+                    ],
+                    "SessionStart": [
+                        {
+                            "matcher": "compact|resume",
+                            "hooks": [
+                                {"type": "command", "command": "compact-ledger hook session-start"}
+                            ],
+                        }
+                    ],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    # Repo .gitignore using .compact-ledger/* pattern
+    (proj / ".gitignore").write_text(".compact-ledger/*\n", encoding="utf-8")
+    (proj / ".compact-ledger").mkdir()
+
+    r1 = run_doctor(cwd=proj, env={"PATH": str(fake_bin)}, home_dir=tmp_path / "h1")
+    assert r1.ok is True
+    by1 = {c.name: c for c in r1.checks}
+    assert by1["claude_plugin"].status == "ok"
+    assert by1["claude_hooks"].status == "ok"
+    assert by1["store"].status == "ok"
+
+    # 2. disableAllHooks: true must report FAIL!
+    (proj / ".claude" / "settings.json").write_text(
+        json.dumps({"disableAllHooks": True}), encoding="utf-8"
+    )
+    r2 = run_doctor(cwd=proj, env={"PATH": str(fake_bin)}, home_dir=tmp_path / "h1")
+    assert r2.ok is False
+    by2 = {c.name: c for c in r2.checks}
+    assert by2["claude_hooks"].status == "fail"
+    assert "disableAllHooks" in by2["claude_hooks"].summary
+
+    # 3. Installed plugin in ~/.claude/settings.json -> hooks OK!
+    p3 = tmp_path / "plugin-user-proj"
+    p3.mkdir()
+    home3 = tmp_path / "h3"
+    (home3 / ".claude").mkdir(parents=True)
+    (home3 / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"compact-ledger@marketplace": True}}),
+        encoding="utf-8",
+    )
+    r3 = run_doctor(cwd=p3, env={"PATH": str(fake_bin)}, home_dir=home3)
+    assert r3.ok is True
+    by3 = {c.name: c for c in r3.checks}
+    assert by3["claude_hooks"].status == "ok"
+
+    # 4. Symlinked sessions/ targets sessions in fix command (not parent dir),
+    #    and symlinked .gitignore removes symlink before writing!
+    if sys.platform != "win32":
+        p4 = tmp_path / "sym-proj"
+        p4.mkdir()
+        st = p4 / ".compact-ledger"
+        st.mkdir()
+        real_target = tmp_path / "outside"
+        real_target.mkdir()
+        (st / "sessions").symlink_to(real_target)
+        r4 = run_doctor(cwd=p4, env={"PATH": str(fake_bin)}, home_dir=tmp_path / "h4")
+        by4 = {c.name: c for c in r4.checks}
+        assert by4["store"].status == "fail"
+        assert "sessions" in (by4["store"].fix or "")
+
+        p5 = tmp_path / "sym-ignore"
+        p5.mkdir()
+        st5 = p5 / ".compact-ledger"
+        st5.mkdir()
+        victim = tmp_path / "victim.txt"
+        victim.write_text("keep", encoding="utf-8")
+        (st5 / ".gitignore").symlink_to(victim)
+        r5 = run_doctor(cwd=p5, env={"PATH": str(fake_bin)}, home_dir=tmp_path / "h5")
+        by5 = {c.name: c for c in r5.checks}
+        assert by5["store"].status == "warn"
+        assert "rm " in (by5["store"].fix or "")
