@@ -67,6 +67,9 @@ def test_sanitize_session_id_prevents_traversal_and_collisions(tmp_path: Path) -
         "a" * 300 + "2",
         "unicode-session-\u2603",
         "spaces in id",
+        "abc\n",
+        "surrogate-\ud83d",
+        "surrogate-\ud83e",
     ]
     # Also test hash-marker spoofing collision attempt
     spoof_target = sanitize_session_id("a/b")
@@ -78,6 +81,7 @@ def test_sanitize_session_id_prevents_traversal_and_collisions(tmp_path: Path) -
         assert "/" not in safe
         assert "\\" not in safe
         assert ".." not in safe
+        assert "\n" not in safe
         assert len(safe) <= 128
         path = store.session_path(sid)
         assert path.parent == sessions_root
@@ -208,7 +212,72 @@ def test_list_clear_and_corrupt_snapshot_handling(tmp_path: Path) -> None:
     recovered = store.save_snapshot(CompactionSnapshot(session_id="sess-corrupt"))
     assert recovered.session_id == "sess-corrupt"
     assert store.load_snapshot("sess-corrupt") is not None
+    # Corrupt file was quarantined rather than silently destroyed
+    assert corrupt_path.with_name(f"{corrupt_path.name}.corrupt").is_file()
 
     assert store.clear_session("sess-b") is True
     assert store.clear_session("sess-b") is False
     assert "sess-b" not in store.list_sessions()
+
+
+def test_save_snapshot_allows_updating_existing_manual_pin_and_remove_manual_pin(
+    tmp_path: Path,
+) -> None:
+    store = SessionStore(store_dir=tmp_path)
+    pin = store.add_manual_pin("s1", "Use June 30 deadline", tags=["deadline"])
+
+    # PR 2 loads snapshot, marks manual pin as superseded, adds a tag, and saves
+    loaded = store.load_snapshot("s1")
+    assert loaded is not None
+    loaded.pins[0].superseded_by = "pin-override-99"
+    loaded.pins[0].tags.append("superseded")
+    loaded.pins.append(
+        PinEntry(
+            pin_id="pin-override-99",
+            text="Actually use July 31",
+            source="override",
+            supersedes=pin.pin_id,
+        )
+    )
+    store.save_snapshot(loaded)
+
+    reloaded = store.load_snapshot("s1")
+    assert reloaded is not None
+    manual = next(p for p in reloaded.pins if p.pin_id == pin.pin_id)
+    assert manual.superseded_by == "pin-override-99"
+    assert "superseded" in manual.tags
+
+    # Explicit removal works and does not resurrect
+    assert store.remove_manual_pin("s1", pin.pin_id) is True
+    assert store.remove_manual_pin("s1", pin.pin_id) is False
+    assert store.list_manual_pins("s1") == []
+
+
+def test_store_resilience_to_binary_files_mismatched_ids_and_symlinks(tmp_path: Path) -> None:
+    store = SessionStore(store_dir=tmp_path / "store")
+    store.save_snapshot(CompactionSnapshot(session_id="valid-1"))
+
+    # Non-UTF-8 binary file in sessions_dir must not crash list_sessions
+    (store.sessions_dir / "binary.json").write_bytes(b"\xff\xfe\x00\x01")
+    # Mismatched embedded session_id must not create duplicates or spoof entries
+    (store.sessions_dir / "other.json").write_text('{"session_id": "valid-1"}', encoding="utf-8")
+    assert store.list_sessions() == ["valid-1"]
+
+    # Symlinked sessions directory is rejected
+    real_target = tmp_path / "elsewhere"
+    real_target.mkdir()
+    symlink_root = tmp_path / "sym-store"
+    symlink_root.mkdir()
+    (symlink_root / "sessions").symlink_to(real_target)
+    sym_store = SessionStore(store_dir=symlink_root)
+    with pytest.raises(ValueError, match="symlinked"):
+        sym_store.save_snapshot(CompactionSnapshot(session_id="s1"))
+
+
+def test_store_handles_lone_surrogates_in_pin_and_session_id(tmp_path: Path) -> None:
+    store = SessionStore(store_dir=tmp_path)
+    pin = store.add_manual_pin("sess-\ud83d", "Keep emoji \ud83d safe")
+    assert "\ufffd" in pin.text
+    loaded = store.load_snapshot("sess-\ud83d")
+    assert loaded is not None
+    assert loaded.pins[0].text == pin.text

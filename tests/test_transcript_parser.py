@@ -104,7 +104,7 @@ def test_parse_claude_code_transcript_full(tmp_path: Path) -> None:
                         "type": "tool_result",
                         "tool_use_id": "toolu_bash_1",
                         "is_error": True,
-                        "content": [{"type": "text", "text": "E   assert 400 == 100\nExit code 1"}],
+                        "content": [{"type": "text", "text": "Exit code 1\nE   assert 400 == 100"}],
                     }
                 ],
             },
@@ -381,7 +381,7 @@ def test_parse_codex_local_shell_and_move_patch() -> None:
         {
             "type": "local_shell_call_output",
             "call_id": "ls_1",
-            "output": "--- FAIL: TestAuth\nExit code: 1",
+            "output": "Exit code: 1\nOutput:\n--- FAIL: TestAuth\n",
         },
         {
             "type": "function_call",
@@ -476,3 +476,313 @@ def test_resilience_to_malformed_lines_and_unexpected_types() -> None:
 
     with pytest.raises(FileNotFoundError):
         parse_transcript(Path("/nonexistent/path/to/transcript.jsonl"))
+
+
+def test_exit_code_scanning_avoids_false_positives_and_redos() -> None:
+    import time
+
+    records = [
+        {"type": "user", "message": {"role": "user", "content": "Inspect logs and run tests."}},
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "t_read",
+                        "name": "Read",
+                        "input": {"file_path": "ci.log"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "t_ok_bash",
+                        "name": "Bash",
+                        "input": {"command": "pytest"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "t_hdr",
+                        "name": "Bash",
+                        "input": {"command": "run"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "t_nl",
+                        "name": "Bash",
+                        "input": {"command": "spam"},
+                    },
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t_read",
+                        "is_error": False,
+                        "content": "Process exited with code 137\nExit code: 2\n",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t_ok_bash",
+                        "is_error": False,
+                        "content": "Exit code 1\nchild exited with code 1 as expected",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t_hdr",
+                        "is_error": True,
+                        "content": "Exit code 2\nlog line\nProcess exited with code 0",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t_nl",
+                        "is_error": True,
+                        "content": "\n" * 50_000 + "done",
+                    },
+                ],
+            },
+        },
+    ]
+
+    t0 = time.monotonic()
+    parsed = parse_transcript_lines(_jsonl(records))
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.5
+
+    by_id = {t.call_id: t for t in parsed.tool_executions}
+    assert by_id["t_read"].exit_code is None
+    assert by_id["t_read"].is_error is False
+    assert by_id["t_ok_bash"].exit_code is None
+    assert by_id["t_ok_bash"].is_error is False
+    assert by_id["t_hdr"].exit_code == 2
+    assert by_id["t_hdr"].is_error is True
+    assert by_id["t_nl"].exit_code is None
+
+
+def test_seq_ordering_interleaves_edits_and_tests_and_excludes_failed_edits() -> None:
+    records = [
+        {"type": "user", "message": {"role": "user", "content": "Fix calc bug"}},
+        {
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "e1",
+                        "name": "Edit",
+                        "input": {"file_path": "a.py", "old_string": "1", "new_string": "2"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "b1",
+                        "name": "Bash",
+                        "input": {"command": "pytest"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "e_fail",
+                        "name": "Edit",
+                        "input": {"file_path": "nope.py", "old_string": "x", "new_string": "y"},
+                    },
+                    {
+                        "type": "tool_use",
+                        "id": "e2",
+                        "name": "Edit",
+                        "input": {"file_path": "a.py", "old_string": "2", "new_string": "3"},
+                    },
+                ],
+            },
+        },
+        {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "e1",
+                        "is_error": False,
+                        "content": "ok",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "b1",
+                        "is_error": True,
+                        "content": "Exit code 1\nFAIL",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "e_fail",
+                        "is_error": True,
+                        "content": "String to replace not found",
+                    },
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "e2",
+                        "is_error": False,
+                        "content": "ok",
+                    },
+                ],
+            },
+        },
+    ]
+    parsed = parse_transcript_lines(_jsonl(records))
+    assert parsed.modified_files == ["a.py"]
+    assert [e.call_id for e in parsed.file_edits] == ["e1", "e2"]
+    b1 = next(t for t in parsed.tool_executions if t.call_id == "b1")
+    e1, e2 = parsed.file_edits
+    # Same turn_index, but seq strictly orders e1 < b1 < e2
+    assert e1.turn_index == b1.turn_index == e2.turn_index == 1
+    assert parsed.user_turns[0].seq < e1.seq < b1.seq < e2.seq
+
+
+def test_codex_apply_patch_preserves_plus_minus_lines_and_shell_patch_and_output_unwrapping() -> (
+    None
+):
+    patch = "\n".join(
+        [
+            "*** Begin Patch",
+            "*** Update File: query.sql",
+            "@@ -1,3 +1,3 @@",
+            "---",
+            "--- old comment",
+            "+++i;",
+            "@@ -10,1 +10,1 @@",
+            "-old2",
+            "+new2",
+            "*** End Patch",
+        ]
+    )
+    records = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "<environment_context>cwd=/repo</environment_context>",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {"type": "user_message", "message": "Apply SQL fix"},
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "shell",
+                "call_id": "c_patch",
+                "arguments": json.dumps({"command": ["apply_patch", patch]}),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "c_patch",
+                "output": "Exit code: 0\nOutput:\nProcess exited with code 3\n",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "c_plain",
+                "arguments": json.dumps({"cmd": "echo hi"}),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "c_plain",
+                "output": "header line\nOutput:\nbody line",
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "exec_command",
+                "call_id": "c_json_stdout",
+                "arguments": json.dumps({"cmd": "cat report.json"}),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "c_json_stdout",
+                "output": json.dumps({"output": {"count": 3}, "status": "ok"}),
+            },
+        },
+    ]
+
+    parsed = parse_transcript_lines(_jsonl(records))
+    assert [t.text for t in parsed.user_turns] == ["Apply SQL fix"]
+    # Two hunks in query.sql produce two contiguous FileEdits without dropping '--'/'++'
+    assert len(parsed.file_edits) == 2
+    assert parsed.file_edits[0].old_text == "--\n-- old comment"
+    assert parsed.file_edits[0].new_text == "++i;"
+    assert parsed.file_edits[1].old_text == "old2"
+    assert parsed.file_edits[1].new_text == "new2"
+
+    by_id = {t.call_id: t for t in parsed.tool_executions}
+    # Header Exit code: 0 must NOT be overridden by body 'Process exited with code 3'
+    assert by_id["c_patch"].exit_code == 0
+    assert by_id["c_patch"].is_error is False
+    # Non-Codex-header plain output containing 'Output:\n' is preserved intact
+    assert by_id["c_plain"].output == "header line\nOutput:\nbody line"
+    # Raw JSON stdout with non-string 'output' key is preserved instead of returning ""
+    assert '"count": 3' in by_id["c_json_stdout"].output
+
+
+def test_fail_open_on_recursion_huge_int_superscript_bom_and_surrogates() -> None:
+    deep_nested = "[" * 2000 + "]" * 2000
+    huge_int = '{"x": ' + ("9" * 5000) + "}"
+    bom_first = "\ufeff" + json.dumps({"role": "user", "content": "First turn \ud83d"})
+    superscript_exit = json.dumps(
+        {"role": "tool", "command": "pytest", "output": "ok", "exit_code": "\u00b2"}
+    )
+    parsed = parse_transcript_lines([bom_first, deep_nested, huge_int, superscript_exit])
+    assert parsed.format == "generic"
+    assert len(parsed.user_turns) == 1
+    assert parsed.user_turns[0].text == "First turn \ufffd"
+    assert len(parsed.tool_executions) == 1
+    assert parsed.tool_executions[0].exit_code is None
+
+
+def test_claude_noise_entries_excluded_from_user_turns() -> None:
+    records = [
+        {
+            "type": "user",
+            "isSidechain": True,
+            "message": {"role": "user", "content": "Subagent prompt"},
+        },
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "[Request interrupted by user]"},
+        },
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "<command-name>/compact</command-name>"},
+        },
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "Keep zero runtime deps."},
+        },
+    ]
+    parsed = parse_transcript_lines(_jsonl(records))
+    assert [t.text for t in parsed.user_turns] == ["Keep zero runtime deps."]

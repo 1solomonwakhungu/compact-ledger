@@ -16,6 +16,7 @@ from compact_ledger.models import (
     ParsedTranscript,
     ToolExecution,
     UserTurn,
+    sanitize_unicode,
 )
 
 SUPPORTED_FORMATS: frozenset[str] = frozenset({"auto", "claude-code", "codex", "generic"})
@@ -41,17 +42,34 @@ _SHELL_TOOL_NAMES = frozenset(
     {"bash", "shell", "shell_command", "exec_command", "local_shell", "container.exec"}
 )
 
-_EXIT_CODE_PATTERNS = (
-    re.compile(r"(?:^|\n)\s*Process exited with code\s+(-?\d+)\b", re.IGNORECASE),
-    re.compile(r"(?:^|\n)\s*Exit code[:\s]+(-?\d+)\b", re.IGNORECASE),
-    re.compile(r"(?:^|\n)\s*Command exited with (?:non-zero )?status\s+(-?\d+)\b", re.IGNORECASE),
-    re.compile(r"\bexited with (?:code|status)\s+(-?\d+)\b", re.IGNORECASE),
+_ASCII_INT_RE = re.compile(r"-?[0-9]{1,18}")
+_HEADER_EXIT_CODE_RE = re.compile(
+    r"^(?:Exit code[:\s]+|Command exited with (?:non-zero )?status\s+|Process exited with code\s+)"
+    r"(-?[0-9]{1,9})\b",
+    re.IGNORECASE,
 )
-_CODEX_OUTPUT_MARKER_RE = re.compile(r"(?:^|\n)Output:\n", re.MULTILINE)
+_CODEX_HEADER_PREFIXES = (
+    "Chunk ID:",
+    "Wall time:",
+    "Process exited with code ",
+    "Exit code:",
+    "Original token count:",
+)
+_CLAUDE_NOISE_EXACT = frozenset({"[Request interrupted by user]"})
+_CLAUDE_WRAPPER_TAG_RE = re.compile(
+    r"^\s*<(?:command-name|command-message|command-args|local-command-stdout|local-command-caveat)>"
+)
+_CODEX_HARNESS_PREFIXES = (
+    "<environment_context>",
+    "# AGENTS.md instructions",
+    "<INSTRUCTIONS>",
+)
+_BEGIN_PATCH_MARKER = "*** Begin Patch"
+_END_PATCH_MARKER = "*** End Patch"
 
 
 def _as_str(value: Any) -> str | None:
-    return value if isinstance(value, str) else None
+    return sanitize_unicode(value) if isinstance(value, str) else None
 
 
 def _as_int(value: Any) -> int | None:
@@ -61,8 +79,7 @@ def _as_int(value: Any) -> int | None:
         return value
     if isinstance(value, str):
         stripped = value.strip()
-        is_neg_digits = stripped.startswith("-") and stripped[1:].isdigit()
-        if stripped and (stripped.isdigit() or is_neg_digits):
+        if _ASCII_INT_RE.fullmatch(stripped):
             return int(stripped)
     return None
 
@@ -79,50 +96,72 @@ def _add_modified_file(modified_files: list[str], seen: set[str], path: str | No
 def _extract_text_from_content(content: Any) -> str:
     """Extract joined text from a string or list of content blocks."""
     if isinstance(content, str):
-        return content
+        return sanitize_unicode(content)
     if isinstance(content, list):
         parts: list[str] = []
         for block in content:
             if isinstance(block, str):
-                parts.append(block)
+                parts.append(sanitize_unicode(block))
             elif isinstance(block, dict):
                 btype = block.get("type")
                 if btype in ("text", "input_text", "output_text", None):
                     text = block.get("text")
                     if isinstance(text, str):
-                        parts.append(text)
+                        parts.append(sanitize_unicode(text))
         return "\n".join(parts)
     return ""
 
 
-def _extract_exit_code_from_text(text: str) -> int | None:
+def _extract_exit_code_from_first_line(text: str) -> int | None:
+    """Extract an exit code strictly from the first line (O(1), no body scan)."""
     if not text:
         return None
-    for pattern in _EXIT_CODE_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            return int(match.group(1))
+    first_line = text.split("\n", 1)[0].strip()
+    match = _HEADER_EXIT_CODE_RE.match(first_line)
+    if match:
+        return int(match.group(1))
     return None
 
 
 def _format_command_arg(cmd: Any) -> str | None:
     if isinstance(cmd, str):
-        return cmd
+        return sanitize_unicode(cmd)
     if isinstance(cmd, list) and all(isinstance(part, str) for part in cmd) and cmd:
+        clean_parts = [sanitize_unicode(part) for part in cmd]
         if (
-            len(cmd) == 3
-            and cmd[0] in ("bash", "sh", "zsh", "/bin/bash", "/bin/sh", "/bin/zsh")
-            and cmd[1] in ("-c", "-lc")
+            len(clean_parts) == 3
+            and clean_parts[0] in ("bash", "sh", "zsh", "/bin/bash", "/bin/sh", "/bin/zsh")
+            and clean_parts[1] in ("-c", "-lc")
         ):
-            return cmd[2]
+            return clean_parts[2]
         if (
-            len(cmd) == 4
-            and cmd[0] in ("env", "/usr/bin/env")
-            and cmd[1] in ("bash", "sh", "zsh")
-            and cmd[2] in ("-c", "-lc")
+            len(clean_parts) == 4
+            and clean_parts[0] in ("env", "/usr/bin/env")
+            and clean_parts[1] in ("bash", "sh", "zsh")
+            and clean_parts[2] in ("-c", "-lc")
         ):
-            return cmd[3]
-        return shlex.join(cmd)
+            return clean_parts[3]
+        return shlex.join(clean_parts)
+    return None
+
+
+def _extract_patch_from_shell_command(raw_cmd: Any, formatted_cmd: str | None) -> str | None:
+    """Detect ``apply_patch`` invoked via a shell command or argv list."""
+    if (
+        isinstance(raw_cmd, list)
+        and len(raw_cmd) >= 2
+        and isinstance(raw_cmd[0], str)
+        and Path(raw_cmd[0]).name == "apply_patch"
+        and isinstance(raw_cmd[1], str)
+    ):
+        return sanitize_unicode(raw_cmd[1])
+
+    if formatted_cmd and _BEGIN_PATCH_MARKER in formatted_cmd:
+        start = formatted_cmd.find(_BEGIN_PATCH_MARKER)
+        end = formatted_cmd.find(_END_PATCH_MARKER, start)
+        if end != -1:
+            return formatted_cmd[start : end + len(_END_PATCH_MARKER)]
+        return formatted_cmd[start:]
     return None
 
 
@@ -131,78 +170,108 @@ def _parse_apply_patch(
     *,
     turn_index: int,
     timestamp: str | None,
+    call_id: str | None = None,
+    next_seq: Any = None,
 ) -> tuple[list[FileEdit], list[str]]:
-    """Parse Codex ``apply_patch`` format into ``FileEdit`` records and modified paths."""
+    """Parse Codex ``apply_patch`` format into contiguous ``FileEdit`` records."""
     edits: list[FileEdit] = []
-    paths: list[str] = []
-    seen: set[str] = set()
+    extra_paths: list[str] = []
+    seen_extra: set[str] = set()
 
     current_path: str | None = None
     current_op: FileOperation | None = None
     old_lines: list[str] = []
     new_lines: list[str] = []
+    emitted_hunk_for_file = False
 
-    def _flush() -> None:
-        nonlocal current_path, current_op, old_lines, new_lines
-        if current_path is not None and current_op is not None:
-            old_text = "\n".join(old_lines) if old_lines else None
-            new_text = "\n".join(new_lines) if new_lines else None
-            edits.append(
-                FileEdit(
-                    turn_index=turn_index,
-                    path=current_path,
-                    operation=current_op,
-                    old_text=old_text,
-                    new_text=new_text,
-                    timestamp=timestamp,
-                )
+    def _emit_hunk(*, force: bool = False) -> None:
+        nonlocal old_lines, new_lines, emitted_hunk_for_file
+        if current_path is None or current_op is None:
+            return
+        if not force and not old_lines and not new_lines:
+            return
+        seq_val = next_seq() if callable(next_seq) else 0
+        edits.append(
+            FileEdit(
+                turn_index=turn_index,
+                path=current_path,
+                operation=current_op,
+                old_text="\n".join(old_lines) if old_lines else None,
+                new_text="\n".join(new_lines) if new_lines else None,
+                timestamp=timestamp,
+                call_id=call_id,
+                seq=seq_val,
             )
-            _add_modified_file(paths, seen, current_path)
+        )
+        old_lines = []
+        new_lines = []
+        emitted_hunk_for_file = True
+
+    def _flush_file() -> None:
+        nonlocal current_path, current_op, old_lines, new_lines, emitted_hunk_for_file
+        if (
+            current_path is not None
+            and current_op is not None
+            and (not emitted_hunk_for_file or old_lines or new_lines)
+        ):
+            _emit_hunk(force=not emitted_hunk_for_file)
         current_path = None
         current_op = None
         old_lines = []
         new_lines = []
+        emitted_hunk_for_file = False
 
-    for line in patch_text.splitlines():
+    normalized_text = sanitize_unicode(patch_text).replace("\r\n", "\n")
+    for line in normalized_text.split("\n"):
         if line.startswith("*** Update File:"):
-            _flush()
+            _flush_file()
             current_path = line.split(":", 1)[1].strip()
             current_op = "edit"
         elif line.startswith("*** Add File:"):
-            _flush()
+            _flush_file()
             current_path = line.split(":", 1)[1].strip()
             current_op = "write"
         elif line.startswith("*** Delete File:"):
-            _flush()
+            _flush_file()
             current_path = line.split(":", 1)[1].strip()
             current_op = "delete"
         elif line.startswith("*** Move to:"):
             if current_path is not None:
-                _add_modified_file(paths, seen, current_path)
+                _add_modified_file(extra_paths, seen_extra, current_path)
                 moved = line.split(":", 1)[1].strip()
                 if moved:
                     current_path = moved
-        elif line.startswith("*** End Patch") or line.startswith("*** End of File"):
-            _flush()
+        elif line.startswith(_END_PATCH_MARKER) or line.startswith("*** End of File"):
+            _flush_file()
+        elif line.startswith("@@"):
+            if current_op == "edit" and (old_lines or new_lines):
+                _emit_hunk(force=False)
         elif current_op is not None:
-            if line.startswith("+") and not line.startswith("+++"):
+            # In Codex apply_patch format, every '+'/'-' line inside a file section is
+            # real content (never unified-diff '+++'/'---' file headers).
+            if line.startswith("+"):
                 new_lines.append(line[1:])
-            elif line.startswith("-") and not line.startswith("---"):
+            elif line.startswith("-"):
                 old_lines.append(line[1:])
 
-    _flush()
-    return edits, paths
+    _flush_file()
+    return edits, extra_paths
 
 
 def _iter_json_records(lines: Iterable[str]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
+    first = True
     for raw_line in lines:
+        if first:
+            first = False
+            if raw_line.startswith("\ufeff"):
+                raw_line = raw_line[1:]
         stripped = raw_line.strip()
         if not stripped:
             continue
         try:
             parsed = json.loads(stripped)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, RecursionError):
             continue
         if isinstance(parsed, dict):
             records.append(parsed)
@@ -263,12 +332,24 @@ def detect_transcript_format(records: Sequence[dict[str, Any]]) -> str:
     return "generic"
 
 
+def _is_claude_noise_user_text(text: str) -> bool:
+    if text in _CLAUDE_NOISE_EXACT:
+        return True
+    return bool(_CLAUDE_WRAPPER_TAG_RE.match(text))
+
+
+def _is_codex_harness_user_text(text: str) -> bool:
+    return text.startswith(_CODEX_HARNESS_PREFIXES)
+
+
 def _extract_claude_file_edits(
     tool_name: str,
     tool_input: dict[str, Any],
     *,
     turn_index: int,
     timestamp: str | None,
+    call_id: str | None,
+    next_seq: Any,
 ) -> list[FileEdit]:
     edits: list[FileEdit] = []
     if tool_name == "Edit":
@@ -282,6 +363,8 @@ def _extract_claude_file_edits(
                     old_text=_as_str(tool_input.get("old_string")),
                     new_text=_as_str(tool_input.get("new_string")),
                     timestamp=timestamp,
+                    call_id=call_id,
+                    seq=next_seq(),
                 )
             )
     elif tool_name == "Write":
@@ -295,6 +378,8 @@ def _extract_claude_file_edits(
                     old_text=None,
                     new_text=_as_str(tool_input.get("content")),
                     timestamp=timestamp,
+                    call_id=call_id,
+                    seq=next_seq(),
                 )
             )
     elif tool_name == "MultiEdit":
@@ -311,6 +396,8 @@ def _extract_claude_file_edits(
                             old_text=_as_str(item.get("old_string")),
                             new_text=_as_str(item.get("new_string")),
                             timestamp=timestamp,
+                            call_id=call_id,
+                            seq=next_seq(),
                         )
                     )
         elif path:
@@ -320,6 +407,8 @@ def _extract_claude_file_edits(
                     path=path,
                     operation="edit",
                     timestamp=timestamp,
+                    call_id=call_id,
+                    seq=next_seq(),
                 )
             )
     elif tool_name == "NotebookEdit":
@@ -345,6 +434,8 @@ def _extract_claude_file_edits(
                     old_text=None,
                     new_text=_as_str(tool_input.get("new_source")),
                     timestamp=timestamp,
+                    call_id=call_id,
+                    seq=next_seq(),
                 )
             )
     return edits
@@ -360,17 +451,25 @@ def parse_claude_code_records(
     user_turns: list[UserTurn] = []
     tool_executions: list[ToolExecution] = []
     file_edits: list[FileEdit] = []
-    modified_files: list[str] = []
-    seen_files: set[str] = set()
 
     pending_tools: dict[str, ToolExecution] = {}
+    failed_call_ids: set[str] = set()
     turn_index = 0
+    seq = 0
+
+    def _next_seq() -> int:
+        nonlocal seq
+        seq += 1
+        return seq
 
     for record in records:
         if detected_session_id is None:
             sid = _as_str(record.get("sessionId")) or _as_str(record.get("session_id"))
             if sid:
                 detected_session_id = sid
+
+        if record.get("isSidechain") is True:
+            continue
 
         rec_type = _as_str(record.get("type"))
         timestamp = _as_str(record.get("timestamp"))
@@ -386,13 +485,22 @@ def parse_claude_code_records(
                     if not isinstance(block, dict) or block.get("type") != "tool_result":
                         continue
                     call_id = _as_str(block.get("tool_use_id"))
+                    execution = pending_tools.get(call_id) if call_id else None
+
                     output_text = _extract_text_from_content(block.get("content"))
                     if not output_text and tur_dict:
                         stdout = _as_str(tur_dict.get("stdout")) or ""
                         stderr = _as_str(tur_dict.get("stderr")) or ""
                         output_text = "\n".join(part for part in (stdout, stderr) if part)
                     elif not output_text and isinstance(tool_use_result, str):
-                        output_text = tool_use_result
+                        output_text = sanitize_unicode(tool_use_result)
+
+                    explicit_is_error = (
+                        block.get("is_error") if isinstance(block.get("is_error"), bool) else None
+                    )
+                    is_shell = (
+                        execution is not None and execution.tool_name.lower() in _SHELL_TOOL_NAMES
+                    )
 
                     exit_code = (
                         _as_int(block.get("exit_code"))
@@ -404,41 +512,45 @@ def parse_claude_code_records(
                             exit_code = _as_int(tur_dict.get(key))
                             if exit_code is not None:
                                 break
-                    if exit_code is None:
-                        exit_code = _extract_exit_code_from_text(output_text)
+                    if exit_code is None and is_shell and explicit_is_error is not False:
+                        exit_code = _extract_exit_code_from_first_line(output_text)
 
-                    is_error = bool(block.get("is_error") is True)
+                    is_error = explicit_is_error is True
                     if exit_code is not None and exit_code != 0:
                         is_error = True
 
-                    if call_id and call_id in pending_tools:
-                        execution = pending_tools[call_id]
+                    if is_error and call_id:
+                        failed_call_ids.add(call_id)
+
+                    if execution is not None:
                         execution.output = output_text
                         execution.exit_code = exit_code
                         execution.is_error = is_error
                         if execution.timestamp is None and timestamp is not None:
                             execution.timestamp = timestamp
                     else:
-                        execution = ToolExecution(
-                            turn_index=turn_index,
-                            tool_name="unknown",
-                            command=None,
-                            output=output_text,
-                            exit_code=exit_code,
-                            is_error=is_error,
-                            timestamp=timestamp,
-                            call_id=call_id,
+                        tool_executions.append(
+                            ToolExecution(
+                                turn_index=turn_index,
+                                tool_name="unknown",
+                                command=None,
+                                output=output_text,
+                                exit_code=exit_code,
+                                is_error=is_error,
+                                timestamp=timestamp,
+                                call_id=call_id,
+                                seq=_next_seq(),
+                            )
                         )
-                        tool_executions.append(execution)
 
             if record.get("isMeta") is True or record.get("isCompactSummary") is True:
                 continue
 
             if isinstance(content, str):
-                user_text = content.strip()
+                user_text = sanitize_unicode(content).strip()
             elif isinstance(content, list):
                 text_parts = [
-                    block["text"]
+                    sanitize_unicode(block["text"])
                     for block in content
                     if isinstance(block, dict)
                     and block.get("type") == "text"
@@ -448,7 +560,7 @@ def parse_claude_code_records(
             else:
                 user_text = ""
 
-            if user_text:
+            if user_text and not _is_claude_noise_user_text(user_text):
                 turn_index += 1
                 user_turns.append(
                     UserTurn(
@@ -456,6 +568,7 @@ def parse_claude_code_records(
                         text=user_text,
                         timestamp=timestamp,
                         source="claude-code",
+                        seq=_next_seq(),
                     )
                 )
 
@@ -483,6 +596,7 @@ def parse_claude_code_records(
                     is_error=False,
                     timestamp=timestamp,
                     call_id=call_id,
+                    seq=_next_seq(),
                 )
                 tool_executions.append(execution)
                 if call_id:
@@ -493,50 +607,95 @@ def parse_claude_code_records(
                     tool_input,
                     turn_index=turn_index,
                     timestamp=timestamp,
+                    call_id=call_id,
+                    next_seq=_next_seq,
                 )
-                for edit in extracted_edits:
-                    file_edits.append(edit)
-                    _add_modified_file(modified_files, seen_files, edit.path)
+                file_edits.extend(extracted_edits)
+
+    # Drop file edits whose correlated tool_result failed/rejected the edit.
+    valid_edits = [
+        edit for edit in file_edits if edit.call_id is None or edit.call_id not in failed_call_ids
+    ]
+    modified_files: list[str] = []
+    seen_files: set[str] = set()
+    for edit in valid_edits:
+        _add_modified_file(modified_files, seen_files, edit.path)
 
     return ParsedTranscript(
         format="claude-code",
         session_id=detected_session_id,
         user_turns=user_turns,
         tool_executions=tool_executions,
-        file_edits=file_edits,
+        file_edits=valid_edits,
         modified_files=modified_files,
     )
 
 
-def _unwrap_codex_output(raw_output: Any) -> tuple[str, int | None]:
-    """Extract output text and optional exit code from a Codex tool output payload."""
+def _unwrap_codex_output(raw_output: Any, *, is_shell: bool) -> tuple[str, int | None]:
+    """Extract output text and optional exit code from a Codex tool output payload.
+
+    Only inspects Codex header lines (before ``Output:\\n``) for exit codes and only
+    unwraps structured Codex JSON envelopes so arbitrary command stdout is never
+    misinterpreted as metadata.
+    """
     if isinstance(raw_output, dict):
-        output = _as_str(raw_output.get("output")) or ""
+        output_val = raw_output.get("output")
         meta = raw_output.get("metadata")
+        is_envelope = isinstance(output_val, str) and (
+            isinstance(meta, dict) or set(raw_output.keys()) <= {"output", "metadata", "exit_code"}
+        )
+        if not is_envelope:
+            return sanitize_unicode(json.dumps(raw_output, ensure_ascii=False)), None
+
+        output = sanitize_unicode(output_val)
         exit_code = _as_int(meta.get("exit_code")) if isinstance(meta, dict) else None
         if exit_code is None:
             exit_code = _as_int(raw_output.get("exit_code"))
-        if exit_code is None:
-            exit_code = _extract_exit_code_from_text(output)
+        if exit_code is None and is_shell:
+            exit_code = _extract_exit_code_from_first_line(output)
         return output, exit_code
 
     if not isinstance(raw_output, str):
         return "", None
 
-    stripped = raw_output.strip()
+    clean_raw = sanitize_unicode(raw_output)
+    stripped = clean_raw.strip()
     if stripped.startswith("{") and stripped.endswith("}"):
         try:
             decoded = json.loads(stripped)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, RecursionError):
             decoded = None
-        if isinstance(decoded, dict) and ("output" in decoded or "metadata" in decoded):
-            return _unwrap_codex_output(decoded)
+        if (
+            isinstance(decoded, dict)
+            and isinstance(decoded.get("output"), str)
+            and (
+                isinstance(decoded.get("metadata"), dict)
+                or set(decoded.keys()) <= {"output", "metadata", "exit_code"}
+            )
+        ):
+            return _unwrap_codex_output(decoded, is_shell=is_shell)
 
-    exit_code = _extract_exit_code_from_text(raw_output)
-    marker = _CODEX_OUTPUT_MARKER_RE.search(raw_output)
-    if marker:
-        return raw_output[marker.end() :], exit_code
-    return raw_output, exit_code
+    if clean_raw.startswith(_CODEX_HEADER_PREFIXES):
+        marker = "\nOutput:\n"
+        marker_idx = clean_raw.find(marker)
+        if marker_idx != -1:
+            header_block = clean_raw[:marker_idx]
+            body = clean_raw[marker_idx + len(marker) :]
+        else:
+            header_block = clean_raw
+            body = clean_raw
+
+        exit_code: int | None = None
+        if is_shell:
+            for header_line in header_block.split("\n"):
+                match = _HEADER_EXIT_CODE_RE.match(header_line.strip())
+                if match:
+                    exit_code = int(match.group(1))
+                    break
+        return body, exit_code
+
+    exit_code = _extract_exit_code_from_first_line(clean_raw) if is_shell else None
+    return clean_raw, exit_code
 
 
 def parse_codex_records(
@@ -549,29 +708,39 @@ def parse_codex_records(
     user_turns: list[UserTurn] = []
     tool_executions: list[ToolExecution] = []
     file_edits: list[FileEdit] = []
-    modified_files: list[str] = []
-    seen_files: set[str] = set()
+    extra_move_paths: list[tuple[str | None, str]] = []
 
     pending_tools: dict[str, ToolExecution] = {}
+    failed_call_ids: set[str] = set()
     turn_index = 0
+    seq = 0
     last_user_origin: str | None = None
     activity_since_last_user = True
 
+    def _next_seq() -> int:
+        nonlocal seq
+        seq += 1
+        return seq
+
     def _record_user_turn(text: str, timestamp: str | None, origin: str) -> None:
         nonlocal turn_index, last_user_origin, activity_since_last_user
-        cleaned = text.strip()
-        if not cleaned:
+        cleaned = sanitize_unicode(text).strip()
+        if not cleaned or _is_codex_harness_user_text(cleaned):
             return
         # Codex frequently logs both response_item(message/user) and event_msg(user_message)
-        # for the exact same user turn; deduplicate consecutive cross-origin duplicates.
+        # for the exact same user turn; deduplicate consecutive cross-origin emissions even
+        # when one copy has extra attachment/image wrapper text.
         if (
             user_turns
             and not activity_since_last_user
             and last_user_origin is not None
             and last_user_origin != origin
-            and user_turns[-1].text == cleaned
         ):
-            return
+            prev_text = user_turns[-1].text
+            if prev_text == cleaned or cleaned in prev_text or prev_text in cleaned:
+                if len(cleaned) > len(prev_text):
+                    user_turns[-1].text = cleaned
+                return
         turn_index += 1
         user_turns.append(
             UserTurn(
@@ -579,10 +748,23 @@ def parse_codex_records(
                 text=cleaned,
                 timestamp=timestamp,
                 source="codex",
+                seq=_next_seq(),
             )
         )
         last_user_origin = origin
         activity_since_last_user = False
+
+    def _record_patch(patch_text: str, timestamp: str | None, call_id: str | None) -> None:
+        patch_edits, move_sources = _parse_apply_patch(
+            patch_text,
+            turn_index=turn_index,
+            timestamp=timestamp,
+            call_id=call_id,
+            next_seq=_next_seq,
+        )
+        file_edits.extend(patch_edits)
+        for src_path in move_sources:
+            extra_move_paths.append((call_id, src_path))
 
     for record in records:
         rec_type = _as_str(record.get("type"))
@@ -608,7 +790,6 @@ def parse_codex_records(
             continue
 
         item = payload_dict if rec_type == "response_item" else record
-
         item_type = _as_str(item.get("type"))
 
         if item_type == "message":
@@ -632,12 +813,13 @@ def parse_codex_records(
                     decoded_args = json.loads(raw_args)
                     if isinstance(decoded_args, dict):
                         args = decoded_args
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError, RecursionError):
                     args = {}
 
+            raw_cmd = args.get("command") or args.get("cmd")
             command: str | None = None
             if tool_name.lower() in _SHELL_TOOL_NAMES:
-                command = _format_command_arg(args.get("command") or args.get("cmd"))
+                command = _format_command_arg(raw_cmd)
 
             execution = ToolExecution(
                 turn_index=turn_index,
@@ -648,6 +830,7 @@ def parse_codex_records(
                 is_error=False,
                 timestamp=timestamp,
                 call_id=call_id,
+                seq=_next_seq(),
             )
             tool_executions.append(execution)
             if call_id:
@@ -660,14 +843,11 @@ def parse_codex_records(
                     or (_as_str(raw_args) if not args else None)
                 )
                 if patch_text:
-                    patch_edits, patch_paths = _parse_apply_patch(
-                        patch_text,
-                        turn_index=turn_index,
-                        timestamp=timestamp,
-                    )
-                    file_edits.extend(patch_edits)
-                    for path in patch_paths:
-                        _add_modified_file(modified_files, seen_files, path)
+                    _record_patch(patch_text, timestamp, call_id)
+            elif tool_name.lower() in _SHELL_TOOL_NAMES:
+                shell_patch = _extract_patch_from_shell_command(raw_cmd, command)
+                if shell_patch:
+                    _record_patch(shell_patch, timestamp, call_id)
 
         elif item_type == "custom_tool_call":
             activity_since_last_user = True
@@ -676,11 +856,13 @@ def parse_codex_records(
             raw_input = item.get("input")
 
             command = None
+            raw_cmd = None
             if tool_name.lower() in _SHELL_TOOL_NAMES:
                 if isinstance(raw_input, dict):
-                    command = _format_command_arg(raw_input.get("command") or raw_input.get("cmd"))
+                    raw_cmd = raw_input.get("command") or raw_input.get("cmd")
+                    command = _format_command_arg(raw_cmd)
                 elif isinstance(raw_input, str):
-                    command = raw_input
+                    command = sanitize_unicode(raw_input)
 
             execution = ToolExecution(
                 turn_index=turn_index,
@@ -691,27 +873,26 @@ def parse_codex_records(
                 is_error=False,
                 timestamp=timestamp,
                 call_id=call_id,
+                seq=_next_seq(),
             )
             tool_executions.append(execution)
             if call_id:
                 pending_tools[call_id] = execution
 
             if tool_name == "apply_patch" and isinstance(raw_input, str):
-                patch_edits, patch_paths = _parse_apply_patch(
-                    raw_input,
-                    turn_index=turn_index,
-                    timestamp=timestamp,
-                )
-                file_edits.extend(patch_edits)
-                for path in patch_paths:
-                    _add_modified_file(modified_files, seen_files, path)
+                _record_patch(raw_input, timestamp, call_id)
+            elif tool_name.lower() in _SHELL_TOOL_NAMES:
+                shell_patch = _extract_patch_from_shell_command(raw_cmd, command)
+                if shell_patch:
+                    _record_patch(shell_patch, timestamp, call_id)
 
         elif item_type == "local_shell_call":
             activity_since_last_user = True
             call_id = _as_str(item.get("call_id"))
             action = item.get("action")
             action_dict = action if isinstance(action, dict) else {}
-            command = _format_command_arg(action_dict.get("command") or item.get("command"))
+            raw_cmd = action_dict.get("command") or item.get("command")
+            command = _format_command_arg(raw_cmd)
             execution = ToolExecution(
                 turn_index=turn_index,
                 tool_name="local_shell",
@@ -721,10 +902,15 @@ def parse_codex_records(
                 is_error=False,
                 timestamp=timestamp,
                 call_id=call_id,
+                seq=_next_seq(),
             )
             tool_executions.append(execution)
             if call_id:
                 pending_tools[call_id] = execution
+
+            shell_patch = _extract_patch_from_shell_command(raw_cmd, command)
+            if shell_patch:
+                _record_patch(shell_patch, timestamp, call_id)
 
         elif item_type in (
             "function_call_output",
@@ -733,13 +919,27 @@ def parse_codex_records(
         ):
             activity_since_last_user = True
             call_id = _as_str(item.get("call_id"))
-            output_text, exit_code = _unwrap_codex_output(item.get("output"))
-            is_error = bool(item.get("is_error") is True)
+            execution = pending_tools.get(call_id) if call_id else None
+            is_shell = (
+                execution is None
+                or execution.tool_name.lower() in _SHELL_TOOL_NAMES
+                or execution.tool_name == "apply_patch"
+            )
+            explicit_is_error = (
+                item.get("is_error") if isinstance(item.get("is_error"), bool) else None
+            )
+            output_text, exit_code = _unwrap_codex_output(
+                item.get("output"),
+                is_shell=is_shell and explicit_is_error is not False,
+            )
+            is_error = explicit_is_error is True
             if exit_code is not None and exit_code != 0:
                 is_error = True
 
-            if call_id and call_id in pending_tools:
-                execution = pending_tools[call_id]
+            if is_error and call_id:
+                failed_call_ids.add(call_id)
+
+            if execution is not None:
                 execution.output = output_text
                 execution.exit_code = exit_code
                 execution.is_error = is_error
@@ -756,15 +956,33 @@ def parse_codex_records(
                         is_error=is_error,
                         timestamp=timestamp,
                         call_id=call_id,
+                        seq=_next_seq(),
                     )
                 )
+
+    valid_edits = [
+        edit for edit in file_edits if edit.call_id is None or edit.call_id not in failed_call_ids
+    ]
+    modified_files: list[str] = []
+    seen_files: set[str] = set()
+    move_by_call: dict[str | None, list[str]] = {}
+    for cid, src_path in extra_move_paths:
+        if cid is None or cid not in failed_call_ids:
+            move_by_call.setdefault(cid, []).append(src_path)
+    for edit in valid_edits:
+        for src_path in move_by_call.pop(edit.call_id, []):
+            _add_modified_file(modified_files, seen_files, src_path)
+        _add_modified_file(modified_files, seen_files, edit.path)
+    for remaining in move_by_call.values():
+        for src_path in remaining:
+            _add_modified_file(modified_files, seen_files, src_path)
 
     return ParsedTranscript(
         format="codex",
         session_id=detected_session_id,
         user_turns=user_turns,
         tool_executions=tool_executions,
-        file_edits=file_edits,
+        file_edits=valid_edits,
         modified_files=modified_files,
     )
 
@@ -783,6 +1001,12 @@ def parse_generic_records(
     seen_files: set[str] = set()
 
     turn_index = 0
+    seq = 0
+
+    def _next_seq() -> int:
+        nonlocal seq
+        seq += 1
+        return seq
 
     for record in records:
         if detected_session_id is None:
@@ -807,6 +1031,8 @@ def parse_generic_records(
                 old_text=_as_str(record.get("old_text")) or _as_str(record.get("old_string")),
                 new_text=_as_str(record.get("new_text")) or _as_str(record.get("new_string")),
                 timestamp=timestamp,
+                call_id=_as_str(record.get("call_id")),
+                seq=_next_seq(),
             )
             file_edits.append(edit)
             _add_modified_file(modified_files, seen_files, path)
@@ -825,6 +1051,7 @@ def parse_generic_records(
                         text=text,
                         timestamp=timestamp,
                         source="generic",
+                        seq=_next_seq(),
                     )
                 )
             continue
@@ -852,13 +1079,17 @@ def parse_generic_records(
                 else:
                     output_text = _extract_text_from_content(record.get("content"))
 
+            explicit_is_error = (
+                record.get("is_error") if isinstance(record.get("is_error"), bool) else None
+            )
             exit_code = _as_int(record.get("exit_code"))
             if exit_code is None:
                 exit_code = _as_int(record.get("exitCode"))
-            if exit_code is None:
-                exit_code = _extract_exit_code_from_text(output_text)
+            is_shell = tool_name.lower() in _SHELL_TOOL_NAMES or command is not None
+            if exit_code is None and is_shell and explicit_is_error is not False:
+                exit_code = _extract_exit_code_from_first_line(output_text)
 
-            is_error = bool(record.get("is_error") is True)
+            is_error = explicit_is_error is True
             if exit_code is not None and exit_code != 0:
                 is_error = True
 
@@ -872,6 +1103,7 @@ def parse_generic_records(
                     is_error=is_error,
                     timestamp=timestamp,
                     call_id=_as_str(record.get("call_id")) or _as_str(record.get("id")),
+                    seq=_next_seq(),
                 )
             )
 

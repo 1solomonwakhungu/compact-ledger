@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from collections.abc import Sequence
@@ -15,11 +16,21 @@ from compact_ledger.models import (
     PinEntry,
     make_pin_id,
     normalize_pin_text,
+    sanitize_unicode,
 )
 from compact_ledger.parsers.transcript import SUPPORTED_FORMATS, parse_transcript
 from compact_ledger.store import CorruptSnapshotError, SessionStore
 
 DEFAULT_MAX_CHARS = 6000
+
+
+def _configure_io_streams() -> None:
+    """Ensure stdout/stderr tolerate non-ASCII text on narrow-encoding pipes."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(OSError, ValueError):
+                reconfigure(errors="replace")
 
 
 def _build_baseline_pins(snapshot_turns: Sequence[Any]) -> list[PinEntry]:
@@ -34,7 +45,7 @@ def _build_baseline_pins(snapshot_turns: Sequence[Any]) -> list[PinEntry]:
         pins.append(
             PinEntry(
                 pin_id=make_pin_id("auto", norm, turn.turn_index),
-                text=turn.text.strip(),
+                text=sanitize_unicode(turn.text).strip(),
                 source="auto",
                 turn_index=turn.turn_index,
                 timestamp=turn.timestamp,
@@ -43,7 +54,14 @@ def _build_baseline_pins(snapshot_turns: Sequence[Any]) -> list[PinEntry]:
     return pins
 
 
+def _flatten_single_line(text: str) -> str:
+    """Flatten embedded newlines so user text cannot spoof Markdown headings."""
+    return " ".join(sanitize_unicode(text).splitlines()).strip()
+
+
 def _truncate_line(text: str, max_len: int) -> str:
+    if max_len <= 0:
+        return ""
     if len(text) <= max_len:
         return text
     if max_len <= 3:
@@ -56,7 +74,7 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
     if max_chars <= 0:
         return ""
 
-    header = f"## Compact Ledger (Session: {snapshot.session_id})"
+    header = f"## Compact Ledger (Session: {_flatten_single_line(snapshot.session_id)})"
     if len(header) > max_chars:
         return _truncate_line(header, max_chars)
 
@@ -70,7 +88,8 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
         section_header = f"\n\n### {title}"
         added_header = False
         for item in items:
-            entry = f"\n- {item}"
+            flat_item = _flatten_single_line(item)
+            entry = f"\n- {flat_item}"
             needed = len(entry) + (len(section_header) if not added_header else 0)
             if used + needed <= max_chars:
                 if not added_header:
@@ -81,19 +100,19 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
                 used += len(entry)
             else:
                 remaining = max_chars - used - (len(section_header) if not added_header else 0) - 3
-                if remaining >= 24:
+                if remaining >= 12:
                     if not added_header:
                         lines.append(section_header)
                         used += len(section_header)
                         added_header = True
-                    truncated = _truncate_line(item, remaining)
+                    truncated = _truncate_line(flat_item, remaining)
                     entry = f"\n- {truncated}"
                     lines.append(entry)
                     used += len(entry)
                 break
 
     manual_pins = [p for p in snapshot.pins if p.source == "manual"]
-    override_pins = [p for p in snapshot.pins if p.source == "override"]
+    override_pins = list(reversed([p for p in snapshot.pins if p.source == "override"]))
     auto_pins = list(reversed([p for p in snapshot.pins if p.source == "auto"]))
 
     manual_items = [
@@ -118,54 +137,168 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
     return result
 
 
+def _compact_json(obj: Any) -> str:
+    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+
+def _truncate_pin_for_json_budget(pin_dict: dict[str, Any], max_item_chars: int) -> str | None:
+    """Truncate a pin dict's ``text`` field so its compact JSON fits in ``max_item_chars``."""
+    base = dict(pin_dict)
+    base["text"] = ""
+    empty_len = len(_compact_json(base))
+    if empty_len + 4 > max_item_chars:
+        return None
+
+    original_text = str(pin_dict.get("text", ""))
+    # Binary search on prefix length to account accurately for JSON escaping.
+    lo, hi = 1, len(original_text)
+    best: str | None = None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = dict(pin_dict)
+        candidate["text"] = _truncate_line(original_text, mid)
+        serialized = _compact_json(candidate)
+        if len(serialized) <= max_item_chars:
+            best = serialized
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best
+
+
 def _render_json(snapshot: CompactionSnapshot, max_chars: int) -> str:
-    """Render a valid JSON representation bounded to ``max_chars`` when possible."""
-    payload = snapshot.to_dict()
-    rendered = json.dumps(payload, indent=2, ensure_ascii=False)
-    if len(rendered) <= max_chars:
-        return rendered
+    """Render valid JSON strictly bounded to ``<= max_chars`` in O(N) time.
 
-    # Compact JSON first before dropping lower-priority fields.
-    rendered = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
-    if len(rendered) <= max_chars:
-        return rendered
+    Priority order matches PLAN.md:
+    (1) Manual pins & active overrides, (2) Remaining auto pins (newest first),
+    (3) Trajectories / thrash / attempts, (4) Modified files.
+    """
+    if max_chars < 2:
+        raise ValueError("--max-chars must be at least 2 for JSON output")
 
-    # Progressively shed lower-priority sections while preserving manual pins.
+    total_items = (
+        len(snapshot.pins)
+        + len(snapshot.attempts)
+        + len(snapshot.trajectories)
+        + len(snapshot.thrash_entries)
+        + len(snapshot.modified_files)
+    )
+    if total_items <= 200:
+        pretty = json.dumps(snapshot.to_dict(), indent=2, ensure_ascii=False)
+        if len(pretty) <= max_chars:
+            return pretty
+
+    # Strict PLAN priority: manual (in order) -> override (newest first) -> auto (newest first).
     manual_pins = [p.to_dict() for p in snapshot.pins if p.source == "manual"]
-    other_pins = [p.to_dict() for p in snapshot.pins if p.source != "manual"]
-    trimmed = dict(payload)
-    trimmed["metadata"] = {}
-    trimmed["attempts"] = []
-    trimmed["trajectories"] = []
-    trimmed["thrash_entries"] = []
-    trimmed["modified_files"] = list(snapshot.modified_files)
-    trimmed["pins"] = manual_pins + other_pins
+    override_pins = [p.to_dict() for p in reversed(snapshot.pins) if p.source == "override"]
+    auto_pins = [p.to_dict() for p in reversed(snapshot.pins) if p.source == "auto"]
+    ordered_pins: list[tuple[bool, dict[str, Any]]] = [
+        *((True, p) for p in manual_pins),
+        *((False, p) for p in override_pins),
+        *((False, p) for p in auto_pins),
+    ]
 
-    rendered = json.dumps(trimmed, separators=(",", ":"), ensure_ascii=False)
-    if len(rendered) <= max_chars:
-        return rendered
+    # Pick the richest JSON envelope whose empty skeleton fits within max_chars.
+    envelopes: list[dict[str, Any]] = [
+        {
+            "schema_version": snapshot.schema_version,
+            "session_id": snapshot.session_id,
+            "created_at": snapshot.created_at,
+            "transcript_path": snapshot.transcript_path,
+            "pins": [],
+            "attempts": [],
+            "trajectories": [],
+            "thrash_entries": [],
+            "modified_files": [],
+            "metadata": {},
+        },
+        {
+            "schema_version": snapshot.schema_version,
+            "session_id": snapshot.session_id,
+            "created_at": snapshot.created_at,
+            "pins": [],
+            "attempts": [],
+            "trajectories": [],
+            "thrash_entries": [],
+            "modified_files": [],
+        },
+        {
+            "session_id": snapshot.session_id,
+            "pins": [],
+        },
+        {
+            "pins": [],
+        },
+    ]
 
-    trimmed["modified_files"] = []
-    rendered = json.dumps(trimmed, separators=(",", ":"), ensure_ascii=False)
-    if len(rendered) <= max_chars:
-        return rendered
+    def _try_envelope(template: dict[str, Any]) -> tuple[str, int] | None:
+        env: dict[str, Any] = {
+            k: ([] if isinstance(v, list) else ({} if isinstance(v, dict) else v))
+            for k, v in template.items()
+        }
+        used = len(_compact_json(env))
+        if used > max_chars:
+            return None
 
-    trimmed["transcript_path"] = None
-    rendered = json.dumps(trimmed, separators=(",", ":"), ensure_ascii=False)
-    if len(rendered) <= max_chars:
-        return rendered
+        def _fill_list(key: str, items: Sequence[tuple[bool, Any]]) -> None:
+            nonlocal used
+            if key not in env:
+                return
+            bucket: list[Any] = env[key]
+            for allow_truncate, item in items:
+                sep = 1 if bucket else 0
+                serialized = _compact_json(item)
+                needed = sep + len(serialized)
+                if used + needed <= max_chars:
+                    bucket.append(item)
+                    used += needed
+                elif allow_truncate and isinstance(item, dict) and "text" in item:
+                    remaining = max_chars - used - sep
+                    truncated_json = _truncate_pin_for_json_budget(item, remaining)
+                    if truncated_json is not None:
+                        bucket.append(json.loads(truncated_json))
+                        used += sep + len(truncated_json)
+                    break
+                else:
+                    break
 
-    while other_pins and len(rendered) > max_chars:
-        other_pins.pop(0)
-        trimmed["pins"] = manual_pins + other_pins
-        rendered = json.dumps(trimmed, separators=(",", ":"), ensure_ascii=False)
+        _fill_list("pins", ordered_pins)
+        if "trajectories" in env:
+            _fill_list("trajectories", [(False, t.to_dict()) for t in snapshot.trajectories])
+        if "thrash_entries" in env:
+            _fill_list("thrash_entries", [(False, e.to_dict()) for e in snapshot.thrash_entries])
+        if "attempts" in env:
+            _fill_list("attempts", [(False, a.to_dict()) for a in snapshot.attempts])
+        if "modified_files" in env:
+            _fill_list("modified_files", [(False, f) for f in snapshot.modified_files])
+        return _compact_json(env), len(env.get("pins", []))
 
-    while manual_pins and len(rendered) > max_chars:
-        manual_pins.pop()
-        trimmed["pins"] = manual_pins
-        rendered = json.dumps(trimmed, separators=(",", ":"), ensure_ascii=False)
+    best_result: str | None = None
+    best_pin_count = -1
+    want_pins = len(ordered_pins) > 0
+    for env_template in envelopes:
+        attempt = _try_envelope(env_template)
+        if attempt is None:
+            continue
+        rendered_candidate, pin_count = attempt
+        if not want_pins:
+            return rendered_candidate
+        # Prefer the richest envelope that keeps all manual pins (or maximizes included pins).
+        if pin_count >= len(manual_pins) and pin_count > 0:
+            return rendered_candidate
+        if pin_count > best_pin_count:
+            best_pin_count = pin_count
+            best_result = rendered_candidate
 
-    return rendered
+    return best_result if best_result is not None else "{}"
+
+
+def _write_bounded_stdout(rendered: str, max_chars: int) -> None:
+    """Write ``rendered`` ensuring total stdout length never exceeds ``max_chars``."""
+    if len(rendered) + 1 <= max_chars:
+        sys.stdout.write(rendered + "\n")
+    else:
+        sys.stdout.write(rendered)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -256,6 +389,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Optional tag to attach to the pin (repeatable).",
     )
+    pin_parser.add_argument(
+        "--negative",
+        action="store_true",
+        default=False,
+        help="Mark this pin as a negative constraint (do-not / never rule).",
+    )
+
+    unpin_parser = subparsers.add_parser(
+        "unpin",
+        parents=[common],
+        help="Remove a manual pin by pin ID or verbatim text.",
+    )
+    unpin_parser.add_argument("--session-id", required=True, help="Session identifier.")
+    unpin_parser.add_argument("target", help="Pin ID or exact pin text to remove.")
 
     status_parser = subparsers.add_parser(
         "status",
@@ -331,7 +478,7 @@ def _cmd_snapshot(args: argparse.Namespace, store: SessionStore) -> int:
             "manual_pins": sum(1 for p in saved.pins if p.source == "manual"),
             "modified_files": len(saved.modified_files),
         }
-        print(json.dumps(summary, indent=2))
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
     else:
         manual_count = sum(1 for p in saved.pins if p.source == "manual")
         print(
@@ -346,6 +493,9 @@ def _cmd_inject(args: argparse.Namespace, store: SessionStore) -> int:
     if args.max_chars <= 0:
         print("Error: --max-chars must be a positive integer.", file=sys.stderr)
         return 2
+    if args.output_format == "json" and args.max_chars < 2:
+        print("Error: --max-chars must be at least 2 for JSON output.", file=sys.stderr)
+        return 2
 
     try:
         snapshot = store.load_snapshot(args.session_id)
@@ -358,21 +508,44 @@ def _cmd_inject(args: argparse.Namespace, store: SessionStore) -> int:
         return 1
 
     if args.output_format == "json":
-        print(_render_json(snapshot, args.max_chars))
+        budget = args.max_chars - 1 if args.max_chars >= 3 else args.max_chars
+        rendered = _render_json(snapshot, budget)
     else:
-        print(_render_markdown(snapshot, args.max_chars))
+        budget = args.max_chars - 1 if args.max_chars >= 2 else args.max_chars
+        rendered = _render_markdown(snapshot, budget)
+
+    _write_bounded_stdout(rendered, args.max_chars)
     return 0
 
 
 def _cmd_pin(args: argparse.Namespace, store: SessionStore) -> int:
     try:
-        pin = store.add_manual_pin(args.session_id, args.text, tags=args.tags)
+        pin = store.add_manual_pin(
+            args.session_id,
+            args.text,
+            tags=args.tags,
+            is_negative=args.negative,
+        )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
     print(f"Pinned [{pin.pin_id}] for session {args.session_id!r}: {pin.text}")
     return 0
+
+
+def _cmd_unpin(args: argparse.Namespace, store: SessionStore) -> int:
+    try:
+        removed = store.remove_manual_pin(args.session_id, args.target)
+    except (ValueError, CorruptSnapshotError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    if removed:
+        print(f"Removed manual pin from session {args.session_id!r}.")
+        return 0
+    print(f"No matching manual pin found in session {args.session_id!r}.", file=sys.stderr)
+    return 1
 
 
 def _cmd_status(args: argparse.Namespace, store: SessionStore) -> int:
@@ -402,7 +575,7 @@ def _cmd_status(args: argparse.Namespace, store: SessionStore) -> int:
             "path": str(store.session_path(snapshot.session_id)),
         }
         if args.as_json:
-            print(json.dumps(info, indent=2))
+            print(json.dumps(info, indent=2, ensure_ascii=False))
         else:
             print(f"Session: {info['session_id']}")
             print(f"Created: {info['created_at']}")
@@ -430,7 +603,7 @@ def _cmd_status(args: argparse.Namespace, store: SessionStore) -> int:
     for sid in sessions:
         try:
             snap = store.load_snapshot(sid)
-        except CorruptSnapshotError:
+        except (ValueError, CorruptSnapshotError):
             snap = None
         if snap is None:
             print(f"- {sid}")
@@ -459,6 +632,7 @@ def _cmd_clear(args: argparse.Namespace, store: SessionStore) -> int:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the ``compact-ledger`` CLI."""
+    _configure_io_streams()
     parser = _build_parser()
     args = parser.parse_args(argv)
 
@@ -466,18 +640,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.print_help()
         return 0
 
-    store = SessionStore(store_dir=args.store_dir)
-
-    if args.command == "snapshot":
-        return _cmd_snapshot(args, store)
-    if args.command == "inject":
-        return _cmd_inject(args, store)
-    if args.command == "pin":
-        return _cmd_pin(args, store)
-    if args.command == "status":
-        return _cmd_status(args, store)
-    if args.command == "clear":
-        return _cmd_clear(args, store)
+    try:
+        store = SessionStore(store_dir=args.store_dir)
+        if args.command == "snapshot":
+            return _cmd_snapshot(args, store)
+        if args.command == "inject":
+            return _cmd_inject(args, store)
+        if args.command == "pin":
+            return _cmd_pin(args, store)
+        if args.command == "unpin":
+            return _cmd_unpin(args, store)
+        if args.command == "status":
+            return _cmd_status(args, store)
+        if args.command == "clear":
+            return _cmd_clear(args, store)
+    except BrokenPipeError:
+        return 0
+    except (OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
 
     parser.print_help()
     return 2

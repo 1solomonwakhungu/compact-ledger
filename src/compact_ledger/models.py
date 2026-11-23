@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -38,9 +39,21 @@ def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+
+def sanitize_unicode(text: str) -> str:
+    """Replace lone UTF-16 surrogates with U+FFFD so UTF-8 encoding never fails."""
+    try:
+        text.encode("utf-8")
+        return text
+    except UnicodeEncodeError:
+        return _SURROGATE_RE.sub("\ufffd", text)
+
+
 def normalize_pin_text(text: str) -> str:
     """Normalize pin text for deterministic deduplication while preserving case."""
-    return " ".join(text.split())
+    return " ".join(sanitize_unicode(text).split())
 
 
 def make_pin_id(source: str, text: str, turn_index: int | None = None) -> str:
@@ -61,7 +74,7 @@ def _require_str(data: dict[str, Any], key: str, model_name: str) -> str:
     val = data.get(key)
     if not isinstance(val, str):
         raise ValueError(f"{model_name}.{key} must be a str")
-    return val
+    return sanitize_unicode(val)
 
 
 def _optional_str(data: dict[str, Any], key: str, model_name: str) -> str | None:
@@ -70,7 +83,7 @@ def _optional_str(data: dict[str, Any], key: str, model_name: str) -> str | None
         return None
     if not isinstance(val, str):
         raise ValueError(f"{model_name}.{key} must be a str or None")
-    return val
+    return sanitize_unicode(val)
 
 
 def _require_int(data: dict[str, Any], key: str, model_name: str) -> int:
@@ -89,6 +102,13 @@ def _optional_int(data: dict[str, Any], key: str, model_name: str) -> int | None
     return val
 
 
+def _default_int(data: dict[str, Any], key: str, default: int, model_name: str) -> int:
+    val = data.get(key, default)
+    if isinstance(val, bool) or not isinstance(val, int):
+        raise ValueError(f"{model_name}.{key} must be an int")
+    return val
+
+
 def _optional_bool(data: dict[str, Any], key: str, default: bool, model_name: str) -> bool:
     val = data.get(key, default)
     if not isinstance(val, bool):
@@ -102,7 +122,7 @@ def _str_list(data: dict[str, Any], key: str, model_name: str) -> list[str]:
         return []
     if not isinstance(val, list) or not all(isinstance(item, str) for item in val):
         raise ValueError(f"{model_name}.{key} must be a list of str")
-    return list(val)
+    return [sanitize_unicode(item) for item in val]
 
 
 def _int_list(data: dict[str, Any], key: str, model_name: str) -> list[int]:
@@ -124,6 +144,7 @@ class UserTurn:
     text: str
     timestamp: str | None = None
     source: str = "transcript"
+    seq: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,6 +152,7 @@ class UserTurn:
             "text": self.text,
             "timestamp": self.timestamp,
             "source": self.source,
+            "seq": self.seq,
         }
 
     @classmethod
@@ -141,6 +163,7 @@ class UserTurn:
             text=_require_str(d, "text", "UserTurn"),
             timestamp=_optional_str(d, "timestamp", "UserTurn"),
             source=_optional_str(d, "source", "UserTurn") or "transcript",
+            seq=_default_int(d, "seq", 0, "UserTurn"),
         )
 
 
@@ -156,6 +179,7 @@ class ToolExecution:
     is_error: bool = False
     timestamp: str | None = None
     call_id: str | None = None
+    seq: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -167,6 +191,7 @@ class ToolExecution:
             "is_error": self.is_error,
             "timestamp": self.timestamp,
             "call_id": self.call_id,
+            "seq": self.seq,
         }
 
     @classmethod
@@ -179,11 +204,12 @@ class ToolExecution:
             turn_index=_require_int(d, "turn_index", "ToolExecution"),
             tool_name=_require_str(d, "tool_name", "ToolExecution"),
             command=_optional_str(d, "command", "ToolExecution"),
-            output=output,
+            output=sanitize_unicode(output),
             exit_code=_optional_int(d, "exit_code", "ToolExecution"),
             is_error=_optional_bool(d, "is_error", False, "ToolExecution"),
             timestamp=_optional_str(d, "timestamp", "ToolExecution"),
             call_id=_optional_str(d, "call_id", "ToolExecution"),
+            seq=_default_int(d, "seq", 0, "ToolExecution"),
         )
 
 
@@ -197,6 +223,8 @@ class FileEdit:
     old_text: str | None = None
     new_text: str | None = None
     timestamp: str | None = None
+    call_id: str | None = None
+    seq: int = 0
 
     def __post_init__(self) -> None:
         if self.operation not in VALID_FILE_OPERATIONS:
@@ -213,6 +241,8 @@ class FileEdit:
             "old_text": self.old_text,
             "new_text": self.new_text,
             "timestamp": self.timestamp,
+            "call_id": self.call_id,
+            "seq": self.seq,
         }
 
     @classmethod
@@ -228,6 +258,8 @@ class FileEdit:
             old_text=_optional_str(d, "old_text", "FileEdit"),
             new_text=_optional_str(d, "new_text", "FileEdit"),
             timestamp=_optional_str(d, "timestamp", "FileEdit"),
+            call_id=_optional_str(d, "call_id", "FileEdit"),
+            seq=_default_int(d, "seq", 0, "FileEdit"),
         )
 
 
@@ -368,9 +400,7 @@ class TestAttempt:
         outcome = d.get("outcome", "failed")
         if not isinstance(outcome, str) or outcome not in VALID_TEST_OUTCOMES:
             raise ValueError(f"TestAttempt.outcome must be one of {sorted(VALID_TEST_OUTCOMES)}")
-        turn_index = d.get("turn_index", 0)
-        if isinstance(turn_index, bool) or not isinstance(turn_index, int):
-            raise ValueError("TestAttempt.turn_index must be an int")
+        turn_index = _default_int(d, "turn_index", 0, "TestAttempt")
         return cls(
             test_id=_require_str(d, "test_id", "TestAttempt"),
             runner=_require_str(d, "runner", "TestAttempt"),
@@ -431,7 +461,7 @@ class TestTrajectory:
             runner=_require_str(d, "runner", "TestTrajectory"),
             status=status,  # type: ignore[arg-type]
             attempts=[TestAttempt.from_dict(item) for item in raw_attempts],
-            summary=summary,
+            summary=sanitize_unicode(summary),
         )
 
 
@@ -468,7 +498,7 @@ class EditThrashEntry:
             failure_count=_require_int(d, "failure_count", "EditThrashEntry"),
             reverted=_optional_bool(d, "reverted", False, "EditThrashEntry"),
             turn_indices=_int_list(d, "turn_indices", "EditThrashEntry"),
-            reason=reason,
+            reason=sanitize_unicode(reason),
         )
 
 
@@ -522,10 +552,7 @@ class CompactionSnapshot:
         if not isinstance(raw_meta, dict):
             raise ValueError("CompactionSnapshot.metadata must be a dict")
 
-        schema_version = d.get("schema_version", SCHEMA_VERSION)
-        if isinstance(schema_version, bool) or not isinstance(schema_version, int):
-            raise ValueError("CompactionSnapshot.schema_version must be an int")
-
+        schema_version = _default_int(d, "schema_version", SCHEMA_VERSION, "CompactionSnapshot")
         created_at = _optional_str(d, "created_at", "CompactionSnapshot") or utc_now_iso()
 
         return cls(
@@ -542,12 +569,12 @@ class CompactionSnapshot:
         )
 
     def to_json(self, *, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+        return sanitize_unicode(json.dumps(self.to_dict(), indent=indent, ensure_ascii=False))
 
     @classmethod
     def from_json(cls, raw: str) -> CompactionSnapshot:
         try:
             parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, ValueError, RecursionError) as exc:
             raise ValueError(f"Invalid snapshot JSON: {exc}") from exc
         return cls.from_dict(parsed)

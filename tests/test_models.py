@@ -238,3 +238,18 @@ def test_make_pin_id_is_deterministic_and_normalizes_whitespace() -> None:
     assert id1 == id2
     assert id1 != id3
     assert id1.startswith("pin-manual-")
+    # Lone UTF-16 surrogates must never crash make_pin_id or JSON serialization
+    surrogate_id = make_pin_id("manual", "bad \ud83d surrogate")
+    assert surrogate_id.startswith("pin-manual-")
+
+
+def test_seq_and_call_id_round_trip() -> None:
+    turn = UserTurn(turn_index=1, text="Run tests", seq=1)
+    exe = ToolExecution(turn_index=1, tool_name="Bash", command="pytest", call_id="c1", seq=2)
+    edit = FileEdit(turn_index=1, path="a.py", operation="edit", call_id="c2", seq=3)
+    assert UserTurn.from_dict(turn.to_dict()) == turn
+    assert ToolExecution.from_dict(exe.to_dict()) == exe
+    assert FileEdit.from_dict(edit.to_dict()) == edit
+    # Missing seq/call_id defaults cleanly for forward/backward compatibility
+    assert FileEdit.from_dict({"turn_index": 1, "path": "a.py"}).seq == 0
+    assert FileEdit.from_dict({"turn_index": 1, "path": "a.py"}).call_id is None
