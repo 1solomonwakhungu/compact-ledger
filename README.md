@@ -13,7 +13,7 @@ Long coding sessions hit context compaction right when precision matters most. L
 
 - **Zero LLM calls** — 100% deterministic, local, reproducible output.
 - **Zero third-party runtime dependencies** — Python `>=3.11` standard library only.
-- **Linear-time & lightweight** — O(N) scanning with atomic JSON storage (runs all 20 seeded eval cases in ~30 ms and scales linearly with transcript size).
+- **Linear-time & lightweight** — O(N) scanning with atomic JSON storage (runs all 24 seeded eval cases in ~30 ms and scales linearly with transcript size).
 - **Fail-open hooks** — hook commands exit `0` without polluting stdout on malformed input, bad flags, broken pipes, or unexpected errors (unless `--strict` is passed) so a hook issue never disrupts a live agent session.
 
 ---
@@ -36,11 +36,12 @@ teaches the agent when to pin a rule. It runs from the plugin's own source with 
 uv tool install git+https://github.com/1solomonwakhungu/compact-ledger.git   # or: pip install git+…
 cd your-project
 compact-ledger init --write      # merges PreCompact + SessionStart hooks into .claude/settings.json
+compact-ledger doctor            # verifies PATH, Python >=3.11, hooks, plugin & store
 ```
 
-Restart Claude Code, run `/compact` once, then `compact-ledger status` to confirm a snapshot
-was written. `init` warns if `compact-ledger` is not on `PATH`, because a hook that cannot
-find its command fails silently.
+Restart Claude Code, run `/compact` once, then `compact-ledger doctor` or `compact-ledger status`
+to confirm a snapshot was written. `init` warns if `compact-ledger` is not on `PATH`, because a
+hook that cannot find its command fails silently.
 
 Try it without installing: `uvx --from git+https://github.com/1solomonwakhungu/compact-ledger.git compact-ledger eval`.
 
@@ -197,18 +198,25 @@ because snapshots contain user messages verbatim.
 
 ---
 
+## Codex CLI & Generic Transcripts
+
+`compact-ledger` parses real Codex CLI rollouts end-to-end — including modern code-mode `exec` tool calls (`tools.exec_command`, `tools.shell_command`, `tools.apply_patch`), `event_msg` `item_completed` (`CommandExecution`, `FileChange`, `UserMessage`) records, legacy `function_call` / `local_shell_call` / `apply_patch` events, and generic JSONL transcripts — extracting user rules, test trajectories (`pytest`, `vitest`, `jest`, `go test`, generic), edit-thrash warnings, and modified files.
+
+Hook integration (`PreCompact` + `SessionStart`) is currently **Claude Code native**; for Codex CLI sessions, use the CLI commands directly:
+
+```bash
+compact-ledger snapshot --transcript ~/.codex/sessions/.../rollout-*.jsonl
+compact-ledger inject --session-id <session-id>
+```
+
+---
+
 ## Known limits
 
-- **Claude Code is the only wired integration.** `snapshot` parses Codex rollouts and
-  generic JSONL, but Codex has no compaction hook to attach to, and Codex's current
-  code-mode `exec` tool calls are not yet parsed into test runs or file edits. User rules
-  from Codex transcripts are still extracted.
+- **Automatic compaction hooks are Claude Code native.** Codex CLI has no compaction hook to attach to yet; Codex rollouts are supported via `compact-ledger snapshot` / `inject` / `pin`.
 - **Rule detection is heuristic.** Casual phrasings can be missed and some task lines in a
-  long brief are labelled `[CONSTRAINT]`. Manual pins are the reliable path.
-- **Sibling rules can outlive a correction.** `Use tabs. Never use spaces.` followed by
-  `Actually use 2 spaces instead of tabs.` retires `Use tabs.` and leaves
-  `Never use spaces.` active. Prohibitions are only retired by an explicit retraction.
-- **Not on PyPI yet.** Install from GitHub or as a plugin.
+  long brief are labelled `[CONSTRAINT]`. Manual pins (`compact-ledger pin`) are the reliable path.
+- **Not on PyPI yet.** Install from GitHub or as a Claude Code plugin.
 
 ---
 
@@ -220,6 +228,7 @@ defaults to `COMPACT_LEDGER_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`.
 | Command | Description |
 | --- | --- |
 | `compact-ledger init [--write] [--settings-path <path>] [--command <cmd>]` | Print or atomically merge `PreCompact` & `SessionStart` hooks into `.claude/settings.json` (idempotent; refuses invalid JSON without corruption; warns when the hook command is not on `PATH`). |
+| `compact-ledger doctor [--settings-path <path>] [--store-dir <dir>] [--json]` | Verify `compact-ledger` on `PATH`, Python `>=3.11`, `.claude/settings.json` `PreCompact` & `SessionStart` hooks, `.claude-plugin/` health (if present), store writability & `.gitignore`, and hook snapshot activity — with exact copy-pasteable fix commands. |
 | `compact-ledger pin "<text>" [--session-id <id>] [--tag <tag>...] [--negative] [--json]` | Add a high-priority manual pin that survives across snapshots and tight budgets. |
 | `compact-ledger unpin "<pin-id-or-text>" [--session-id <id>]` | Remove a manual pin by pin ID or verbatim text. |
 | `compact-ledger snapshot --transcript <path> [--session-id <id>] [--format auto\|claude-code\|codex\|generic] [--json]` | Parse a JSONL transcript, preserve manual pins, compute overrides/trajectories/thrash, and save an atomic snapshot. |
@@ -228,18 +237,18 @@ defaults to `COMPACT_LEDGER_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`.
 | `compact-ledger clear [--session-id <id>]` | Delete the stored snapshot for a session. |
 | `compact-ledger hook pre-compact [--store-dir <dir>] [--strict]` | Claude Code `PreCompact` stdin hook handler (fail-open unless `--strict`). |
 | `compact-ledger hook session-start [--store-dir <dir>] [--max-chars 6000] [--always] [--strict]` | Claude Code `SessionStart` stdin hook handler (injects on `compact`/`resume` or `--always`; fail-open unless `--strict`). |
-| `compact-ledger eval [--format text\|json] [--verbose]` | Run the packaged 20-case deterministic evaluation suite from any working directory. |
+| `compact-ledger eval [--format text\|json] [--verbose]` | Run the packaged 24-case deterministic evaluation suite from any working directory. |
 
 ---
 
-## Evaluation Suite (20 Seeded Cases)
+## Evaluation Suite (24 Seeded Cases)
 
-`compact-ledger` ships with 20 realistic multi-turn evaluation cases covering Claude Code, Codex, and generic JSONL transcripts, override chains, false-positive guards, `pytest`/`vitest`/`jest`/`go test`/generic trajectories, edit-thrash detection, strict budget truncation, and full hook round-trips.
+`compact-ledger` ships with 24 realistic multi-turn evaluation cases covering Claude Code, Codex (including code-mode `exec` / `apply_patch` rollouts), and generic JSONL transcripts, long multi-rule briefs, contradictory negative-constraint overrides, override chains, harness-feedback & false-positive guards, `pytest`/`vitest`/`jest`/`go test`/generic trajectories, edit-thrash detection, strict budget truncation, and full hook round-trips.
 
 Run it anywhere with `compact-ledger eval` (or `uv run compact-ledger eval`):
 
 ```text
-compact-ledger eval (20 seeded cases)
+compact-ledger eval (24 seeded cases)
 ------------------------------------------------------------------------
 [PASS] 01_negative_constraints_claude_code                  (constraints )  1.08 ms
 [PASS] 02_codex_transcript_constraints_and_edits            (constraints )  0.77 ms
@@ -261,16 +270,20 @@ compact-ledger eval (20 seeded cases)
 [PASS] 18_long_override_does_not_starve_negative_constraints (budget     )  1.90 ms
 [PASS] 19_hook_pre_compact_to_session_start_roundtrip       (hooks       )  1.47 ms
 [PASS] 20_hook_session_start_gating_and_fail_open           (hooks       )  0.44 ms
+[PASS] 21_long_brief_single_rule_override                   (overrides   )  0.92 ms
+[PASS] 22_contradictory_negative_constraint_override        (overrides   )  0.80 ms
+[PASS] 23_harness_feedback_filtering                        (constraints )  0.85 ms
+[PASS] 24_codex_code_mode_exec_trajectories_and_edits       (trajectories)  1.15 ms
 ------------------------------------------------------------------------
 Category breakdown:
-  - constraints    3/3 passed
-  - overrides      5/5 passed
-  - trajectories   6/6 passed
+  - constraints    4/4 passed
+  - overrides      7/7 passed
+  - trajectories   7/7 passed
   - thrash         2/2 passed
   - budget         2/2 passed
   - hooks          2/2 passed
 ------------------------------------------------------------------------
-Total: 20/20 passed (100.0%) in 27.1 ms
+Total: 24/24 passed (100.0%) in 30.2 ms
 ```
 
 See [evals/README.md](evals/README.md) for category details or run `uv run compact-ledger eval --format json` for machine-readable output.

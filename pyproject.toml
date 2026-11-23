@@ -9,6 +9,7 @@ description = "Deterministic, zero-LLM PreCompact/SessionStart memory injector f
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+authors = [{ name = "Solomon Wakhungu" }]
 keywords = ["claude-code", "codex", "ai-agents", "compaction", "context", "memory", "hooks"]
 classifiers = [
     "Development Status :: 4 - Beta",

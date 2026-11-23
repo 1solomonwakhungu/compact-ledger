@@ -1,4 +1,4 @@
-"""Tests for the seeded 20-case compact_ledger.evals suite and `eval` CLI."""
+"""Tests for the seeded 24-case compact_ledger.evals suite and `eval` CLI."""
 
 from __future__ import annotations
 
@@ -19,21 +19,21 @@ from compact_ledger.evals import (
 )
 
 
-def test_seeded_eval_suite_has_20_unique_passing_cases() -> None:
-    assert len(SEEDED_EVAL_CASES) == 20
+def test_seeded_eval_suite_has_24_unique_passing_cases() -> None:
+    assert len(SEEDED_EVAL_CASES) == 24
     ids = [c.case_id for c in SEEDED_EVAL_CASES]
-    assert len(set(ids)) == 20
+    assert len(set(ids)) == 24
 
     report = run_eval_suite()
-    assert report.total == 20
-    assert report.passed == 20
+    assert report.total == 24
+    assert report.passed == 24
     assert report.failed == 0
     assert report.pass_rate == 100.0
     assert report.elapsed_ms >= 0.0
 
     cats = report.category_summary()
     assert set(cats) == {"constraints", "overrides", "trajectories", "thrash", "budget", "hooks"}
-    assert sum(c["total"] for c in cats.values()) == 20
+    assert sum(c["total"] for c in cats.values()) == 24
     assert all(c["failed"] == 0 for c in cats.values())
 
 
@@ -41,24 +41,24 @@ def test_cli_eval_text_verbose_and_json(capsys: pytest.CaptureFixture[str]) -> N
     rc = main(["eval"])
     assert rc == 0
     text_out = capsys.readouterr().out
-    assert "compact-ledger eval (20 seeded cases)" in text_out
-    assert "20/20 passed (100.0%)" in text_out
+    assert "compact-ledger eval (24 seeded cases)" in text_out
+    assert "24/24 passed (100.0%)" in text_out
     assert "[FAIL]" not in text_out
 
     rc = main(["eval", "--verbose"])
     assert rc == 0
     verbose_out = capsys.readouterr().out
     assert "3-step override chain" in verbose_out
-    assert "20/20 passed (100.0%)" in verbose_out
+    assert "24/24 passed (100.0%)" in verbose_out
 
     rc = main(["eval", "--format", "json"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
-    assert parsed["total"] == 20
-    assert parsed["passed"] == 20
+    assert parsed["total"] == 24
+    assert parsed["passed"] == 24
     assert parsed["failed"] == 0
     assert parsed["pass_rate"] == 100.0
-    assert len(parsed["cases"]) == 20
+    assert len(parsed["cases"]) == 24
     assert all(c["passed"] is True and c["error"] is None for c in parsed["cases"])
 
 
@@ -75,8 +75,8 @@ def test_eval_cli_works_from_arbitrary_working_directory(tmp_path: Path) -> None
     )
     assert proc.returncode == 0, proc.stderr
     parsed = json.loads(proc.stdout)
-    assert parsed["total"] == 20
-    assert parsed["passed"] == 20
+    assert parsed["total"] == 24
+    assert parsed["passed"] == 24
     assert parsed["failed"] == 0
 
 
@@ -94,8 +94,8 @@ def test_repo_evals_script_runs_cleanly() -> None:
     )
     assert proc.returncode == 0, proc.stderr
     parsed = json.loads(proc.stdout)
-    assert parsed["total"] == 20
-    assert parsed["passed"] == 20
+    assert parsed["total"] == 24
+    assert parsed["passed"] == 24
 
 
 def test_eval_suite_failure_reporting() -> None:

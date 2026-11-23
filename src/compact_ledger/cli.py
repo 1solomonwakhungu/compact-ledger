@@ -15,6 +15,11 @@ from pathlib import Path
 from typing import TextIO
 
 from compact_ledger import __version__
+from compact_ledger.doctor import (
+    format_doctor_report_json,
+    format_doctor_report_text,
+    run_doctor,
+)
 from compact_ledger.evals import (
     format_eval_report_json,
     format_eval_report_text,
@@ -46,6 +51,7 @@ _SESSION_HELP = (
 _MAIN_EPILOG = """\
 quick start (Claude Code):
   compact-ledger init --write          wire the PreCompact + SessionStart hooks
+  compact-ledger doctor                verify PATH, Python, hooks, plugin & store
   compact-ledger pin "Never touch db/migrations/" --negative
   compact-ledger status                see what is stored for this project
 
@@ -411,10 +417,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Command prefix for hook invocation (default: {DEFAULT_CLAUDE_COMMAND!r}).",
     )
 
+    # doctor
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        parents=[common],
+        help="Verify PATH, Python version, Claude Code hooks, plugin, and store health.",
+        description=(
+            "Check that compact-ledger is on PATH, Python >= 3.11 is active, PreCompact and "
+            "SessionStart hooks are wired, any local .claude-plugin/ is valid, and the project "
+            "store is writable and git-ignored."
+        ),
+    )
+    doctor_parser.add_argument(
+        "--settings-path",
+        default=None,
+        help="Path to settings.json to inspect (default: <project>/.claude/settings.json).",
+    )
+    doctor_parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help="Output diagnostic report as JSON.",
+    )
+
     # eval
     eval_parser = subparsers.add_parser(
         "eval",
-        help="Run the seeded 20-case deterministic compaction evaluation suite.",
+        help="Run the seeded 24-case deterministic compaction evaluation suite.",
     )
     eval_parser.add_argument(
         "--format",
@@ -779,6 +808,18 @@ def _missing_hook_executable(command_prefix: str) -> str | None:
     return None if shutil.which(executable) else tokens[0]
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    report = run_doctor(
+        store_dir=args.store_dir,
+        settings_path=args.settings_path,
+    )
+    if args.as_json:
+        print(format_doctor_report_json(report))
+    else:
+        print(format_doctor_report_text(report))
+    return 0 if report.ok else 1
+
+
 def _cmd_eval(args: argparse.Namespace) -> int:
     report = run_eval_suite()
     if args.eval_format == "json":
@@ -828,6 +869,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_hook(args)
         if args.command == "init":
             return _cmd_init(args)
+        if args.command == "doctor":
+            return _cmd_doctor(args)
         if args.command == "eval":
             return _cmd_eval(args)
 
