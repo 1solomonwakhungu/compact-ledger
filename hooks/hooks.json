@@ -1,0 +1,26 @@
+{
+  "description": "Snapshot user rules and failed attempts before compaction, and re-inject them afterwards.",
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/compact-ledger\" hook pre-compact"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "compact|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/compact-ledger\" hook session-start"
+          }
+        ]
+      }
+    ]
+  }
+}

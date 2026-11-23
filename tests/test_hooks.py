@@ -499,9 +499,14 @@ def test_init_claude_code_refuses_corrupt_or_invalid_settings(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # Missing --claude-code flag exits 2
-    assert main(["init"]) == 2
-    assert "--claude-code" in capsys.readouterr().err
+    # Claude Code is the default (and only) integration, so a bare `init` previews it.
+    with pytest.MonkeyPatch.context() as mp:
+        mp.chdir(tmp_path)
+        assert main(["init"]) == 0
+    preview = capsys.readouterr()
+    assert json.loads(preview.out)["hooks"]["PreCompact"]
+    assert "--write" in preview.err
+    assert not (tmp_path / ".claude").exists()
 
     bad_contents = [
         "{not valid json",

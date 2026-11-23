@@ -24,7 +24,12 @@ from compact_ledger.models import CompactionSnapshot, ParsedTranscript, PinEntry
 from compact_ledger.parsers.transcript import parse_transcript
 from compact_ledger.pins import extract_pins
 from compact_ledger.renderer import DEFAULT_MAX_CHARS, render_snapshot
-from compact_ledger.store import ENV_STORE_DIR, CorruptSnapshotError, SessionStore
+from compact_ledger.store import (
+    ENV_STORE_DIR,
+    CorruptSnapshotError,
+    SessionStore,
+    find_project_root,
+)
 
 __all__ = [
     "DEFAULT_CLAUDE_COMMAND",
@@ -45,6 +50,7 @@ DEFAULT_CLAUDE_COMMAND = "compact-ledger"
 DEFAULT_CLAUDE_SETTINGS_RELPATH = Path(".claude") / "settings.json"
 SESSION_START_SOURCES: frozenset[str] = frozenset({"compact", "resume"})
 SESSION_START_MATCHER = "compact|resume"
+ENV_CLAUDE_PROJECT_DIR = "CLAUDE_PROJECT_DIR"
 _MAX_STDIN_BYTES = 4 * 1024 * 1024  # 4 MiB hard cap for hook stdin payloads
 _COMPACTION_MATCHER_RE = re.compile(r"\b(?:compact|resume)\b", re.IGNORECASE)
 _SHELL_META_RE = re.compile(r"(?:&&|\|\||[;|><`$])")
@@ -138,8 +144,10 @@ def resolve_hook_store(
     Precedence:
     1. Explicit ``store_dir`` (``--store-dir``)
     2. ``COMPACT_LEDGER_DIR`` environment variable (when non-whitespace)
-    3. Payload ``cwd`` (when it points to an existing directory)
-    4. ``fallback_cwd`` or current working directory (``Path.cwd()``)
+    3. The project root found from ``CLAUDE_PROJECT_DIR``, else the payload ``cwd``, else
+       ``fallback_cwd`` / the current working directory. See :func:`find_project_root`:
+       the session's cwd moves whenever the agent changes directory, so the store is
+       anchored to the nearest existing ``.compact-ledger`` or repository root instead.
     """
     if store_dir is not None:
         return SessionStore(store_dir=store_dir)
@@ -149,11 +157,26 @@ def resolve_hook_store(
     if env_dir and env_dir.strip():
         return SessionStore(store_dir=env_dir.strip())
 
-    valid_cwd = _is_valid_existing_dir(payload_cwd)
-    if valid_cwd is not None:
-        return SessionStore(base_dir=valid_cwd)
+    return SessionStore(
+        base_dir=find_project_root(
+            resolve_project_dir(payload_cwd, env=env_map, fallback_cwd=fallback_cwd)
+        )
+    )
 
-    return SessionStore(base_dir=fallback_cwd if fallback_cwd is not None else Path.cwd())
+
+def resolve_project_dir(
+    payload_cwd: Any = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    fallback_cwd: Path | None = None,
+) -> Path:
+    """Return the best-known project directory for a hook invocation."""
+    env_map = os.environ if env is None else env
+    for candidate in (env_map.get(ENV_CLAUDE_PROJECT_DIR), payload_cwd):
+        valid = _is_valid_existing_dir(candidate)
+        if valid is not None:
+            return valid
+    return fallback_cwd if fallback_cwd is not None else Path.cwd()
 
 
 def build_snapshot_from_transcript(
@@ -214,6 +237,11 @@ def create_and_save_snapshot(
     parsed = parse_transcript(path, fmt=transcript_format, session_id=session_id)
     effective_session_id = session_id or parsed.session_id
     if not effective_session_id or not effective_session_id.strip():
+        if not (parsed.user_turns or parsed.tool_executions or parsed.file_edits):
+            raise ValueError(
+                f"No transcript records could be parsed from {path} (expected a Claude Code "
+                "or Codex JSONL transcript). Pass --session-id to store an empty snapshot anyway."
+            )
         raise ValueError("--session-id is required when transcript has no embedded session_id.")
 
     # Load existing manual pins if present; tolerate corrupt files so save_snapshot can quarantine.
@@ -288,6 +316,9 @@ def handle_pre_compact(
         )
 
         extra_meta: dict[str, Any] = {"hook_event": "PreCompact"}
+        with contextlib.suppress(OSError, RuntimeError):
+            project_dir = resolve_project_dir(payload_cwd, env=env, fallback_cwd=fallback_cwd)
+            extra_meta["project_dir"] = sanitize_unicode(str(project_dir.resolve()))
         trigger = payload.get("trigger")
         if isinstance(trigger, str) and trigger.strip():
             extra_meta["trigger"] = sanitize_unicode(trigger.strip())

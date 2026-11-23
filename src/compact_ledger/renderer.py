@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections.abc import Sequence
 from typing import Any, Literal
 
@@ -36,6 +37,14 @@ _MAX_SUPERSEDED_SNIPPET_CHARS = 120
 # strict monotonicity as max_chars grows while preventing one 8KB log from starving Tier 2).
 _STARVATION_FLOOR_CHARS = 1200
 _MAX_METADATA_DEPTH = 32
+
+# Tells the agent waking up after compaction how much weight this block carries.
+_PREAMBLE = (
+    "\nRecorded verbatim before compaction. Pins, overrides and constraints are the user's "
+    "standing instructions: where the compaction summary disagrees, follow these. Failure "
+    "lines list values already observed, oldest first; do not retry an approach that "
+    "produced them."
+)
 
 _TRAJECTORY_PRIORITY: dict[str, int] = {
     "OSCILLATING": 0,
@@ -208,8 +217,9 @@ def _partition_pins(
             sort_turn = p.turn_index if p.turn_index is not None else idx
             auto_indexed.append((sort_turn, idx, p))
 
-    overrides_indexed.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    auto_indexed.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    # Newest turn first; rules stated in the same message keep the order the user wrote them.
+    overrides_indexed.sort(key=lambda item: (-item[0], item[1]))
+    auto_indexed.sort(key=lambda item: (-item[0], item[1]))
 
     return (
         manual,
@@ -340,12 +350,34 @@ def _format_constraint_pin(pin: PinEntry, per_pin_cap: int | None = None) -> str
     return f"{tag} {body}"
 
 
+def _relativize(path: str, project_dir: str | None) -> str:
+    """Show ``path`` relative to the project directory when it lives inside it."""
+    if project_dir and path.startswith(project_dir) and len(path) > len(project_dir):
+        rest = path[len(project_dir) :]
+        if rest[0] in "/\\":
+            return rest.lstrip("/\\") or path
+    return path
+
+
+def _project_dir_of(snapshot: CompactionSnapshot) -> str | None:
+    raw = snapshot.metadata.get("project_dir") if isinstance(snapshot.metadata, dict) else None
+    if not isinstance(raw, str):
+        return None
+    cleaned = _flatten_single_line(raw).rstrip("/\\")
+    return cleaned or None
+
+
 def _format_trajectory(traj: TestTrajectory) -> str:
     test_id = _flatten_single_line(traj.test_id)
     runner = _flatten_single_line(traj.runner)
     prefix = f"[{traj.status}] {test_id} ({runner})"
     summary = _flatten_single_line(traj.summary)
     if summary:
+        # Stored summaries repeat "<STATUS>: <test id>"; the prefix already says both.
+        echoed = f"{traj.status}: {test_id}"
+        if summary.startswith(echoed):
+            rest = summary[len(echoed) :].strip()
+            return f"{prefix} {rest}" if rest else prefix
         return f"{prefix}: {summary}"
 
     if not traj.attempts:
@@ -368,11 +400,19 @@ def _format_trajectory(traj: TestTrajectory) -> str:
     return f"{prefix}: {', '.join(parts)}"
 
 
-def _format_thrash_entry(entry: EditThrashEntry) -> str:
+_TRAILING_PAREN_RE = re.compile(r" \([^()]{0,80}\)$")
+
+
+def _format_thrash_entry(entry: EditThrashEntry, project_dir: str | None = None) -> str:
     tag = "[THRASH/REVERT]" if entry.reverted else "[THRASH]"
-    path = _flatten_single_line(entry.path)
+    raw_path = _flatten_single_line(entry.path)
+    path = _relativize(raw_path, project_dir)
     counts = f"{entry.edit_count} edits, {entry.failure_count} failures"
     reason = _flatten_single_line(entry.reason)
+    if reason:
+        # The stored reason repeats the path and the counts already shown before the colon.
+        reason = reason.replace(f" on {raw_path}", "", 1)
+        reason = _TRAILING_PAREN_RE.sub("", reason).strip()
     if reason:
         return f"{tag} {path} ({counts}): {reason}"
     return f"{tag} {path} ({counts})"
@@ -408,7 +448,10 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
     thrash = _order_thrash_entries(snapshot.thrash_entries)
     covered_test_ids = frozenset(t.test_id for t in snapshot.trajectories)
     raw_attempts = _unresolved_raw_attempts(snapshot.attempts, covered_test_ids)
-    modified_files = _dedupe_files(snapshot.modified_files)
+    project_dir = _project_dir_of(snapshot)
+    modified_files = _dedupe_files(
+        [_relativize(_flatten_single_line(f), project_dir) for f in snapshot.modified_files]
+    )
 
     # Monotonic starvation cap: ONLY applied when pins would otherwise overflow max_chars.
     all_active_pins = [*manual, *overrides, *auto]
@@ -433,7 +476,7 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
 
     tier3_items: list[str] = [
         *(_format_trajectory(t) for t in unresolved_traj),
-        *(_format_thrash_entry(e) for e in thrash),
+        *(_format_thrash_entry(e, project_dir) for e in thrash),
         *(_format_raw_attempt(a) for a in raw_attempts),
     ]
 
@@ -507,6 +550,10 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
 
         if overflowed:
             break
+
+    # The preamble only uses leftover budget, so it never displaces a pin or a failure line.
+    if len(parts) > 1 and used + len(_PREAMBLE) <= max_chars:
+        parts.insert(1, _PREAMBLE)
 
     result = sanitize_unicode("".join(parts))
     if len(result) > max_chars:
