@@ -20,20 +20,29 @@ Long coding sessions hit context compaction right when precision matters most. L
 
 ## Quick start
 
+### Agent Skill ([skills.sh](https://skills.sh))
+
+Install into Claude Code, Codex, Cursor, Antigravity, OpenCode, and other skill-compatible agents:
+
+```bash
+npx skills add 1solomonwakhungu/compact-ledger
+```
+
 ### Claude Code plugin (no Python setup)
 
 ```text
-/plugin install compact-ledger --marketplace 1solomonwakhungu/compact-ledger
+/plugin marketplace add 1solomonwakhungu/compact-ledger
+/plugin install compact-ledger@compact-ledger
 ```
 
 The plugin bundles the hooks, a `compact-ledger` command for the Bash tool, and a skill that
 teaches the agent when to pin a rule. It runs from the plugin's own source with any Python
 3.11+ already on the machine and installs nothing.
 
-### CLI + hooks
+### CLI + hooks (PyPI)
 
 ```bash
-uv tool install git+https://github.com/1solomonwakhungu/compact-ledger.git   # or: pip install git+…
+uv tool install compact-ledger   # or: pip install compact-ledger (zero-install: uvx compact-ledger)
 cd your-project
 compact-ledger init --write      # merges PreCompact + SessionStart hooks into .claude/settings.json
 compact-ledger doctor            # verifies PATH, Python >=3.11, hooks, plugin & store
@@ -43,7 +52,7 @@ Restart Claude Code, run `/compact` once, then `compact-ledger doctor` or `compa
 to confirm a snapshot was written. `init` warns if `compact-ledger` is not on `PATH`, because a
 hook that cannot find its command fails silently.
 
-Try it without installing: `uvx --from git+https://github.com/1solomonwakhungu/compact-ledger.git compact-ledger eval`.
+Try it without installing: `uvx compact-ledger eval`.
 
 Local development:
 
@@ -183,7 +192,7 @@ existing hooks and settings, writes atomically, and changes nothing on a second 
 - **`PreCompact`** reads Claude Code's stdin JSON (`session_id`, `transcript_path`, `cwd`, `trigger`), parses the transcript, and atomically writes `.compact-ledger/sessions/<session_id>.json`.
 - **`SessionStart`** reads stdin JSON (`session_id`, `source`, `cwd`) and, only when `source` is `"compact"` or `"resume"` (or `--always` is passed), emits `hookSpecificOutput.additionalContext` with the bounded Markdown ledger.
 
-Use `--command` to change the hook command prefix, for example `--command "uvx compact-ledger"` once the package is on PyPI.
+Use `--command` to change the hook command prefix, for example `--command "uvx compact-ledger"`.
 
 ### Where snapshots live
 
@@ -216,14 +225,12 @@ compact-ledger inject --session-id <session-id>
 - **Automatic compaction hooks are Claude Code native.** Codex CLI has no compaction hook to attach to yet; Codex rollouts are supported via `compact-ledger snapshot` / `inject` / `pin`.
 - **Rule detection is heuristic.** Casual phrasings can be missed and some task lines in a
   long brief are labelled `[CONSTRAINT]`. Manual pins (`compact-ledger pin`) are the reliable path.
-- **Not on PyPI yet.** Install from GitHub or as a Claude Code plugin.
 
 ---
 
 ## CLI Reference
 
-All session commands accept `--store-dir <dir>` (or `COMPACT_LEDGER_DIR`). `--session-id`
-defaults to `COMPACT_LEDGER_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID`.
+All session commands accept `--store-dir <dir>` (or `COMPACT_LEDGER_DIR`). For `pin`, `unpin`, `inject`, and `clear`, `--session-id` defaults to `COMPACT_LEDGER_SESSION_ID`, then `CLAUDE_CODE_SESSION_ID` (`snapshot` falls back to the transcript's embedded ID; `status` without `--session-id` lists all sessions and marks the env session with `*`).
 
 | Command | Description |
 | --- | --- |
