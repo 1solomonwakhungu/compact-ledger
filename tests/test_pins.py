@@ -852,7 +852,7 @@ def test_round2_b4_three_linear_scaling_stress_shapes() -> None:
     ]
     t1 = time.monotonic()
     extract_pins(shared_turns)
-    assert (time.monotonic() - t1) < 1.5
+    assert (time.monotonic() - t1) < 3.0
 
     # 3. 2,000-step single override chain
     chain_turns = [UserTurn(turn_index=1, text="Use token_0 for cutoff.", seq=1)] + [

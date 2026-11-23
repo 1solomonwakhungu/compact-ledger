@@ -868,12 +868,11 @@ def _clean_phrase(raw: str) -> str:
     return " ".join(cleaned.split())
 
 
-def _phrase_in_norm_text(phrase: str, norm_lower_text: str) -> bool:
-    """Check whether ``phrase`` appears in pre-normalized lowercase text on token boundaries."""
-    clean_phrase = _clean_phrase(phrase).lower()
-    if not clean_phrase or not norm_lower_text:
+def _phrase_in_norm_text(clean_lower_phrase: str, norm_lower_text: str) -> bool:
+    """Check whether ``clean_lower_phrase`` appears in normalized text on token boundaries."""
+    if not clean_lower_phrase or not norm_lower_text or clean_lower_phrase not in norm_lower_text:
         return False
-    escaped = re.escape(clean_phrase)
+    escaped = re.escape(clean_lower_phrase)
     pattern = rf"(?<![a-z0-9]){escaped}(?![a-z0-9])"
     return re.search(pattern, norm_lower_text) is not None
 
@@ -1315,6 +1314,8 @@ def is_chatter(text: str) -> bool:
 def _score_supersede_candidate(
     signal: _OverrideSignal,
     override_tokens: frozenset[str],
+    old_val_specs: Sequence[tuple[str, frozenset[str]]],
+    hint_specs: Sequence[tuple[str, frozenset[str]]],
     candidate: PinEntry,
     candidate_norm_lower: str,
     candidate_own_tokens: frozenset[str],
@@ -1329,12 +1330,11 @@ def _score_supersede_candidate(
     # 1. Explicit old-value matches (highest signal).
     # For multi-word old_values (e.g. "old logging config"), require ALL tokens to match
     # (or >= 2 tokens covering >= 50%) so a single incidental word ("config") never misfires.
-    for old_val in signal.old_values:
-        if _phrase_in_norm_text(old_val, candidate_norm_lower):
+    for clean_old_lower, old_tokens in old_val_specs:
+        if _phrase_in_norm_text(clean_old_lower, candidate_norm_lower):
             score += 120
             direct_value_or_topic_match = True
             continue
-        old_tokens = _extract_content_tokens(old_val)
         if not old_tokens:
             continue
         own_hit = old_tokens & candidate_own_tokens
@@ -1351,12 +1351,11 @@ def _score_supersede_candidate(
                 direct_value_or_topic_match = True
 
     # 2. Explicit topic-hint matches ("ignore what I said earlier about auth")
-    for hint in signal.topic_hints:
-        if _phrase_in_norm_text(hint, candidate_norm_lower):
+    for clean_hint_lower, hint_tokens in hint_specs:
+        if _phrase_in_norm_text(clean_hint_lower, candidate_norm_lower):
             score += 90
             direct_value_or_topic_match = True
             continue
-        hint_tokens = _extract_content_tokens(hint)
         if not hint_tokens:
             continue
         own_hit = hint_tokens & candidate_own_tokens
@@ -1553,12 +1552,20 @@ def extract_pins(
         superseded_target: PinEntry | None = None
 
         if signal is not None:
+            # Precompute normalized phrases and tokens ONCE per override turn (not per candidate)
+            old_val_specs = [
+                (_clean_phrase(v).lower(), _extract_content_tokens(v)) for v in signal.old_values
+            ]
+            hint_specs = [
+                (_clean_phrase(h).lower(), _extract_content_tokens(h)) for h in signal.topic_hints
+            ]
+
             # Gather up to _MAX_BUCKET_SCAN newest active candidates per token (strictly O(1))
             query_tokens: set[str] = set(own_tokens)
-            for old_val in signal.old_values:
-                query_tokens.update(_extract_content_tokens(old_val))
-            for hint in signal.topic_hints:
-                query_tokens.update(_extract_content_tokens(hint))
+            for _, old_toks in old_val_specs:
+                query_tokens.update(old_toks)
+            for _, hint_toks in hint_specs:
+                query_tokens.update(hint_toks)
 
             candidate_map: dict[str, PinEntry] = {}
 
@@ -1570,7 +1577,6 @@ def extract_pins(
                         found += 1
                         if found >= _MAX_BUCKET_SCAN:
                             break
-                # Periodically compact buckets when tail contains many dead entries
                 if len(bucket) > _MAX_BUCKET_SCAN * 4 and found < _MAX_BUCKET_SCAN:
                     bucket[:] = [p for p in bucket if p.superseded_by is None]
 
@@ -1579,9 +1585,9 @@ def extract_pins(
                 if bucket:
                     _collect_recent(bucket, candidate_map)
 
-            for hint in signal.topic_hints:
-                for ht in _extract_content_tokens(hint):
-                    if len(ht) >= 4:
+            for _, hint_toks in hint_specs:
+                for ht in hint_toks:
+                    if len(ht) >= 4 and ht not in token_index:
                         pbucket = prefix4_index.get(ht[:4])
                         if pbucket:
                             _collect_recent(pbucket, candidate_map)
@@ -1607,6 +1613,8 @@ def extract_pins(
                 score = _score_supersede_candidate(
                     signal=signal,
                     override_tokens=own_tokens,
+                    old_val_specs=old_val_specs,
+                    hint_specs=hint_specs,
                     candidate=cand,
                     candidate_norm_lower=cand_norm_lower,
                     candidate_own_tokens=cand_own,
