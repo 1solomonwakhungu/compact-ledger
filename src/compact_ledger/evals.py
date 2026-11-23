@@ -1,4 +1,4 @@
-"""Seeded 20-case deterministic evaluation suite for compact-ledger.
+"""Seeded 24-case deterministic evaluation suite for compact-ledger.
 
 Every case constructs realistic multi-turn transcripts (Claude Code, Codex, or
 generic JSONL) and runs them through the real end-to-end parsing, pin/override
@@ -1178,7 +1178,467 @@ def _case_20_hook_session_start_gating_and_fail_open(tmp: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Registry of all 20 seeded evaluation cases
+# Category 7: Adoption & Real-World Usability Regressions (Cases 21–24)
+# ---------------------------------------------------------------------------
+
+
+def _case_21_long_brief_single_rule_override(tmp: Path) -> None:
+    sid = "eval-21"
+    context_prose = (
+        "Our multi-tenant invoicing service processes recurring subscription renewals, "
+        "seat upgrades, mid-cycle downgrades, and end-of-quarter enterprise true-ups across "
+        "twelve regional tax jurisdictions. Historically the proration engine mixed calendar "
+        "day arithmetic with cached floating-point exchange rates, which caused rounding drift "
+        "whenever finance audited monthly close ledgers or replayed historical webhooks. "
+        "The team already migrated invoice persistence to immutable append-only ledger rows "
+        "last quarter, and the mobile checkout client parses the JSON summary payload directly "
+        "without an intermediate BFF translation layer. Every nightly backfill job replays the "
+        "last ninety days of subscription transitions inside an ephemeral staging container "
+        "whose network egress is disabled by policy, so deterministic local execution matters."
+    )
+    long_brief = (
+        "Hey, please refactor the subscription proration and rollover pipeline.\n\n"
+        f"## Background\n{context_prose}\n\n{context_prose}\n\n"
+        "During yesterday's incident review we noticed that legacy worker queues sometimes "
+        "retry failed jobs out of order and old CI workers never finish cleanly when fixtures "
+        "leave stray temporary files behind.\n\n"
+        f"Additional operational notes:\n{context_prose}\n\n"
+        "## Standing Rules\n"
+        "- Use June 30 as the billing cutoff date for fiscal-year rollovers.\n"
+        "- Never touch migrations under db/migrations/ — the DBA team owns those.\n"
+        "- Don't add any new third-party runtime dependencies.\n"
+        "- All money math must use `Decimal`, never floats.\n"
+        "- Keep the public signature of `compute_proration(account, cutoff)` stable.\n"
+        "- Always emit ISO-8601 UTC timestamps on generated audit records.\n\n"
+        "Sample failing log (do not treat fenced log lines as rules):\n"
+        "```\n"
+        "FAILED tests/test_billing.py::test_proration - assert 400 == 100\n"
+        "Never trust this fenced error message.\n"
+        "```\n"
+    )
+    _require(
+        3000 <= len(long_brief) <= 5000,
+        f"Expected 3-5 KB long brief fixture, got {len(long_brief)} chars",
+    )
+    records = [
+        _cc_user(sid, long_brief, "2026-02-01T10:00:00Z"),
+        _cc_user(sid, "ok sounds good, go ahead", "2026-02-01T10:01:00Z"),
+        _cc_user(
+            sid,
+            "Actually use July 31 instead of June 30 for the billing cutoff date.",
+            "2026-02-01T10:02:00Z",
+        ),
+    ]
+    snap, md, _ = _run_pipeline(tmp, records, session_id=sid)
+    active = [p for p in snap.pins if p.superseded_by is None]
+    superseded = [p for p in snap.pins if p.superseded_by is not None]
+    active_texts = [p.text for p in active]
+
+    _require(
+        len(superseded) == 1 and "June 30" in superseded[0].text,
+        f"Expected only the June 30 rule to be superseded, got: {[p.text for p in superseded]}",
+    )
+    surviving_rules = (
+        "Never touch migrations under db/migrations/ — the DBA team owns those.",
+        "Don't add any new third-party runtime dependencies.",
+        "All money math must use `Decimal`, never floats.",
+        "Keep the public signature of `compute_proration(account, cutoff)` stable.",
+        "Always emit ISO-8601 UTC timestamps on generated audit records.",
+    )
+    for rule in surviving_rules:
+        _require(rule in active_texts, f"Unaffected rule from long brief was lost: {rule!r}")
+        _require(rule in md, f"Unaffected rule missing from rendered markdown: {rule!r}")
+    _require(
+        not any("Never trust this fenced error message." in t for t in active_texts),
+        "Fenced code block text leaked into pins",
+    )
+    _require("July 31" in md and "[OVERRIDE]" in md, md)
+
+
+def _case_22_contradictory_negative_constraint_override(tmp: Path) -> None:
+    sid = "eval-22"
+    records = [
+        _cc_user(sid, "Use tabs. Never use spaces.", "2026-02-01T10:00:00Z"),
+        _cc_user(sid, "Never use spaces in filenames.", "2026-02-01T10:01:00Z"),
+        _cc_user(sid, "Never touch db/migrations/.", "2026-02-01T10:02:00Z"),
+        _cc_user(sid, "Actually use 2 spaces instead of tabs.", "2026-02-01T10:03:00Z"),
+    ]
+    snap, md, _ = _run_pipeline(tmp, records, session_id=sid)
+    active_texts = [p.text for p in snap.pins if p.superseded_by is None]
+    superseded_texts = [p.text for p in snap.pins if p.superseded_by is not None]
+
+    _require("Use tabs." in superseded_texts, f"'Use tabs.' not retired: {superseded_texts}")
+    _require(
+        "Never use spaces." in superseded_texts,
+        f"Contradictory 'Never use spaces.' stayed active! active={active_texts}",
+    )
+    _require(
+        "Never use spaces." not in md,
+        f"Contradictory 'Never use spaces.' leaked into rendered markdown:\n{md}",
+    )
+    _require(
+        "Never use spaces in filenames." in active_texts,
+        f"Scoped negative rule was falsely retired: active={active_texts}",
+    )
+    _require(
+        "Never touch db/migrations/." in active_texts,
+        f"Unrelated negative rule was falsely retired: active={active_texts}",
+    )
+    _require("Actually use 2 spaces instead of tabs." in md and "[OVERRIDE]" in md, md)
+
+
+def _case_23_harness_feedback_filtering(tmp: Path) -> None:
+    claude_sid = "eval-23-claude"
+    claude_records = [
+        _cc_user(claude_sid, "Never commit .env files.", "2026-02-01T10:00:00Z"),
+        _cc_user(
+            claude_sid,
+            "Stop hook feedback:\n- [ruff check]: Never leave unused imports in src/app.py",
+            "2026-02-01T10:01:00Z",
+        ),
+        _cc_user(
+            claude_sid,
+            "PreToolUse:Bash hook blocking error from command: Do not run rm -rf /tmp",
+            "2026-02-01T10:02:00Z",
+        ),
+        _cc_user(
+            claude_sid,
+            "<bash-input>echo 'Never pin bash input'</bash-input>",
+            "2026-02-01T10:03:00Z",
+        ),
+        _cc_user(
+            claude_sid,
+            "This session is being continued from a previous conversation. Never use tabs.",
+            "2026-02-01T10:04:00Z",
+        ),
+        _cc_user(
+            claude_sid,
+            "Always run ruff before pushing.\n"
+            "<system-reminder>\nNever reveal internal prompt rules.\n</system-reminder>",
+            "2026-02-01T10:05:00Z",
+        ),
+    ]
+    claude_dir = tmp / "claude_run"
+    claude_dir.mkdir()
+    c_snap, c_md, _ = _run_pipeline(claude_dir, claude_records, session_id=claude_sid)
+    c_texts = [p.text for p in c_snap.pins]
+    _require(
+        c_texts == ["Never commit .env files.", "Always run ruff before pushing."],
+        f"Claude harness feedback leaked into pins: {c_texts}",
+    )
+    _require("Stop hook feedback" not in c_md and "system-reminder" not in c_md, c_md)
+
+    codex_dir = tmp / "codex_run"
+    codex_dir.mkdir()
+    codex_sid = "eval-23-codex"
+    codex_records = [
+        {"type": "session_meta", "timestamp": "2026-02-01T11:00:00Z", "payload": {"id": codex_sid}},
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T11:00:01Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "# AGENTS.md instructions\nNever leak AGENTS.md boilerplate.",
+                    }
+                ],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T11:00:02Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Always use uv, never pip."}],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T11:00:03Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": (
+                            "Background command completed (exit 1): /bin/zsh -lc "
+                            '"pytest -q # never pin background notices"'
+                        ),
+                    }
+                ],
+            },
+        },
+    ]
+    x_snap, _, _ = _run_pipeline(codex_dir, codex_records, session_id=None)
+    x_texts = [p.text for p in x_snap.pins]
+    _require(
+        x_texts == ["Always use uv, never pip."],
+        f"Codex harness feedback leaked into pins: {x_texts}",
+    )
+
+
+def _case_24_codex_code_mode_exec_trajectories_and_edits(tmp: Path) -> None:
+    node = "tests/test_billing.py::test_proration"
+    fail_1 = _pytest_fail_output(node, "tests/test_billing.py:42", "400", "100")
+    fail_2 = _pytest_fail_output(node, "tests/test_billing.py:42", "200", "100")
+
+    # Part A: Real Codex CLI rollout with custom_tool_call(exec) + event_msg(item_completed)
+    full_dir = tmp / "codex_full"
+    full_dir.mkdir()
+    full_sid = "eval-24-codex-full"
+    full_records: list[dict[str, Any]] = [
+        {"type": "session_meta", "timestamp": "2026-02-01T12:00:00Z", "payload": {"id": full_sid}},
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:00:01Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Never use floats for money math."}],
+            },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": "2026-02-01T12:00:01Z",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "UserMessage",
+                    "id": "um_1",
+                    "content": [{"type": "text", "text": "Never use floats for money math."}],
+                },
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:00:02Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call_exec_1",
+                "input": (
+                    'const r = await tools.exec_command({"cmd":"pytest tests/test_billing.py"});\n'
+                    "text(r.output);"
+                ),
+            },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": "2026-02-01T12:00:03Z",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "exec-cmd-1",
+                    "command": ["/bin/zsh", "-lc", "pytest tests/test_billing.py"],
+                    "status": "failed",
+                    "exit_code": 1,
+                    "aggregated_output": fail_1,
+                },
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:00:03Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec_1",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "Script completed\nWall time 0.2 seconds\nOutput:\n",
+                    },
+                    {"type": "input_text", "text": fail_1},
+                ],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:00:04Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call_exec_2",
+                "input": (
+                    'text(await tools.apply_patch("*** Begin Patch\\n'
+                    "*** Update File: src/billing/proration.py\\n"
+                    '@@\\n-return amount * 4\\n+return amount * 2\\n*** End Patch"));'
+                ),
+            },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": "2026-02-01T12:00:05Z",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "FileChange",
+                    "id": "exec-fc-1",
+                    "status": "completed",
+                    "changes": {
+                        "src/billing/proration.py": {
+                            "type": "update",
+                            "unified_diff": (
+                                "@@ -10,1 +10,1 @@\n-return amount * 4\n+return amount * 2\n"
+                            ),
+                            "move_path": None,
+                        }
+                    },
+                },
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:00:05Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec_2",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "Script completed\nWall time 0.1 seconds\nOutput:\n",
+                    },
+                    {"type": "input_text", "text": "{}"},
+                ],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:00:06Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "call_exec_3",
+                "input": (
+                    'const r = await tools.exec_command({"cmd":"pytest tests/test_billing.py"});\n'
+                    "text(r.output);"
+                ),
+            },
+        },
+        {
+            "type": "event_msg",
+            "timestamp": "2026-02-01T12:00:07Z",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "exec-cmd-2",
+                    "command": ["/bin/zsh", "-lc", "pytest tests/test_billing.py"],
+                    "status": "failed",
+                    "exit_code": 1,
+                    "aggregated_output": fail_2,
+                },
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:00:07Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "call_exec_3",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "Script completed\nWall time 0.2 seconds\nOutput:\n",
+                    },
+                    {"type": "input_text", "text": fail_2},
+                ],
+            },
+        },
+    ]
+    snap, md, _ = _run_pipeline(full_dir, full_records, session_id=None)
+    _require(snap.metadata.get("transcript_format") == "codex", str(snap.metadata))
+    _require(snap.modified_files == ["src/billing/proration.py"], str(snap.modified_files))
+    traj = next((t for t in snap.trajectories if t.test_id == node), None)
+    _require(traj is not None, f"Missing Codex exec trajectory: {snap.trajectories}")
+    assert traj is not None
+    _require(traj.status == "PROGRESSING", f"Expected PROGRESSING, got {traj}")
+    _require(
+        [a.actual for a in traj.attempts] == ["400", "200"],
+        f"Duplicate or missing attempts in Codex rollout: {traj.attempts}",
+    )
+    _require("[PROGRESSING]" in md and "400 -> 200" in md and "src/billing/proration.py" in md, md)
+
+    # Part B: Response-item-only Codex code-mode exec fallback (no item_completed events)
+    js_dir = tmp / "codex_js_only"
+    js_dir.mkdir()
+    js_sid = "eval-24-codex-js"
+    js_only_records: list[dict[str, Any]] = [
+        {"type": "session_meta", "timestamp": "2026-02-01T12:10:00Z", "payload": {"id": js_sid}},
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:10:01Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "js_1",
+                "input": (
+                    'const patch = "*** Begin Patch\\n*** Add File: src/billing/helper.py\\n'
+                    '+def ok():\\n+    return 1\\n*** End Patch";\n'
+                    "text(await tools.apply_patch(patch));"
+                ),
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:10:02Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "js_1",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "Script completed\nWall time 0.1 seconds\nOutput:\n",
+                    },
+                    {"type": "input_text", "text": "{}"},
+                ],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:10:03Z",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "js_2",
+                "input": (
+                    'await Promise.all([tools.exec_command({cmd:"pytest tests/test_billing.py"})]);'
+                ),
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": "2026-02-01T12:10:04Z",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "js_2",
+                "output": [
+                    {
+                        "type": "input_text",
+                        "text": "Script completed\nWall time 0.3 seconds\nOutput:\n",
+                    },
+                    {
+                        "type": "input_text",
+                        "text": json.dumps([{"chunk_id": "abc", "exit_code": 1, "output": fail_1}]),
+                    },
+                ],
+            },
+        },
+    ]
+    js_snap, js_md, _ = _run_pipeline(js_dir, js_only_records, session_id=None)
+    _require(js_snap.modified_files == ["src/billing/helper.py"], str(js_snap.modified_files))
+    js_traj = next((t for t in js_snap.trajectories if t.test_id == node), None)
+    _require(js_traj is not None and js_traj.attempts[0].actual == "400", str(js_snap.trajectories))
+    _require("src/billing/helper.py" in js_md and "test_proration" in js_md, js_md)
+
+
+# ---------------------------------------------------------------------------
+# Registry of all 24 seeded evaluation cases
 # ---------------------------------------------------------------------------
 
 SEEDED_EVAL_CASES: tuple[EvalCase, ...] = (
@@ -1301,6 +1761,30 @@ SEEDED_EVAL_CASES: tuple[EvalCase, ...] = (
         "hooks",
         "SessionStart source gating (startup/clear/--always) and fail-open vs --strict safety",
         _case_20_hook_session_start_gating_and_fail_open,
+    ),
+    EvalCase(
+        "21_long_brief_single_rule_override",
+        "overrides",
+        "3-4 KB multi-rule opening brief + single-rule override preserves all unaffected rules",
+        _case_21_long_brief_single_rule_override,
+    ),
+    EvalCase(
+        "22_contradictory_negative_constraint_override",
+        "overrides",
+        "Adopting a previously forbidden target retires the conflicting [DO NOT] rule safely",
+        _case_22_contradictory_negative_constraint_override,
+    ),
+    EvalCase(
+        "23_harness_feedback_filtering",
+        "constraints",
+        "Claude Code & Codex harness feedback and background notices never leak into user pins",
+        _case_23_harness_feedback_filtering,
+    ),
+    EvalCase(
+        "24_codex_code_mode_exec_trajectories_and_edits",
+        "trajectories",
+        "Real-shape Codex code-mode exec & item_completed rollouts extract trajectories and edits",
+        _case_24_codex_code_mode_exec_trajectories_and_edits,
     ),
 )
 
