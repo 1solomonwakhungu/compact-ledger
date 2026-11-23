@@ -8,7 +8,7 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 from compact_ledger.models import (
@@ -41,6 +41,65 @@ _WINDOWS_RESERVED_NAMES = frozenset(
         *(f"lpt{i}" for i in range(1, 10)),
     }
 )
+
+
+ENV_SESSION_ID = "COMPACT_LEDGER_SESSION_ID"
+ENV_CLAUDE_SESSION_ID = "CLAUDE_CODE_SESSION_ID"
+_STORE_GITIGNORE = "# Session snapshots hold verbatim user messages. Never commit them.\n*\n"
+_MAX_ROOT_WALK = 64
+
+
+def find_project_root(start: str | Path) -> Path:
+    """Return the directory whose ``.compact-ledger`` store ``start`` should use.
+
+    Hooks receive the session's *current* directory and agents run ``compact-ledger pin``
+    from wherever they happen to be, so a store keyed on the literal cwd splits into
+    several stores as soon as anyone changes directory. Walking up keeps one per project:
+
+    1. the nearest ancestor (including ``start``) that already has a ``.compact-ledger``
+       directory, else
+    2. the nearest ancestor that contains ``.git`` (a repository or worktree root), else
+    3. ``start`` itself.
+
+    The walk never adopts the home directory or the filesystem root unless ``start`` is
+    exactly that directory.
+    """
+    try:
+        origin = Path(start).expanduser().resolve()
+    except (OSError, RuntimeError):
+        return Path(start)
+    try:
+        home = Path.home().resolve()
+    except (OSError, RuntimeError):
+        home = None
+
+    git_root: Path | None = None
+    current = origin
+    for _ in range(_MAX_ROOT_WALK):
+        is_boundary = current != origin and (current == home or current.parent == current)
+        if is_boundary:
+            break
+        try:
+            if (current / DEFAULT_DIR_NAME).is_dir():
+                return current
+            if git_root is None and (current / ".git").exists():
+                git_root = current
+        except OSError:
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+    return git_root if git_root is not None else origin
+
+
+def default_session_id(env: Mapping[str, str] | None = None) -> str | None:
+    """Return the ambient session id (``COMPACT_LEDGER_SESSION_ID`` or Claude Code's)."""
+    env_map = os.environ if env is None else env
+    for key in (ENV_SESSION_ID, ENV_CLAUDE_SESSION_ID):
+        value = env_map.get(key)
+        if value and value.strip():
+            return value.strip()
+    return None
 
 
 class CorruptSnapshotError(ValueError):
@@ -161,9 +220,17 @@ class SessionStore:
             if env_dir and env_dir.strip():
                 self.root_dir = Path(env_dir.strip()).expanduser()
             else:
-                self.root_dir = Path.cwd() / DEFAULT_DIR_NAME
+                self.root_dir = find_project_root(Path.cwd()) / DEFAULT_DIR_NAME
 
         self.sessions_dir = self.root_dir / SESSIONS_SUBDIR
+
+    def _ensure_dirs(self) -> None:
+        """Create the store and make it ignore itself in git (best effort)."""
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        ignore_file = self.root_dir / ".gitignore"
+        with contextlib.suppress(OSError):
+            if not ignore_file.exists() and not ignore_file.is_symlink():
+                ignore_file.write_text(_STORE_GITIGNORE, encoding="utf-8")
 
     def _reject_symlinks(self, target: Path | None = None) -> None:
         for path in (self.root_dir, self.sessions_dir):
@@ -188,7 +255,7 @@ class SessionStore:
     def _session_lock(self, session_id: str) -> Iterator[None]:
         self._reject_symlinks()
         safe_id = sanitize_session_id(session_id)
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_dirs()
         lock_path = self.sessions_dir / f".{safe_id}.lock"
         if fcntl is None:
             yield
@@ -390,7 +457,7 @@ class SessionStore:
 
     def _atomic_write_json(self, target: Path, payload: str) -> None:
         self._reject_symlinks(target)
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self._ensure_dirs()
         safe_payload = sanitize_unicode(payload)
         tmp_path: Path | None = None
         try:

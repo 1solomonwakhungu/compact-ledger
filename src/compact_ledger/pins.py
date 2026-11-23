@@ -46,6 +46,23 @@ _DASH_VARIANTS_RE = re.compile(r"[\u2013\u2014]")
 _WORD_TOKEN_RE = re.compile(r"[a-z0-9]+")
 _CAMEL_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
 _SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?]) ")
+
+# Long-form turn segmentation (multi-block briefs, rule lists, long paragraphs)
+_LONGFORM_PARAGRAPH_CHARS = 400
+_MAX_SEGMENTS_PER_TURN = 200
+_LIST_MARKER_RE = re.compile(r"^[ \t>]*(?:[-*+\u2022]|\d{1,3}[.)])[ \t]+(?:\[[ xX]\][ \t]+)?")
+_HEADING_MARKER_RE = re.compile(r"^[ \t>]*#{1,6}[ \t]+")
+_RULES_LEADIN_RE = re.compile(
+    r"\b(?:rules?|constraints?|requirements?|guardrails?|invariants?|restrictions?|"
+    r"non[- ]negotiables?|hard limits?|boundar(?:y|ies)|polic(?:y|ies)|"
+    r"do(?:'s)? and don'?ts|must[- ]haves?|out of scope|off[- ]limits)\b",
+    re.IGNORECASE,
+)
+_NEGATIVE_LEADIN_RE = re.compile(
+    r"^(?:(?:please|you|we|and) )?(?:do not|don't|never|avoid|must not|should not|"
+    r"shouldn't|out of scope|off[- ]limits|not allowed|forbidden)\b[^.!?]{0,60}$",
+    re.IGNORECASE,
+)
 _CLAUSE_SPLIT_RE = re.compile(r"[.!?;,]+")
 
 # ---------------------------------------------------------------------------
@@ -259,7 +276,11 @@ _NEG_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(
         r"\bno (?:third[- ]party|external|llm|network|breaking|extra|additional|"
         r"changes? to|edits? to|modifications? to|writes? to|dependencies|"
-        r"deps|mocking|mocks|skipping|skipped)\b",
+        r"deps|mocking|mocks|skipping|skipped|new (?:dependenc(?:y|ies)|deps|files?|"
+        r"packages?|libraries|libs|abstractions?|features?)|emojis?|force[- ]push\w*|"
+        r"floats?|global (?:state|variables?)|hardcod\w*|placeholders?|stubs?|todos?|"
+        r"secrets?|wildcard imports?|em[- ]dashes?|console\.logs?|print statements?|"
+        r"destructive \w+)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -348,7 +369,15 @@ _IMPERATIVE_VERBS = (
     "downgrade|upgrade|assume|target|apply|stick|follow|match|respect|honor|retain|"
     "drop|omit|strip|wrap|prefix|suffix|encode|decode|serialize|deserialize|pass|bind|"
     "route|redirect|map|filter|group|split|merge|join|cache|flush|close|open|load|read|"
-    "run|execute"
+    "run|execute|go with|pick|choose"
+)
+
+# "For the frontend bits use pnpm", "In tests prefer fixtures" (scoped imperative)
+_SCOPED_IMPERATIVE_RE = re.compile(
+    r"^(?:for|in|on|inside|within|under|with) (?:[a-z0-9_./`'-]+ ){1,5}"
+    r"(?:(?:please|always|only) )?(?:use|keep|prefer|stick (?:with|to)|avoid|go with) "
+    r"[a-z0-9_./`'-]",
+    re.IGNORECASE,
 )
 
 _IMPERATIVE_START_RE = re.compile(
@@ -409,6 +438,13 @@ _IGNORE_FORGET_ABOUT_RE = re.compile(
 _FORGET_ABOUT_DIRECT_RE = re.compile(
     r"\b(?:ignore|forget|disregard) (?:about )?the ([^,;!?]{1,60}) "
     r"(?:rule|constraint|requirement|instruction)(?:$|[,;:]| (?:for|about|now|please)\b)",
+    re.IGNORECASE,
+)
+
+# Hesitation fillers allowed before a retraction ("hmm scratch that", "oh wait, never mind")
+_RETRACTION_FILLER_RE = re.compile(
+    r"^(?:(?:h+m+|u+m+|u+h+|oh|ah|well|so|ok(?:ay)?|sorry|oops|wait|yeah|ugh|argh)\b"
+    r"[,;:. -]*){1,3}",
     re.IGNORECASE,
 )
 
@@ -979,6 +1015,8 @@ def _has_directive_sentence(sentences: Sequence[str]) -> bool:
             norm_clause = _trim_non_alnum(cleaned.lower())
             if norm_clause not in _CHATTER_PHRASES:
                 return True
+        if _SCOPED_IMPERATIVE_RE.match(cleaned):
+            return True
         for sep in (":", ","):
             if sep in cleaned:
                 tail = _LEADING_FILLER_RE.sub("", cleaned.split(sep, 1)[1].strip()).strip()
@@ -1077,13 +1115,14 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
             _add_unique(topic_hints, m.group(1))
 
         # 3. Scratch that / strike that / cancel that (only at clause boundary)
-        if _SCRATCH_THAT_RE.match(sent):
+        retraction_sent = _RETRACTION_FILLER_RE.sub("", sent, count=1)
+        if _SCRATCH_THAT_RE.match(retraction_sent):
             hard = True
             explicit_retraction = True
             unscoped_retraction = True
 
         # 4. Never mind ... (noun-phrase topic OR bare/directive retraction only)
-        nm_match = _NEVER_MIND_RE.match(sent)
+        nm_match = _NEVER_MIND_RE.match(retraction_sent)
         if nm_match:
             after_punct = nm_match.group(1)
             topic_arg = nm_match.group(2)
@@ -1432,6 +1471,194 @@ def _score_supersede_candidate(
 
 
 # ---------------------------------------------------------------------------
+# Long-form turn segmentation
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _PinUnit:
+    """One independently pinnable piece of a user turn."""
+
+    text: str
+    # True for blocks cut from a multi-block / long message (briefs, rule lists). Such units
+    # never supersede a sibling from the same message and only count as overrides when they
+    # retire a concrete earlier pin.
+    longform: bool = False
+    force_directive: bool = False
+    force_negative: bool = False
+
+
+_SIMPLE_NEGATION_RE = re.compile(r"\b(?:do not|don't|never)\b", re.IGNORECASE)
+# Words that may sit directly before an imperative "never" / "don't"
+_IMPERATIVE_NEGATION_LEADS: frozenset[str] = frozenset(
+    {
+        "please", "and", "but", "so", "then", "also", "or", "you", "we", "i", "must",
+        "should", "shall", "will", "can", "could", "would", "may", "might", "to", "always",
+        "just", "that", "lets", "let's", "kindly", "absolutely", "definitely", "really",
+        "simply", "strictly", "still", "now", "again", "otherwise", "instead",
+    }
+)  # fmt: skip
+
+
+def _scrub_descriptive_negations(text: str) -> str:
+    """Blank out "never" / "don't" used to describe behaviour rather than to forbid it.
+
+    In a long brief, "count-only runs never falsely resolve" or "probe commands don't emit
+    failures" report what code does. Only a negation in imperative position (sentence or
+    clause start, or after a modal / pronoun) is treated as a rule.
+    """
+    matches = _bounded_finditer(_SIMPLE_NEGATION_RE, text)
+    if not matches:
+        return text
+    chars = list(text)
+    for match in matches:
+        before = text[max(0, match.start() - 40) : match.start()].rstrip()
+        if not before or before[-1] in ",;:(.!?-\u2013\u2014*_`":
+            continue
+        prev_word = before.rsplit(" ", 1)[-1].lower().strip("*_`\"'([")
+        if prev_word in _IMPERATIVE_NEGATION_LEADS:
+            continue
+        for idx in range(match.start(), match.end()):
+            chars[idx] = " "
+    return "".join(chars)
+
+
+def _sentence_is_directive(sentence: str) -> bool:
+    return is_negative_constraint(sentence) or _has_directive_sentence([sentence])
+
+
+def _group_directive_sentences(sentences: Sequence[str]) -> list[str]:
+    """Group sentences so each group holds exactly one directive plus its trailing context."""
+    groups: list[list[str]] = []
+    lead: list[str] = []
+    for sent in sentences:
+        if _sentence_is_directive(sent):
+            groups.append([*lead, sent])
+            lead = []
+        elif groups:
+            groups[-1].append(sent)
+        else:
+            lead.append(sent)
+    return [" ".join(group) for group in groups]
+
+
+def _markdown_blocks(prose: str) -> list[tuple[str, str]]:
+    """Split fence-free prose into ``(kind, text)`` blocks in O(N).
+
+    ``kind`` is ``"heading"``, ``"item"`` (list entry), or ``"para"``. Hard-wrapped lines of
+    one paragraph or list item are joined with single spaces; list and heading markers are
+    stripped so pin text stays the user's own words.
+    """
+    blocks: list[tuple[str, str]] = []
+    current_kind = ""
+    current: list[str] = []
+
+    def _flush() -> None:
+        nonlocal current_kind, current
+        if current:
+            blocks.append((current_kind, " ".join(current)))
+        current_kind = ""
+        current = []
+
+    for raw_line in prose.splitlines():
+        line = " ".join(raw_line.split())
+        if not line:
+            _flush()
+            continue
+        heading = _HEADING_MARKER_RE.match(raw_line)
+        if heading:
+            _flush()
+            text = " ".join(raw_line[heading.end() :].split()).strip("# ")
+            if text:
+                blocks.append(("heading", text))
+            continue
+        marker = _LIST_MARKER_RE.match(raw_line)
+        if marker:
+            _flush()
+            text = " ".join(raw_line[marker.end() :].split())
+            if text:
+                current_kind = "item"
+                current = [text]
+            continue
+        if not current:
+            current_kind = "para"
+        current.append(line)
+    _flush()
+    return blocks
+
+
+def _split_turn_units(text: str) -> list[_PinUnit]:
+    """Split one user turn into independently pinnable units.
+
+    A short single-block message stays whole unless it states two or more separate
+    directives. Multi-block messages (task briefs, rule lists) and long paragraphs are cut
+    into one unit per block or directive sentence, so a later correction retires only the
+    rule it targets instead of every rule in the message.
+    """
+    prose = strip_fenced_code_blocks(text)
+    blocks = _markdown_blocks(prose)
+    if not blocks:
+        return [_PinUnit(text=text)]
+
+    if len(blocks) == 1 and len(blocks[0][1]) <= _LONGFORM_PARAGRAPH_CHARS:
+        if "```" in text or "~~~" in text:
+            return [_PinUnit(text=text)]
+        groups = _group_directive_sentences(_split_sentences(prose))
+        if len(groups) < 2:
+            return [_PinUnit(text=text)]
+        return [_PinUnit(text=group) for group in groups]
+
+    units: list[_PinUnit] = []
+    leadin = ""
+    leadin_rules = False
+    leadin_negative = False
+    for block_idx, (kind, block) in enumerate(blocks):
+        if len(units) >= _MAX_SEGMENTS_PER_TURN:
+            break
+        next_is_item = block_idx + 1 < len(blocks) and blocks[block_idx + 1][0] == "item"
+        if kind == "item" and leadin:
+            item_text = f"{leadin}: {block}" if leadin_negative else block
+            units.append(
+                _PinUnit(
+                    text=item_text,
+                    longform=True,
+                    force_directive=leadin_rules or leadin_negative,
+                    force_negative=leadin_negative,
+                )
+            )
+            continue
+
+        stripped = block.rstrip()
+        is_leadin = kind == "heading" or stripped.endswith(":")
+        if is_leadin:
+            leadin = stripped.rstrip(":").strip().strip("*_ ").rstrip(":").strip()
+            leadin_negative = bool(_NEGATIVE_LEADIN_RE.match(leadin))
+            leadin_rules = bool(_RULES_LEADIN_RE.search(leadin)) and len(leadin) <= 80
+            # A heading or "…:" line that introduces a list is context for its items,
+            # not a rule of its own.
+            # A heading that is itself a rule ("# Never push to main") is kept.
+            if (
+                next_is_item
+                or (leadin_negative and stripped.endswith(":"))
+                or (kind == "heading" and not _sentence_is_directive(block))
+            ):
+                continue
+        elif kind == "para":
+            leadin = ""
+            leadin_rules = leadin_negative = False
+
+        if len(block) > _LONGFORM_PARAGRAPH_CHARS:
+            for sent in _split_sentences(block):
+                if len(units) >= _MAX_SEGMENTS_PER_TURN:
+                    break
+                if _sentence_is_directive(sent) or _detect_override_signal(sent) is not None:
+                    units.append(_PinUnit(text=sent, longform=True))
+        else:
+            units.append(_PinUnit(text=block, longform=True))
+    return units
+
+
+# ---------------------------------------------------------------------------
 # Main extraction pipeline (strictly O(N) via capped inverted token index)
 # ---------------------------------------------------------------------------
 
@@ -1531,8 +1758,15 @@ def extract_pins(
     # unscoped retractions ("Scratch that.", "Never mind.") never reach past unrelated turns.
     prev_non_chatter_pin: PinEntry | None = None
 
+    work: list[tuple[UserTurn, _PinUnit]] = []
     for turn in ordered_turns:
-        clean_text = sanitize_unicode(turn.text).strip()
+        turn_text = sanitize_unicode(turn.text).strip()
+        if not normalize_pin_text(turn_text) or is_chatter(turn_text):
+            continue
+        work.extend((turn, unit) for unit in _split_turn_units(turn_text))
+
+    for turn, unit in work:
+        clean_text = unit.text.strip()
         norm = normalize_pin_text(clean_text)
         if not norm:
             continue
@@ -1540,11 +1774,28 @@ def extract_pins(
             continue
 
         signal = _detect_override_signal(clean_text)
-        neg = is_negative_constraint(clean_text)
-        directive = neg or signal is not None or is_constraint_or_directive(clean_text)
-        if not directive:
-            prev_non_chatter_pin = None
-            continue
+        if unit.longform:
+            neg = unit.force_negative or is_negative_constraint(
+                _scrub_descriptive_negations(clean_text)
+            )
+        else:
+            neg = is_negative_constraint(clean_text)
+        if unit.longform:
+            # Blocks of a long brief must stand on their own as a rule; an incidental
+            # "actually" / "switch to" inside descriptive prose is not enough.
+            base_directive = (
+                neg
+                or unit.force_directive
+                or _has_directive_sentence(_split_sentences(_normalize_prose(clean_text)))
+            )
+            if not base_directive and signal is None:
+                continue
+        else:
+            base_directive = True
+            directive = neg or signal is not None or is_constraint_or_directive(clean_text)
+            if not directive:
+                prev_non_chatter_pin = None
+                continue
 
         own_tokens = _extract_content_tokens(clean_text)
         norm_lower = " ".join(_normalize_prose(clean_text).lower().split())
@@ -1603,6 +1854,8 @@ def extract_pins(
                     continue
                 if cand.pin_id in bare_retraction_ids:
                     continue
+                if unit.longform and cand.source != "manual" and cand.turn_index == turn.turn_index:
+                    continue
                 eligible.append(cand)
             eligible.sort(key=lambda p: pin_meta[p.pin_id][0], reverse=True)
 
@@ -1634,8 +1887,17 @@ def extract_pins(
                 and prev_non_chatter_pin.superseded_by is None
                 and prev_non_chatter_pin.source != "manual"
                 and prev_non_chatter_pin.pin_id not in bare_retraction_ids
+                and not (unit.longform and prev_non_chatter_pin.turn_index == turn.turn_index)
             ):
                 superseded_target = prev_non_chatter_pin
+
+        if (
+            unit.longform
+            and superseded_target is None
+            and not base_directive
+            and not (signal is not None and signal.kind == "hard")
+        ):
+            continue
 
         # Consecutive bare unscoped retraction ("Scratch that." twice in a row) is a no-op
         is_bare_retraction = bool(
@@ -1654,7 +1916,10 @@ def extract_pins(
 
         source = (
             "override"
-            if (superseded_target is not None or (signal is not None and signal.kind == "hard"))
+            if (
+                superseded_target is not None
+                or (signal is not None and signal.kind == "hard" and not unit.longform)
+            )
             else "auto"
         )
 
