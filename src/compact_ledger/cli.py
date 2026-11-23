@@ -8,20 +8,23 @@ import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
 
 from compact_ledger import __version__
-from compact_ledger.models import (
-    CompactionSnapshot,
-    PinEntry,
-    make_pin_id,
-    normalize_pin_text,
-    sanitize_unicode,
+from compact_ledger.evals import (
+    format_eval_report_json,
+    format_eval_report_text,
+    run_eval_suite,
 )
-from compact_ledger.parsers.transcript import SUPPORTED_FORMATS, parse_transcript
+from compact_ledger.hooks import (
+    DEFAULT_CLAUDE_COMMAND,
+    create_and_save_snapshot,
+    handle_pre_compact,
+    handle_session_start,
+    init_claude_code_settings,
+)
+from compact_ledger.parsers.transcript import SUPPORTED_FORMATS
+from compact_ledger.renderer import DEFAULT_MAX_CHARS, render_snapshot
 from compact_ledger.store import CorruptSnapshotError, SessionStore
-
-DEFAULT_MAX_CHARS = 6000
 
 
 def _configure_io_streams() -> None:
@@ -31,266 +34,6 @@ def _configure_io_streams() -> None:
         if callable(reconfigure):
             with contextlib.suppress(OSError, ValueError):
                 reconfigure(errors="replace")
-
-
-def _build_baseline_pins(snapshot_turns: Sequence[Any]) -> list[PinEntry]:
-    """Convert parsed user turns into baseline auto PinEntry objects."""
-    pins: list[PinEntry] = []
-    seen_texts: set[str] = set()
-    for turn in snapshot_turns:
-        norm = normalize_pin_text(turn.text)
-        if not norm or norm in seen_texts:
-            continue
-        seen_texts.add(norm)
-        pins.append(
-            PinEntry(
-                pin_id=make_pin_id("auto", norm, turn.turn_index),
-                text=sanitize_unicode(turn.text).strip(),
-                source="auto",
-                turn_index=turn.turn_index,
-                timestamp=turn.timestamp,
-            )
-        )
-    return pins
-
-
-def _flatten_single_line(text: str) -> str:
-    """Flatten embedded newlines so user text cannot spoof Markdown headings."""
-    return " ".join(sanitize_unicode(text).splitlines()).strip()
-
-
-def _truncate_line(text: str, max_len: int) -> str:
-    if max_len <= 0:
-        return ""
-    if len(text) <= max_len:
-        return text
-    if max_len <= 3:
-        return text[:max_len]
-    return text[: max_len - 3].rstrip() + "..."
-
-
-def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
-    """Render a bounded Markdown summary prioritizing manual pins over auto pins and files."""
-    if max_chars <= 0:
-        return ""
-
-    header = f"## Compact Ledger (Session: {_flatten_single_line(snapshot.session_id)})"
-    if len(header) > max_chars:
-        return _truncate_line(header, max_chars)
-
-    lines: list[str] = [header]
-    used = len(header)
-
-    def _try_add_section(title: str, items: list[str]) -> None:
-        nonlocal used
-        if not items:
-            return
-        section_header = f"\n\n### {title}"
-        added_header = False
-        for item in items:
-            flat_item = _flatten_single_line(item)
-            entry = f"\n- {flat_item}"
-            needed = len(entry) + (len(section_header) if not added_header else 0)
-            if used + needed <= max_chars:
-                if not added_header:
-                    lines.append(section_header)
-                    used += len(section_header)
-                    added_header = True
-                lines.append(entry)
-                used += len(entry)
-            else:
-                remaining = max_chars - used - (len(section_header) if not added_header else 0) - 3
-                if remaining >= 12:
-                    if not added_header:
-                        lines.append(section_header)
-                        used += len(section_header)
-                        added_header = True
-                    truncated = _truncate_line(flat_item, remaining)
-                    entry = f"\n- {truncated}"
-                    lines.append(entry)
-                    used += len(entry)
-                break
-
-    manual_pins = [p for p in snapshot.pins if p.source == "manual"]
-    override_pins = list(reversed([p for p in snapshot.pins if p.source == "override"]))
-    auto_pins = list(reversed([p for p in snapshot.pins if p.source == "auto"]))
-
-    manual_items = [
-        f"{'[tags: ' + ', '.join(p.tags) + '] ' if p.tags else ''}{p.text}" for p in manual_pins
-    ]
-    _try_add_section("Manual Pins", manual_items)
-
-    override_items = [p.text for p in override_pins]
-    _try_add_section("Active Overrides", override_items)
-
-    auto_items = [
-        f"[turn {p.turn_index}] {p.text}" if p.turn_index is not None else p.text for p in auto_pins
-    ]
-    _try_add_section("User Constraints & Turns", auto_items)
-
-    if snapshot.modified_files:
-        _try_add_section("Modified Files", list(snapshot.modified_files))
-
-    result = "".join(lines)
-    if len(result) > max_chars:
-        return _truncate_line(result, max_chars)
-    return result
-
-
-def _compact_json(obj: Any) -> str:
-    return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
-
-
-def _truncate_pin_for_json_budget(pin_dict: dict[str, Any], max_item_chars: int) -> str | None:
-    """Truncate a pin dict's ``text`` field so its compact JSON fits in ``max_item_chars``."""
-    base = dict(pin_dict)
-    base["text"] = ""
-    empty_len = len(_compact_json(base))
-    if empty_len + 4 > max_item_chars:
-        return None
-
-    original_text = str(pin_dict.get("text", ""))
-    # Binary search on prefix length to account accurately for JSON escaping.
-    lo, hi = 1, len(original_text)
-    best: str | None = None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        candidate = dict(pin_dict)
-        candidate["text"] = _truncate_line(original_text, mid)
-        serialized = _compact_json(candidate)
-        if len(serialized) <= max_item_chars:
-            best = serialized
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return best
-
-
-def _render_json(snapshot: CompactionSnapshot, max_chars: int) -> str:
-    """Render valid JSON strictly bounded to ``<= max_chars`` in O(N) time.
-
-    Priority order matches PLAN.md:
-    (1) Manual pins & active overrides, (2) Remaining auto pins (newest first),
-    (3) Trajectories / thrash / attempts, (4) Modified files.
-    """
-    if max_chars < 2:
-        raise ValueError("--max-chars must be at least 2 for JSON output")
-
-    total_items = (
-        len(snapshot.pins)
-        + len(snapshot.attempts)
-        + len(snapshot.trajectories)
-        + len(snapshot.thrash_entries)
-        + len(snapshot.modified_files)
-    )
-    if total_items <= 200:
-        pretty = json.dumps(snapshot.to_dict(), indent=2, ensure_ascii=False)
-        if len(pretty) <= max_chars:
-            return pretty
-
-    # Strict PLAN priority: manual (in order) -> override (newest first) -> auto (newest first).
-    manual_pins = [p.to_dict() for p in snapshot.pins if p.source == "manual"]
-    override_pins = [p.to_dict() for p in reversed(snapshot.pins) if p.source == "override"]
-    auto_pins = [p.to_dict() for p in reversed(snapshot.pins) if p.source == "auto"]
-    ordered_pins: list[tuple[bool, dict[str, Any]]] = [
-        *((True, p) for p in manual_pins),
-        *((False, p) for p in override_pins),
-        *((False, p) for p in auto_pins),
-    ]
-
-    # Pick the richest JSON envelope whose empty skeleton fits within max_chars.
-    envelopes: list[dict[str, Any]] = [
-        {
-            "schema_version": snapshot.schema_version,
-            "session_id": snapshot.session_id,
-            "created_at": snapshot.created_at,
-            "transcript_path": snapshot.transcript_path,
-            "pins": [],
-            "attempts": [],
-            "trajectories": [],
-            "thrash_entries": [],
-            "modified_files": [],
-            "metadata": {},
-        },
-        {
-            "schema_version": snapshot.schema_version,
-            "session_id": snapshot.session_id,
-            "created_at": snapshot.created_at,
-            "pins": [],
-            "attempts": [],
-            "trajectories": [],
-            "thrash_entries": [],
-            "modified_files": [],
-        },
-        {
-            "session_id": snapshot.session_id,
-            "pins": [],
-        },
-        {
-            "pins": [],
-        },
-    ]
-
-    def _try_envelope(template: dict[str, Any]) -> tuple[str, int] | None:
-        env: dict[str, Any] = {
-            k: ([] if isinstance(v, list) else ({} if isinstance(v, dict) else v))
-            for k, v in template.items()
-        }
-        used = len(_compact_json(env))
-        if used > max_chars:
-            return None
-
-        def _fill_list(key: str, items: Sequence[tuple[bool, Any]]) -> None:
-            nonlocal used
-            if key not in env:
-                return
-            bucket: list[Any] = env[key]
-            for allow_truncate, item in items:
-                sep = 1 if bucket else 0
-                serialized = _compact_json(item)
-                needed = sep + len(serialized)
-                if used + needed <= max_chars:
-                    bucket.append(item)
-                    used += needed
-                elif allow_truncate and isinstance(item, dict) and "text" in item:
-                    remaining = max_chars - used - sep
-                    truncated_json = _truncate_pin_for_json_budget(item, remaining)
-                    if truncated_json is not None:
-                        bucket.append(json.loads(truncated_json))
-                        used += sep + len(truncated_json)
-                    break
-                else:
-                    break
-
-        _fill_list("pins", ordered_pins)
-        if "trajectories" in env:
-            _fill_list("trajectories", [(False, t.to_dict()) for t in snapshot.trajectories])
-        if "thrash_entries" in env:
-            _fill_list("thrash_entries", [(False, e.to_dict()) for e in snapshot.thrash_entries])
-        if "attempts" in env:
-            _fill_list("attempts", [(False, a.to_dict()) for a in snapshot.attempts])
-        if "modified_files" in env:
-            _fill_list("modified_files", [(False, f) for f in snapshot.modified_files])
-        return _compact_json(env), len(env.get("pins", []))
-
-    best_result: str | None = None
-    best_pin_count = -1
-    want_pins = len(ordered_pins) > 0
-    for env_template in envelopes:
-        attempt = _try_envelope(env_template)
-        if attempt is None:
-            continue
-        rendered_candidate, pin_count = attempt
-        if not want_pins:
-            return rendered_candidate
-        # Prefer the richest envelope that keeps all manual pins (or maximizes included pins).
-        if pin_count >= len(manual_pins) and pin_count > 0:
-            return rendered_candidate
-        if pin_count > best_pin_count:
-            best_pin_count = pin_count
-            best_result = rendered_candidate
-
-    return best_result if best_result is not None else "{}"
 
 
 def _write_bounded_stdout(rendered: str, max_chars: int) -> None:
@@ -330,6 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command")
 
+    # snapshot
     snap_parser = subparsers.add_parser(
         "snapshot",
         parents=[common],
@@ -355,6 +99,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output saved snapshot summary as JSON.",
     )
 
+    # inject
     inject_parser = subparsers.add_parser(
         "inject",
         parents=[common],
@@ -375,6 +120,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output format (default: markdown).",
     )
 
+    # pin
     pin_parser = subparsers.add_parser(
         "pin",
         parents=[common],
@@ -396,6 +142,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Mark this pin as a negative constraint (do-not / never rule).",
     )
 
+    # unpin
     unpin_parser = subparsers.add_parser(
         "unpin",
         parents=[common],
@@ -404,6 +151,7 @@ def _build_parser() -> argparse.ArgumentParser:
     unpin_parser.add_argument("--session-id", required=True, help="Session identifier.")
     unpin_parser.add_argument("target", help="Pin ID or exact pin text to remove.")
 
+    # status
     status_parser = subparsers.add_parser(
         "status",
         parents=[common],
@@ -421,12 +169,105 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output status as JSON.",
     )
 
+    # clear
     clear_parser = subparsers.add_parser(
         "clear",
         parents=[common],
         help="Delete a stored session snapshot.",
     )
     clear_parser.add_argument("--session-id", required=True, help="Session identifier.")
+
+    # hook pre-compact / session-start
+    hook_parser = subparsers.add_parser(
+        "hook",
+        parents=[common],
+        help="Run Claude Code lifecycle hooks (pre-compact / session-start).",
+    )
+    hook_subparsers = hook_parser.add_subparsers(dest="hook_command")
+
+    pre_compact_parser = hook_subparsers.add_parser(
+        "pre-compact",
+        parents=[common],
+        help="Read Claude Code PreCompact JSON from stdin and save a snapshot.",
+    )
+    pre_compact_parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help="Exit non-zero on malformed stdin or errors (default: fail-open exit 0).",
+    )
+
+    session_start_parser = hook_subparsers.add_parser(
+        "session-start",
+        parents=[common],
+        help="Read Claude Code SessionStart JSON from stdin and inject the bounded ledger.",
+    )
+    session_start_parser.add_argument(
+        "--max-chars",
+        type=int,
+        default=DEFAULT_MAX_CHARS,
+        help=f"Maximum rendered ledger character budget (default: {DEFAULT_MAX_CHARS}).",
+    )
+    session_start_parser.add_argument(
+        "--always",
+        action="store_true",
+        default=False,
+        help="Inject even when SessionStart source is not 'compact' or 'resume'.",
+    )
+    session_start_parser.add_argument(
+        "--strict",
+        action="store_true",
+        default=False,
+        help="Exit non-zero on malformed stdin or errors (default: fail-open exit 0).",
+    )
+
+    # init
+    init_parser = subparsers.add_parser(
+        "init",
+        help="Generate or safely merge agent hook settings.",
+    )
+    init_parser.add_argument(
+        "--claude-code",
+        action="store_true",
+        default=False,
+        help="Generate or merge Claude Code .claude/settings.json hook entries.",
+    )
+    init_parser.add_argument(
+        "--write",
+        action="store_true",
+        default=False,
+        help="Atomically write merged settings to disk instead of only printing to stdout.",
+    )
+    init_parser.add_argument(
+        "--settings-path",
+        default=None,
+        help="Path to settings.json (default: .claude/settings.json in current directory).",
+    )
+    init_parser.add_argument(
+        "--command",
+        dest="init_command",
+        default=DEFAULT_CLAUDE_COMMAND,
+        help=f"Command prefix for hook invocation (default: {DEFAULT_CLAUDE_COMMAND!r}).",
+    )
+
+    # eval
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Run the seeded 20-case deterministic compaction evaluation suite.",
+    )
+    eval_parser.add_argument(
+        "--format",
+        dest="eval_format",
+        choices=("text", "json"),
+        default="text",
+        help="Evaluation report format (default: text).",
+    )
+    eval_parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Include case descriptions in text output.",
+    )
 
     return parser
 
@@ -437,37 +278,24 @@ def _cmd_snapshot(args: argparse.Namespace, store: SessionStore) -> int:
         print(f"Error: transcript file not found: {transcript_path}", file=sys.stderr)
         return 1
 
-    parsed = parse_transcript(
-        transcript_path,
-        fmt=args.transcript_format,
-        session_id=args.session_id,
-    )
-    session_id = args.session_id or parsed.session_id
-    if not session_id:
-        print(
-            "Error: --session-id is required when transcript has no embedded session_id.",
-            file=sys.stderr,
-        )
-        return 2
-
-    baseline_pins = _build_baseline_pins(parsed.user_turns)
-    snapshot = CompactionSnapshot(
-        session_id=session_id,
-        transcript_path=str(transcript_path.resolve()),
-        pins=baseline_pins,
-        modified_files=list(parsed.modified_files),
-        metadata={
-            "transcript_format": parsed.format,
-            "user_turn_count": len(parsed.user_turns),
-            "tool_execution_count": len(parsed.tool_executions),
-            "file_edit_count": len(parsed.file_edits),
-        },
-    )
     try:
-        saved = store.save_snapshot(snapshot)
+        saved, parsed = create_and_save_snapshot(
+            transcript_path,
+            store,
+            session_id=args.session_id,
+            transcript_format=args.transcript_format,
+        )
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
+    except FileNotFoundError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    manual_count = sum(1 for p in saved.pins if p.source == "manual")
+    override_count = sum(
+        1 for p in saved.pins if p.source == "override" and p.superseded_by is None
+    )
 
     if args.as_json:
         summary = {
@@ -475,16 +303,21 @@ def _cmd_snapshot(args: argparse.Namespace, store: SessionStore) -> int:
             "path": str(store.session_path(saved.session_id)),
             "format": parsed.format,
             "pins": len(saved.pins),
-            "manual_pins": sum(1 for p in saved.pins if p.source == "manual"),
+            "manual_pins": manual_count,
+            "override_pins": override_count,
+            "attempts": len(saved.attempts),
+            "trajectories": len(saved.trajectories),
+            "thrash_entries": len(saved.thrash_entries),
             "modified_files": len(saved.modified_files),
         }
         print(json.dumps(summary, indent=2, ensure_ascii=False))
     else:
-        manual_count = sum(1 for p in saved.pins if p.source == "manual")
         print(
             f"Saved snapshot for session {saved.session_id!r} "
             f"(format={parsed.format}, pins={len(saved.pins)}, "
-            f"manual_pins={manual_count}, modified_files={len(saved.modified_files)})."
+            f"manual_pins={manual_count}, overrides={override_count}, "
+            f"trajectories={len(saved.trajectories)}, thrash={len(saved.thrash_entries)}, "
+            f"modified_files={len(saved.modified_files)})."
         )
     return 0
 
@@ -509,11 +342,14 @@ def _cmd_inject(args: argparse.Namespace, store: SessionStore) -> int:
 
     if args.output_format == "json":
         budget = args.max_chars - 1 if args.max_chars >= 3 else args.max_chars
-        rendered = _render_json(snapshot, budget)
     else:
         budget = args.max_chars - 1 if args.max_chars >= 2 else args.max_chars
-        rendered = _render_markdown(snapshot, budget)
 
+    rendered = render_snapshot(
+        snapshot,
+        max_chars=budget,
+        output_format=args.output_format,
+    )
     _write_bounded_stdout(rendered, args.max_chars)
     return 0
 
@@ -561,6 +397,9 @@ def _cmd_status(args: argparse.Namespace, store: SessionStore) -> int:
             return 1
 
         manual_pins = sum(1 for p in snapshot.pins if p.source == "manual")
+        override_pins = sum(
+            1 for p in snapshot.pins if p.source == "override" and p.superseded_by is None
+        )
         auto_pins = sum(1 for p in snapshot.pins if p.source != "manual")
         info = {
             "session_id": snapshot.session_id,
@@ -568,6 +407,7 @@ def _cmd_status(args: argparse.Namespace, store: SessionStore) -> int:
             "transcript_path": snapshot.transcript_path,
             "manual_pins": manual_pins,
             "auto_pins": auto_pins,
+            "override_pins": override_pins,
             "attempts": len(snapshot.attempts),
             "trajectories": len(snapshot.trajectories),
             "thrash_entries": len(snapshot.thrash_entries),
@@ -580,7 +420,9 @@ def _cmd_status(args: argparse.Namespace, store: SessionStore) -> int:
             print(f"Session: {info['session_id']}")
             print(f"Created: {info['created_at']}")
             print(f"Transcript: {info['transcript_path'] or '(none)'}")
-            print(f"Pins: {manual_pins} manual, {auto_pins} auto")
+            print(
+                f"Pins: {manual_pins} manual, {auto_pins} auto ({override_pins} active overrides)"
+            )
             print(
                 f"Ledger: {info['attempts']} attempts, "
                 f"{info['trajectories']} trajectories, "
@@ -611,6 +453,7 @@ def _cmd_status(args: argparse.Namespace, store: SessionStore) -> int:
             manual = sum(1 for p in snap.pins if p.source == "manual")
             print(
                 f"- {sid} (pins={len(snap.pins)}, manual={manual}, "
+                f"trajectories={len(snap.trajectories)}, "
                 f"files={len(snap.modified_files)}, created={snap.created_at})"
             )
     return 0
@@ -630,6 +473,70 @@ def _cmd_clear(args: argparse.Namespace, store: SessionStore) -> int:
     return 0
 
 
+def _cmd_hook(args: argparse.Namespace) -> int:
+    hook_cmd = getattr(args, "hook_command", None)
+    if hook_cmd == "pre-compact":
+        result = handle_pre_compact(
+            sys.stdin,
+            store_dir=args.store_dir,
+            strict=args.strict,
+        )
+    elif hook_cmd == "session-start":
+        result = handle_session_start(
+            sys.stdin,
+            store_dir=args.store_dir,
+            max_chars=args.max_chars,
+            always=args.always,
+            strict=args.strict,
+        )
+    else:
+        print(
+            "Error: specify a hook subcommand: 'pre-compact' or 'session-start'.",
+            file=sys.stderr,
+        )
+        return 2
+
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    return result.exit_code
+
+
+def _cmd_init(args: argparse.Namespace) -> int:
+    if not args.claude_code:
+        print(
+            "Error: specify a target integration (currently supported: --claude-code).",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        merged, target_path, wrote = init_claude_code_settings(
+            settings_path=args.settings_path,
+            write=args.write,
+            command=args.init_command,
+        )
+    except (ValueError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    if wrote:
+        print(f"Updated Claude Code hook settings in {target_path}")
+    else:
+        print(json.dumps(merged, indent=2, ensure_ascii=False))
+    return 0
+
+
+def _cmd_eval(args: argparse.Namespace) -> int:
+    report = run_eval_suite()
+    if args.eval_format == "json":
+        print(format_eval_report_json(report))
+    else:
+        print(format_eval_report_text(report, verbose=args.verbose))
+    return 0 if report.failed == 0 else 1
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Entry point for the ``compact-ledger`` CLI."""
     _configure_io_streams()
@@ -641,6 +548,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     try:
+        if args.command == "hook":
+            return _cmd_hook(args)
+        if args.command == "init":
+            return _cmd_init(args)
+        if args.command == "eval":
+            return _cmd_eval(args)
+
         store = SessionStore(store_dir=args.store_dir)
         if args.command == "snapshot":
             return _cmd_snapshot(args, store)
