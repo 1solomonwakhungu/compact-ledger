@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shlex
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
@@ -95,7 +96,6 @@ _GIT_READONLY_SUBCOMMANDS: frozenset[str] = frozenset(
         "describe",
         "blame",
         "cat-file",
-        "commit",
     }
 )
 
@@ -103,8 +103,18 @@ _WRAPPER_SINGLE = frozenset({"env", "time", "nohup", "xvfb-run", "npx", "pnpx", 
 _WRAPPER_WITH_RUN = frozenset({"uv", "poetry", "pipenv", "pdm", "hatch"})
 _NODE_PKG_MANAGERS = frozenset({"npm", "pnpm", "yarn", "bun"})
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
+_SCOPE_AFFECTING_ENV_VARS = frozenset({"PYTEST_ADDOPTS"})
 _CHDIR_COMMANDS = frozenset({"cd", "pushd", "popd"})
 _CHDIR_FLAGS = frozenset({"-C", "--directory", "--rootdir", "--cwd", "--dir", "--root"})
+_SCOPE_NARROWING_FLAGS = frozenset(
+    {
+        "-c",
+        "--config",
+        "--project",
+        "--changed",
+        "--related",
+    }
+)
 
 # Strictly linear-time regexes (no nested/overlapping quantifiers).
 _PYTEST_SESSION_RE = re.compile(
@@ -138,16 +148,15 @@ _JEST_NON_FAILURE_BULLETS = (
     "Deprecation Warning",
     "Validation Warning",
     "Console",
+    "Cannot log after tests are done",
 )
-_JS_TRAILING_DURATION_RE = re.compile(r"(?:\s+\(\d+\s*m?s\)|\s+\d+\s*m?s)$")
 _JS_EXPECTED_LINE_RE = re.compile(
     r"^\s*Expected(?:\s+(?:value|substring|pattern|length|number of calls))?:\s*(.+)$"
 )
 _JS_RECEIVED_LINE_RE = re.compile(
     r"^\s*Received(?:\s+(?:value|string|length|number of calls))?:\s*(.+)$"
 )
-_JS_STACK_PAREN_RE = re.compile(r"\(([^()\s]+\.[cm]?[jt]sx?):(\d+)(?::\d+)?\)")
-_JS_STACK_BARE_RE = re.compile(r"(?:^|\s|❯\s*)([^\s()<>]+\.[cm]?[jt]sx?):(\d+)(?::\d+)?(?:\s|$)")
+_JS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs")
 _VITEST_TO_OP_RE = re.compile(
     r"\s+to\s+(?:(?:deeply|strictly)\s+)?(?:be|equal|eql|match|contain)\s+",
     re.IGNORECASE,
@@ -157,8 +166,6 @@ _VITEST_TO_OP_RE = re.compile(
 _GO_RUN_RE = re.compile(r"^\s*===\s*(?:RUN|CONT|NAME)\s+(\S+)")
 _GO_RESULT_RE = re.compile(r"^\s*---\s*(FAIL|PASS|SKIP):\s*(\S+)(?:\s+\([^)]*\))?")
 _GO_FILE_LINE_RE = re.compile(r"^\s*([^\s:]+\.go):(\d+)(?::\d+)?:\s*(.*)$")
-# Require Go duration, `(cached)`, or `[no test...]` / `[build/setup failed]` so plain lines
-# like `ok  done`, TAP `ok 1 - adds`, or `FAIL check_schema` are never misclassified as Go.
 _GO_PKG_OK_RE = re.compile(r"^ok\s+(\S+)\s+(?:\d+(?:\.\d+)?s|\(cached\)|\[no test)")
 _GO_PKG_FAIL_RE = re.compile(r"^FAIL\s+(\S+)\s+(?:\d+(?:\.\d+)?s|\[(?:build|setup) failed\])")
 _GO_KV_LINE_RE = re.compile(r"^\s*(expected|want|wanted|actual|got)\s*:\s*(.+)$", re.IGNORECASE)
@@ -176,7 +183,8 @@ _ERROR_KEYWORD_RE = re.compile(
     re.IGNORECASE,
 )
 _COUNT_TOKEN_RE = re.compile(
-    r"\b(\d+)\s+(passed|failed|errors?|skipped|deselected)\b", re.IGNORECASE
+    r"\b(\d+)\s+(passed|failed|errors?|skipped|deselected|xfailed|xpassed)\b",
+    re.IGNORECASE,
 )
 
 _ASSERT_OPS: tuple[str, ...] = (
@@ -217,6 +225,7 @@ class RunnerPassSignal:
     passed_files: list[str] = field(default_factory=list)
     passed_packages: list[str] = field(default_factory=list)
     explicit_test_ids: list[str] = field(default_factory=list)
+    is_command_only_pass: bool = False
 
 
 def strip_ansi(text: str) -> str:
@@ -292,12 +301,10 @@ def _strip_redirections(tokens: list[str]) -> list[str]:
     n = len(tokens)
     while idx < n:
         tok = tokens[idx]
-        # Pure fd-duplication / attached redirects like 2>&1, 1>&2, &>/dev/null, 2>/dev/null
         if tok in (">", ">>", "<", "<<", "<<<", "&>", "&>>", ">&", "<&"):
             idx += 2 if idx + 1 < n else 1
             continue
         if len(tok) >= 2 and tok[0].isdigit() and tok[1] in (">", "<"):
-            # `2>&1` or `2>/tmp/err` (attached) vs `2>` followed by path
             if tok in ("2>", "2>>", "1>", "1>>", "0<"):
                 idx += 2 if idx + 1 < n else 1
             else:
@@ -312,18 +319,20 @@ def _strip_redirections(tokens: list[str]) -> list[str]:
 
 
 def _split_shell_subcommands(command: str) -> list[list[str]]:
-    """Split a shell command into subcommand argv lists, stripping shell redirections."""
-    # Pre-normalize attached fd redirections like `2>&1` / `1>&2` / `&>/dev/null` before shlex
-    # so `&` inside `2>&1` is not misinterpreted as a background command separator.
+    """Split a shell command into subcommand argv lists, respecting quotes and groups."""
+    # Collapse POSIX backslash-newline line continuations before lexing.
+    prepped = command.replace("\\\r\n", " ").replace("\\\n", " ")
+
     subcommands: list[list[str]] = []
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer = shlex.shlex(prepped, posix=True, punctuation_chars=";&|()\n")
+        lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         raw_tokens = list(lexer)
     except ValueError:
-        raw_tokens = command.split()
+        raw_tokens = prepped.replace("\n", " ; ").split()
 
-    # Re-join `2>` + `&` + `1` produced by `punctuation_chars=";&|"` when splitting `2>&1`.
+    # Re-join `2>` + `&` + `1` produced when splitting `2>&1` and normalize `{`/`}` group tokens.
     tokens: list[str] = []
     idx = 0
     n = len(raw_tokens)
@@ -342,12 +351,18 @@ def _split_shell_subcommands(command: str) -> list[list[str]]:
             tokens.append("&" + raw_tokens[idx + 1])
             idx += 2
             continue
+        # Separate standalone brace-group tokens `{` and `}`.
+        if tok in ("{", "}"):
+            tokens.append(";")
+            idx += 1
+            continue
         tokens.append(tok)
         idx += 1
 
+    separators = {"&&", "||", ";", "|", "&", "(", ")", "\n"}
     current: list[str] = []
     for tok in tokens:
-        if tok in ("&&", "||", ";", "|", "&"):
+        if tok in separators or ("\n" in tok and not tok.strip()):
             if current:
                 cleaned = _strip_redirections(current)
                 if cleaned:
@@ -362,14 +377,18 @@ def _split_shell_subcommands(command: str) -> list[list[str]]:
     return subcommands
 
 
-def _unwrap_runner_tokens(tokens: list[str]) -> tuple[list[str], bool]:
-    """Strip leading env assignments and wrappers. Returns ``(remaining, has_chdir)``."""
+def _unwrap_runner_tokens(tokens: list[str]) -> tuple[list[str], bool, bool]:
+    """Strip env vars and wrappers. Returns ``(remaining, has_chdir, has_scope_env)``."""
     idx = 0
     n = len(tokens)
     has_chdir = False
+    has_scope_env = False
     while idx < n:
         tok = tokens[idx]
         if _ENV_ASSIGN_RE.match(tok):
+            var_name = tok.split("=", 1)[0]
+            if var_name in _SCOPE_AFFECTING_ENV_VARS:
+                has_scope_env = True
             idx += 1
             continue
         base = PurePosixPath(tok).name.lower()
@@ -381,7 +400,7 @@ def _unwrap_runner_tokens(tokens: list[str]) -> tuple[list[str], bool]:
                 if flag in ("-s", "--signal", "-k", "--kill-after") and idx < n:
                     idx += 1
             if idx < n:
-                idx += 1  # duration
+                idx += 1
             continue
         if base == "nice":
             idx += 1
@@ -407,7 +426,12 @@ def _unwrap_runner_tokens(tokens: list[str]) -> tuple[list[str], bool]:
                     if cur in ("-u", "--unset") and idx + 1 < n:
                         idx += 2
                         continue
-                    if cur.startswith("-") or _ENV_ASSIGN_RE.match(cur):
+                    if _ENV_ASSIGN_RE.match(cur):
+                        if cur.split("=", 1)[0] in _SCOPE_AFFECTING_ENV_VARS:
+                            has_scope_env = True
+                        idx += 1
+                        continue
+                    if cur.startswith("-"):
                         idx += 1
                         continue
                     break
@@ -457,7 +481,7 @@ def _unwrap_runner_tokens(tokens: list[str]) -> tuple[list[str], bool]:
                 idx += 1
                 continue
         break
-    return tokens[idx:], has_chdir
+    return tokens[idx:], has_chdir, has_scope_env
 
 
 def _extract_python_module_pytest(rest: list[str]) -> list[str] | None:
@@ -480,36 +504,41 @@ def _extract_python_module_pytest(rest: list[str]) -> list[str] | None:
     return None
 
 
+def _is_single_subcommand_probe(sub: list[str]) -> bool:
+    """Return True if one shell subcommand is a read-only probe/inspector."""
+    idx = 0
+    while idx < len(sub) and _ENV_ASSIGN_RE.match(sub[idx]):
+        idx += 1
+    if idx >= len(sub):
+        return True
+    raw_exe = PurePosixPath(sub[idx]).name.lower()
+    # Package/env runners like `hatch run test` or `pdm run test` are NEVER POSIX `test` probes.
+    if raw_exe in _WRAPPER_WITH_RUN or raw_exe in _NODE_PKG_MANAGERS:
+        return False
+    if raw_exe in _CHDIR_COMMANDS:
+        return True
+    if raw_exe in _NON_RUNNER_COMMANDS:
+        return True
+    if raw_exe == "git":
+        g_idx = idx + 1
+        while g_idx < len(sub) and sub[g_idx].startswith("-"):
+            flag = sub[g_idx]
+            g_idx += 1
+            if flag in ("-C", "-c", "--git-dir", "--work-tree") and g_idx < len(sub):
+                g_idx += 1
+        subcmd = sub[g_idx].lower() if g_idx < len(sub) else ""
+        return subcmd in _GIT_READONLY_SUBCOMMANDS
+    return False
+
+
 def _is_non_runner_command(command: str | None) -> bool:
-    """Return True if the command is a read-only inspection/probe command (e.g. cat, grep, git)."""
+    """Return True iff EVERY subcommand in ``command`` is a read-only probe/inspector."""
     if not command:
         return False
     subs = _split_shell_subcommands(strip_ansi(command))
     if not subs:
         return False
-    # Inspect the first non-chdir subcommand.
-    for sub in subs:
-        unwrapped, _ = _unwrap_runner_tokens(sub)
-        if not unwrapped:
-            continue
-        exe = PurePosixPath(unwrapped[0]).name.lower()
-        if exe in _CHDIR_COMMANDS:
-            continue
-        if exe in _NON_RUNNER_COMMANDS:
-            return True
-        if exe == "git":
-            # Skip leading git global flags like `-C <dir>`
-            g_idx = 1
-            while g_idx < len(unwrapped) and unwrapped[g_idx].startswith("-"):
-                flag = unwrapped[g_idx]
-                g_idx += 1
-                if flag in ("-C", "-c", "--git-dir", "--work-tree") and g_idx < len(unwrapped):
-                    g_idx += 1
-            subcmd = unwrapped[g_idx].lower() if g_idx < len(unwrapped) else ""
-            if subcmd in _GIT_READONLY_SUBCOMMANDS:
-                return True
-        return False
-    return False
+    return all(_is_single_subcommand_probe(sub) for sub in subs)
 
 
 def parse_runner_invocation(command: str | None) -> RunnerInvocation:
@@ -520,12 +549,15 @@ def parse_runner_invocation(command: str | None) -> RunnerInvocation:
     clean_cmd = strip_ansi(command)
     subs = _split_shell_subcommands(clean_cmd)
     has_chdir = False
+    has_scope_env = False
     found: list[tuple[str, list[str]]] = []
 
     for sub in subs:
-        unwrapped, wrapper_chdir = _unwrap_runner_tokens(sub)
+        unwrapped, wrapper_chdir, wrapper_env = _unwrap_runner_tokens(sub)
         if wrapper_chdir:
             has_chdir = True
+        if wrapper_env:
+            has_scope_env = True
         if not unwrapped:
             continue
         exe = PurePosixPath(unwrapped[0]).name.lower()
@@ -550,15 +582,21 @@ def parse_runner_invocation(command: str | None) -> RunnerInvocation:
         return RunnerInvocation(runner=None, args=[], scope_known=False, has_chdir=has_chdir)
 
     runner, args = found[-1]
-    # Check for directory-changing flags inside runner args themselves (e.g. --rootdir, -C).
+    has_scope_narrowing = False
     for arg in args:
         if arg in _CHDIR_FLAGS or any(arg.startswith(f + "=") for f in _CHDIR_FLAGS):
             has_chdir = True
-            break
+        if arg in _SCOPE_NARROWING_FLAGS or any(
+            arg.startswith(f + "=") for f in _SCOPE_NARROWING_FLAGS
+        ):
+            has_scope_narrowing = True
 
-    # If multiple runner commands were chained in one shell invocation, or a chdir happened,
-    # treat scope as unknown so we never over-claim coverage.
-    scope_known = (not has_chdir) and (len(found) == 1)
+    if runner == "vitest" and args and args[0] == "related":
+        has_scope_narrowing = True
+
+    scope_known = (
+        (not has_chdir) and (not has_scope_env) and (not has_scope_narrowing) and (len(found) == 1)
+    )
     return RunnerInvocation(runner=runner, args=args, scope_known=scope_known, has_chdir=has_chdir)
 
 
@@ -587,7 +625,6 @@ def detect_runner(command: str | None, output: str) -> str:
     if inv.runner is not None:
         return inv.runner
 
-    # Never infer a test runner from read-only inspection/probe commands like `cat` or `systemctl`.
     if _is_non_runner_command(command):
         return "generic"
 
@@ -596,7 +633,6 @@ def detect_runner(command: str | None, output: str) -> str:
         return "generic"
 
     lines = clean_output.split("\n")
-    # Inspect both head and tail so long wrapper logs with summaries at the end are detected.
     sample = lines if len(lines) <= 400 else lines[:200] + lines[-200:]
 
     has_pytest = False
@@ -663,7 +699,6 @@ def _extract_expected_actual_from_text(text: str) -> tuple[str | None, str | Non
     if not norm:
         return None, None
 
-    # Vitest: `AssertionError: expected <actual> to [deeply|strictly] be/equal <expected> [// ...]`
     lower = norm.lower()
     ae_idx = lower.find("assertionerror:")
     if ae_idx != -1:
@@ -679,7 +714,6 @@ def _extract_expected_actual_from_text(text: str) -> tuple[str | None, str | Non
                     exp_part = exp_part[:comment_idx].strip()
                 return _clean_value(exp_part), _clean_value(act_part)
 
-    # General `expected X, got Y` / `got X, want Y` / `want X, got Y` via single-pass keyword scan.
     matches = list(_KV_KEYWORD_RE.finditer(norm))
     if len(matches) >= 2:
         expected_words = {"expected", "want", "wanted"}
@@ -692,7 +726,6 @@ def _extract_expected_actual_from_text(text: str) -> tuple[str | None, str | Non
                 k1 in actual_words and k2 in expected_words
             ):
                 v1_raw = norm[m1.end() : m2.start()]
-                # Strip trailing connector word `but` before second keyword
                 v1_clean = _strip_kv_val_edges(v1_raw)
                 if v1_clean.lower().endswith(" but"):
                     v1_clean = v1_clean[:-4].strip()
@@ -801,6 +834,13 @@ def _split_pytest_summary_node_and_detail(rest: str) -> tuple[str, str | None]:
     return rest.strip(), None
 
 
+def _normalize_pytest_block_key(header_name: str) -> str:
+    h = header_name.strip()
+    if h.startswith("ERROR at ") and " of " in h:
+        h = h.split(" of ", 1)[1].strip()
+    return h
+
+
 def _pytest_header_matches_node(
     header_name: str,
     node_id: str,
@@ -813,11 +853,8 @@ def _pytest_header_matches_node(
     if block_outcome and summary_outcome and block_outcome != summary_outcome:
         return False
 
-    h = header_name.strip()
-    if h.startswith("ERROR at ") and " of " in h:
-        h = h.split(" of ", 1)[1].strip()
+    h = _normalize_pytest_block_key(header_name)
 
-    # Prevent swapping details between identically named tests in different files.
     if block_file_hint and "::" in node_id:
         node_file = _normalize_rel_path(node_id.split("::", 1)[0])
         hint_norm = _normalize_rel_path(block_file_hint)
@@ -841,7 +878,7 @@ def _pytest_header_matches_node(
 
 
 def _parse_pytest(execution: ToolExecution, clean_output: str) -> list[TestAttempt]:
-    """Parse pytest output into TestAttempt records (both failures/errors and explicit passes)."""
+    """Parse pytest output into TestAttempt records in linear time."""
     lines = clean_output.split("\n")
     turn_index = execution.turn_index
     command = execution.command
@@ -981,36 +1018,61 @@ def _parse_pytest(execution: ToolExecution, clean_output: str) -> list[TestAttem
 
     _flush_block()
 
+    # Index detailed blocks by normalized header key for O(1) summary matching.
+    blocks_by_key: dict[str, list[int]] = defaultdict(list)
+    for idx, blk in enumerate(blocks):
+        key = _normalize_pytest_block_key(blk["header"] or "")
+        blocks_by_key[key].append(idx)
+
     attempts: list[TestAttempt] = []
     seen_fail_ids: set[str] = set()
     used_blocks: set[int] = set()
 
     for outcome, node_id, detail in summary_failures:
+        candidate_keys: list[str] = [node_id]
+        if "::" in node_id:
+            tail = node_id.split("::", 1)[1]
+            candidate_keys.append(tail)
+            dotted = tail.replace("::", ".")
+            if dotted != tail:
+                candidate_keys.append(dotted)
+            last_part = node_id.rsplit("::", 1)[-1]
+            if last_part not in candidate_keys:
+                candidate_keys.append(last_part)
+
         matched_idx: int | None = None
-        for idx, blk in enumerate(blocks):
-            if idx in used_blocks:
-                continue
-            if _pytest_header_matches_node(
-                blk["header"] or "",
-                node_id,
-                block_file_hint=blk["file_hint"],
-                block_outcome=blk["outcome"],
-                summary_outcome=outcome,
-            ):
-                matched_idx = idx
-                break
-        # Fallback match without file_hint only if block had no file_hint
-        if matched_idx is None:
-            for idx, blk in enumerate(blocks):
-                if idx in used_blocks or blk["file_hint"] is not None:
+        for key in candidate_keys:
+            for idx in blocks_by_key.get(key, ()):
+                if idx in used_blocks:
                     continue
+                blk = blocks[idx]
                 if _pytest_header_matches_node(
                     blk["header"] or "",
                     node_id,
+                    block_file_hint=blk["file_hint"],
                     block_outcome=blk["outcome"],
                     summary_outcome=outcome,
                 ):
                     matched_idx = idx
+                    break
+            if matched_idx is not None:
+                break
+
+        if matched_idx is None:
+            for key in candidate_keys:
+                for idx in blocks_by_key.get(key, ()):
+                    if idx in used_blocks or blocks[idx]["file_hint"] is not None:
+                        continue
+                    blk = blocks[idx]
+                    if _pytest_header_matches_node(
+                        blk["header"] or "",
+                        node_id,
+                        block_outcome=blk["outcome"],
+                        summary_outcome=outcome,
+                    ):
+                        matched_idx = idx
+                        break
+                if matched_idx is not None:
                     break
 
         assertion_loc: str | None = None
@@ -1053,6 +1115,16 @@ def _parse_pytest(execution: ToolExecution, clean_output: str) -> list[TestAttem
                 )
             )
 
+    # Index verbose failures by tail for O(1) unmatched-block lookup.
+    verbose_fail_by_tail: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for v_out, v_node in verbose_failures:
+        verbose_fail_by_tail[v_node].append((v_out, v_node))
+        if "::" in v_node:
+            tail = v_node.split("::", 1)[1]
+            verbose_fail_by_tail[tail].append((v_out, v_node))
+            verbose_fail_by_tail[tail.replace("::", ".")].append((v_out, v_node))
+            verbose_fail_by_tail[v_node.rsplit("::", 1)[-1]].append((v_out, v_node))
+
     for idx, blk in enumerate(blocks):
         if idx in used_blocks:
             continue
@@ -1062,7 +1134,8 @@ def _parse_pytest(execution: ToolExecution, clean_output: str) -> list[TestAttem
             node_id = _normalize_rel_path(col_m.group(1))
         else:
             node_id = ""
-            for v_out, v_node in verbose_failures:
+            h_key = _normalize_pytest_block_key(header)
+            for v_out, v_node in verbose_fail_by_tail.get(h_key, ()):
                 if _pytest_header_matches_node(
                     header,
                     v_node,
@@ -1073,9 +1146,7 @@ def _parse_pytest(execution: ToolExecution, clean_output: str) -> list[TestAttem
                     node_id = v_node
                     break
             if not node_id:
-                clean_header = header
-                if clean_header.startswith("ERROR at ") and " of " in clean_header:
-                    clean_header = clean_header.split(" of ", 1)[1].strip()
+                clean_header = h_key
                 clean_header = (
                     clean_header.replace(".", "::")
                     if "::" not in clean_header and "[" not in clean_header
@@ -1172,16 +1243,37 @@ def _parse_pytest(execution: ToolExecution, clean_output: str) -> list[TestAttem
     return attempts
 
 
+def _parse_js_location_token(raw_token: str) -> tuple[str, str] | None:
+    """Linear-time parser for a single stack-frame token like `(src/a.test.ts:42:18)`."""
+    tok = raw_token.strip("()<>[]❯,")
+    if not tok or ":" not in tok:
+        return None
+    parts = tok.split(":")
+    if len(parts) < 2:
+        return None
+    # Walk from left to find `<file>.<js/ts ext>:<digits>`
+    for idx in range(len(parts) - 1):
+        candidate_file = ":".join(parts[: idx + 1])
+        candidate_line = parts[idx + 1]
+        if candidate_line.isdigit() and candidate_file.lower().endswith(_JS_EXTS):
+            return _normalize_rel_path(candidate_file), candidate_line
+    return None
+
+
 def _extract_js_location(lines: list[str], preferred_file: str | None) -> str | None:
-    """Extract the best ``file:line`` stack location from a Vitest/Jest failure block."""
+    """Strictly linear-time extraction of ``file:line`` from a Vitest/Jest failure block."""
     first_non_module: str | None = None
     for raw in lines:
         line = _cap_line(raw)
-        for m in (_JS_STACK_PAREN_RE.search(line), _JS_STACK_BARE_RE.search(line)):
-            if not m:
+        if ":" not in line:
+            continue
+        for tok in line.split():
+            if ":" not in tok:
                 continue
-            fpath = _normalize_rel_path(m.group(1))
-            lineno = m.group(2)
+            parsed = _parse_js_location_token(tok)
+            if parsed is None:
+                continue
+            fpath, lineno = parsed
             if "node_modules/" in fpath or fpath.startswith("node:"):
                 continue
             loc = f"{fpath}:{lineno}"
@@ -1279,16 +1371,59 @@ def _normalize_js_test_id(file_path: str | None, raw_name: str) -> str:
     return cleaned
 
 
+def _strip_trailing_js_duration(text: str) -> str:
+    """Linear-time removal of trailing Jest/Vitest timing like `8ms`, `1.2s`, `(5 ms)`."""
+    parts = text.split()
+    if len(parts) < 2:
+        return " ".join(parts)
+    last = parts[-1]
+    # Form 1: `(5 ms)` -> last two tokens are `(<digits>` and `ms)` / `s)`
+    if (
+        len(parts) >= 3
+        and last in ("ms)", "s)")
+        and parts[-2].startswith("(")
+        and parts[-2][1:].isdigit()
+    ):
+        return " ".join(parts[:-2])
+    # Form 2: `(5ms)` or `5ms` or `5s`
+    inner = last[1:-1] if (last.startswith("(") and last.endswith(")")) else last
+    if inner.endswith("ms") and inner[:-2].isdigit():
+        return " ".join(parts[:-1])
+    if inner.endswith("s") and inner[:-1].isdigit():
+        return " ".join(parts[:-1])
+    return " ".join(parts)
+
+
 def _parse_js_inline_marker(stripped: str, markers: tuple[str, ...]) -> str | None:
-    """Linear-time parser for `× test name 12ms` / `✓ test name (5 ms)` lines."""
+    """Strictly linear-time parser for `× test name 12ms` / `✓ test name (5 ms)` lines."""
     for mk in markers:
         if stripped.startswith(mk):
             rest = stripped[len(mk) :].strip()
             if not rest:
                 return None
-            rest = _JS_TRAILING_DURATION_RE.sub("", rest).strip()
-            return rest if rest else None
+            cleaned = _strip_trailing_js_duration(rest)
+            return cleaned if cleaned else None
     return None
+
+
+def _js_output_has_failure_markers(lines: list[str]) -> bool:
+    """Return True if Jest/Vitest output explicitly reports failures."""
+    for raw_line in lines:
+        line = _cap_line(raw_line)
+        if _VITEST_FAIL_LINE_RE.match(line) or _VITEST_SUITE_FAIL_RE.match(line):
+            return True
+        file_m = _JS_FILE_STATUS_RE.match(line) if " > " not in line else None
+        if file_m and file_m.group(1) in ("FAIL", "×", "✕", "✗"):
+            return True
+        if (
+            _JS_TESTS_SUMMARY_RE.match(line)
+            or _VITEST_TEST_FILES_RE.match(line)
+            or _JEST_TEST_SUITES_RE.match(line)
+        ):
+            for m in _COUNT_TOKEN_RE.finditer(line):
+                if m.group(2).lower() in ("failed", "error", "errors") and int(m.group(1)) > 0:
+                    return True
+    return False
 
 
 def _parse_js_runner(execution: ToolExecution, clean_output: str, runner: str) -> list[TestAttempt]:
@@ -1296,7 +1431,15 @@ def _parse_js_runner(execution: ToolExecution, clean_output: str, runner: str) -
     lines = clean_output.split("\n")
     turn_index = execution.turn_index
     command = execution.command
-    run_looks_clean = execution.exit_code == 0 and not execution.is_error
+
+    # Treat Claude Code clean runs (exit_code=None, is_error=False) with no failure markers
+    # as passing so stray `●` warnings (e.g. TCPSERVERWRAP, Cannot log after tests are done)
+    # never become phantom test failures.
+    run_looks_clean = (
+        execution.exit_code in (0, None)
+        and not execution.is_error
+        and not _js_output_has_failure_markers(lines)
+    )
 
     attempts: list[TestAttempt] = []
     seen_fail_ids: set[str] = set()
@@ -1348,7 +1491,6 @@ def _parse_js_runner(execution: ToolExecution, clean_output: str, runner: str) -
             _flush_js_block()
             continue
 
-        # Vitest test failure block header: FAIL  src/calc.test.ts > Suite > test name
         vf_m = _VITEST_FAIL_LINE_RE.match(line)
         if vf_m:
             _flush_js_block()
@@ -1359,7 +1501,6 @@ def _parse_js_runner(execution: ToolExecution, clean_output: str, runner: str) -
             current_block_lines = []
             continue
 
-        # Vitest suite-level failure header: FAIL  src/calc.test.ts [ src/calc.test.ts ]
         vsf_m = _VITEST_SUITE_FAIL_RE.match(line)
         if vsf_m:
             _flush_js_block()
@@ -1370,15 +1511,12 @@ def _parse_js_runner(execution: ToolExecution, clean_output: str, runner: str) -
             current_block_lines = []
             continue
 
-        # File-level PASS / FAIL header (not per-test lines containing ` > `)
         file_m = _JS_FILE_STATUS_RE.match(line) if " > " not in line else None
         if file_m:
             _flush_js_block()
             current_file = _normalize_rel_path(file_m.group(2))
             continue
 
-        # Jest failure block header: ● Suite › test name
-        # Skip non-failure Jest banners (Deprecation Warning, Console) and passing runs.
         bullet_m = _JEST_BULLET_RE.match(line)
         if bullet_m:
             _flush_js_block()
@@ -1454,7 +1592,6 @@ def _parse_go_test(execution: ToolExecution, clean_output: str) -> list[TestAtte
     passed_set: set[str] = set()
     build_errors: list[tuple[str, str]] = []
 
-    # Track package association per test block so Go test_ids are package-qualified when available.
     test_package: dict[str, str] = {}
     pending_pkg_tests: list[str] = []
 
@@ -1696,7 +1833,6 @@ def _parse_generic(
     if is_failure:
         return _build_command_failure_attempt(execution, clean_output, runner="generic")
 
-    # Claude Code transcripts often leave exit_code=None on successful Bash calls.
     if emit_generic_pass and execution.exit_code in (0, None) and not execution.is_error:
         return [
             TestAttempt(
@@ -1713,6 +1849,8 @@ def _parse_generic(
 
 def extract_pass_signal(execution: ToolExecution) -> RunnerPassSignal | None:
     """Return a ``RunnerPassSignal`` if ``execution`` represents a clean passing test run."""
+    if not _is_command_execution(execution):
+        return None
     if execution.is_error or (execution.exit_code is not None and execution.exit_code != 0):
         return None
 
@@ -1722,7 +1860,7 @@ def extract_pass_signal(execution: ToolExecution) -> RunnerPassSignal | None:
         if _is_non_runner_command(execution.command):
             return None
         test_id = _bounded_generic_test_id(execution.command)
-        if execution.exit_code in (0, None) and test_id and _is_command_execution(execution):
+        if execution.exit_code in (0, None) and test_id:
             return RunnerPassSignal(
                 runner="generic",
                 turn_index=execution.turn_index,
@@ -1753,7 +1891,7 @@ def extract_pass_signal(execution: ToolExecution) -> RunnerPassSignal | None:
                         passed_count = max(passed_count, count)
                     elif kind in ("failed", "error", "errors"):
                         failed_count += count
-                    elif kind == "skipped":
+                    elif kind in ("skipped", "xfailed", "xpassed"):
                         skipped_count += count
                     elif kind == "deselected":
                         deselected_count += count
@@ -1766,7 +1904,20 @@ def extract_pass_signal(execution: ToolExecution) -> RunnerPassSignal | None:
                         explicit_ids.append(nid)
                     elif status in ("FAILED", "ERROR"):
                         failed_count += 1
-        if failed_count > 0 or (passed_count == 0 and not explicit_ids):
+        if failed_count > 0:
+            return None
+        if passed_count == 0 and not explicit_ids:
+            # Support redirected empty-stdout clean exits (e.g. `uv run pytest > out.log 2>&1`)
+            # ONLY for resolving command-keyed fallback attempts of the identical command.
+            if not clean_output.strip() and execution.command:
+                return RunnerPassSignal(
+                    runner="pytest",
+                    turn_index=execution.turn_index,
+                    command=execution.command,
+                    passed_count=0,
+                    failed_count=0,
+                    is_command_only_pass=True,
+                )
             return None
         return RunnerPassSignal(
             runner="pytest",
@@ -1804,9 +1955,20 @@ def extract_pass_signal(execution: ToolExecution) -> RunnerPassSignal | None:
                         passed_count = max(passed_count, count)
                     elif kind in ("failed", "error", "errors"):
                         failed_count += count
-                    elif kind == "skipped":
+                    elif kind in ("skipped", "xfailed", "xpassed"):
                         skipped_count += count
-        if failed_count > 0 or (passed_count == 0 and not passed_files):
+        if failed_count > 0:
+            return None
+        if passed_count == 0 and not passed_files:
+            if not clean_output.strip() and execution.command:
+                return RunnerPassSignal(
+                    runner=runner,
+                    turn_index=execution.turn_index,
+                    command=execution.command,
+                    passed_count=0,
+                    failed_count=0,
+                    is_command_only_pass=True,
+                )
             return None
         return RunnerPassSignal(
             runner=runner,
@@ -1845,9 +2007,19 @@ def extract_pass_signal(execution: ToolExecution) -> RunnerPassSignal | None:
                 pending_pass_names.clear()
             elif line == "PASS":
                 passed_count = max(passed_count, 1)
-        # Flush any trailing unqualified verbose PASS lines (when no `ok <pkg>` line was present).
         explicit_ids.extend(pending_pass_names)
-        if failed_count > 0 or (passed_count == 0 and not passed_packages and not explicit_ids):
+        if failed_count > 0:
+            return None
+        if passed_count == 0 and not passed_packages and not explicit_ids:
+            if not clean_output.strip() and execution.command:
+                return RunnerPassSignal(
+                    runner="go",
+                    turn_index=execution.turn_index,
+                    command=execution.command,
+                    passed_count=0,
+                    failed_count=0,
+                    is_command_only_pass=True,
+                )
             return None
         return RunnerPassSignal(
             runner="go",
@@ -1894,6 +2066,8 @@ def parse_runner_output(
     emit_generic_pass: bool = False,
 ) -> list[TestAttempt]:
     """Parse a single ``ToolExecution`` into structured ``TestAttempt`` records."""
+    if not _is_command_execution(execution):
+        return []
     clean_output = strip_ansi(execution.output)
     runner = detect_runner(execution.command, clean_output)
     is_failure = (
@@ -1910,8 +2084,6 @@ def parse_runner_output(
     else:
         return _parse_generic(execution, clean_output, emit_generic_pass=emit_generic_pass)
 
-    # Never silently drop a failing specialized runner execution (e.g. Go timeout/panic,
-    # pytest exit 4 usage error, or unparsed crash).
     if not parsed and is_failure:
         return _build_command_failure_attempt(
             execution,
@@ -1933,6 +2105,8 @@ def parse_tool_executions(executions: Sequence[ToolExecution]) -> list[TestAttem
     failed_generic_commands: set[str] = set()
 
     for execution in executions:
+        if not _is_command_execution(execution):
+            continue
         clean_output = strip_ansi(execution.output)
         runner = detect_runner(execution.command, clean_output)
         if runner == "generic":

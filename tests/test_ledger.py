@@ -324,6 +324,15 @@ def test_unknown_scope_wrappers_chdir_and_filters_do_not_falsely_resolve_pytest(
         "nice -n 10 pytest tests/test_b.py",
         "docker compose exec app pytest tests/test_b.py",
         "cd services/other && pytest",
+        # N1: Subshell and brace-group chdir must NOT falsely resolve!
+        "(cd services/other && pytest -q)",
+        "(cd services/other; pytest -q)",
+        "{ cd services/other && pytest -q; }",
+        # N2: Backslash-newline continuation with scoped file must NOT resolve!
+        "pytest -q \\\n  tests/test_b.py",
+        # Scope-narrowing env/config flags must NOT resolve!
+        "PYTEST_ADDOPTS='-k other' pytest -q",
+        "pytest -c other/pytest.ini",
     ]
     execs = [
         ToolExecution(
@@ -340,10 +349,15 @@ def test_unknown_scope_wrappers_chdir_and_filters_do_not_falsely_resolve_pytest(
         execs.append(
             ToolExecution(idx, "Bash", cmd, "=== 5 passed in 0.08s ===\n", 0, False, seq=idx)
         )
-    # Skipping a test (`1 passed, 1 skipped`) must also NOT implicitly resolve it.
+    # Skipping or xfailing a test must also NOT implicitly resolve it.
     execs.append(
         ToolExecution(
             99, "Bash", "pytest", "=== 1 passed, 1 skipped in 0.05s ===\n", 0, False, seq=99
+        )
+    )
+    execs.append(
+        ToolExecution(
+            100, "Bash", "pytest", "=== 1 passed, 1 xfailed in 0.05s ===\n", 0, False, seq=100
         )
     )
 
@@ -360,6 +374,7 @@ def test_pytest_and_vitest_redirects_and_scoped_passes_resolve() -> None:
     for pass_cmd in (
         "pytest 2>&1 | tail -30",
         "pytest > /tmp/o.log 2>&1; tail -20 /tmp/o.log",
+        "pytest -q > /tmp/o.log 2>&1\ntail -20 /tmp/o.log",
         "uv run pytest -q",
         "pytest tests/test_a.py::test_disc",
     ):
@@ -788,3 +803,134 @@ def test_build_attempt_ledger_end_to_end_multi_turn_session() -> None:
     assert thrash[0].reverted is True
     assert thrash[0].edit_count == 2
     assert thrash[0].failure_count == 4
+
+
+def test_identical_wrapper_and_command_fallback_reruns_resolve_n4_n5() -> None:
+    # N4: Identical wrapper / chdir command going fail -> pass MUST resolve.
+    for cmd in (
+        "cd backend && pytest -q",
+        "make test",
+        "tox -e py312",
+        "uv run --directory backend pytest -q",
+        "coverage run -m pytest -q",
+        "docker compose exec app pytest -q",
+    ):
+        tx = ParsedTranscript(
+            format="claude-code",
+            tool_executions=[
+                ToolExecution(
+                    1,
+                    "Bash",
+                    cmd,
+                    _pytest_fail_output("tests/test_a.py::test_x", "400", "100"),
+                    1,
+                    True,
+                    seq=1,
+                ),
+                ToolExecution(2, "Bash", cmd, "=== 5 passed in 0.08s ===\n", 0, False, seq=2),
+            ],
+        )
+        _, trajs, _ = build_attempt_ledger(tx)
+        assert trajs[0].status == "RESOLVED", f"Expected identical command {cmd!r} to resolve"
+
+    # N5: Command-keyed fallback error attempts resolve when the exact command later succeeds.
+    # (a) pytest exit 4 -> clean pass
+    tx_p = ParsedTranscript(
+        format="claude-code",
+        tool_executions=[
+            ToolExecution(
+                1,
+                "Bash",
+                "pytest tests/test_new.py -q",
+                "ERROR: file or directory not found: tests/test_new.py\n",
+                4,
+                True,
+                seq=1,
+            ),
+            ToolExecution(
+                2,
+                "Bash",
+                "pytest tests/test_new.py -q",
+                "=== 2 passed in 0.04s ===\n",
+                0,
+                False,
+                seq=2,
+            ),
+        ],
+    )
+    assert build_attempt_ledger(tx_p)[1][0].status == "RESOLVED"
+
+    # (b) go test timeout -> clean pass
+    tx_g = ParsedTranscript(
+        format="claude-code",
+        tool_executions=[
+            ToolExecution(
+                1, "Bash", "go test ./pkg/a", "panic: test timed out after 10m0s\n", 2, True, seq=1
+            ),
+            ToolExecution(
+                2,
+                "Bash",
+                "go test ./pkg/a",
+                "ok  \texample.com/m/pkg/a\t0.005s\n",
+                0,
+                False,
+                seq=2,
+            ),
+        ],
+    )
+    assert build_attempt_ledger(tx_g)[1][0].status == "RESOLVED"
+
+    # (c) redirected stdout workflow (`uv run pytest > /tmp/out.log 2>&1`) exit 1 -> exit 0 empty
+    tx_redir = ParsedTranscript(
+        format="claude-code",
+        tool_executions=[
+            ToolExecution(1, "Bash", "uv run pytest > /tmp/out.log 2>&1", "", 1, True, seq=1),
+            ToolExecution(2, "Bash", "uv run pytest > /tmp/out.log 2>&1", "", 0, False, seq=2),
+        ],
+    )
+    assert build_attempt_ledger(tx_redir)[1][0].status == "RESOLVED"
+
+    # Vitest chdir with relative file `✓ src/a.test.ts` must NOT resolve failure from different dir!
+    vitest_fail = (
+        " RUN  v2.1.0\n"
+        " FAIL  src/a.test.ts > Suite > works\n"
+        "AssertionError: expected 400 to be 100\n"
+        " ❯ src/a.test.ts:12:5\n"
+        " Test Files  1 failed (1)\n"
+    )
+    tx_v_cd = ParsedTranscript(
+        format="claude-code",
+        tool_executions=[
+            ToolExecution(
+                1, "Bash", "cd packages/app && npx vitest run", vitest_fail, 1, True, seq=1
+            ),
+            ToolExecution(
+                2,
+                "Bash",
+                "cd packages/other && npx vitest run",
+                " RUN  v2.1.0\n ✓ src/a.test.ts (1 test) 4ms\n Test Files  1 passed (1)\n",
+                0,
+                False,
+                seq=2,
+            ),
+            ToolExecution(
+                3,
+                "Bash",
+                "npx vitest run --project other",
+                " RUN  v2.1.0\n Test Files  1 passed (1)\n      Tests  1 passed (1)\n",
+                0,
+                False,
+                seq=3,
+            ),
+            ToolExecution(
+                4,
+                "Bash",
+                "npx vitest run \\\n  src/b.test.ts",
+                " RUN  v2.1.0\n Test Files  1 passed (1)\n      Tests  1 passed (1)\n",
+                0,
+                False,
+                seq=4,
+            ),
+        ],
+    )
+    assert build_attempt_ledger(tx_v_cd)[1][0].status == "SINGLE_FAILURE"

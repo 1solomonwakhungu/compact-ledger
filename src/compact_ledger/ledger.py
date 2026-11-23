@@ -1,7 +1,7 @@
 """Test attempt ledger, trajectory classifier, and edit-thrash detector.
 
-All algorithms are 100% deterministic, zero-LLM, stdlib-only, and designed to stay
-fast on large transcripts with bounded summaries and linear-time pattern checks.
+All algorithms are 100% deterministic, zero-LLM, stdlib-only, and indexed for
+fast scaling on large transcripts with bounded summaries and linear-time pattern checks.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import re
 from bisect import bisect_right
 from collections import defaultdict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from compact_ledger.models import (
     EditThrashEntry,
@@ -29,6 +29,7 @@ from compact_ledger.parsers.runners import (
     detect_runner,
     extract_go_failed_packages,
     extract_pass_signal,
+    normalize_command,
     parse_runner_invocation,
     parse_runner_output,
     strip_ansi,
@@ -107,7 +108,9 @@ _JS_VALUE_FLAGS = frozenset(
 _GO_VALUE_FLAGS = frozenset(
     {
         "-run",
+        "--run",
         "-skip",
+        "--skip",
         "-count",
         "-timeout",
         "-tags",
@@ -128,7 +131,6 @@ _GO_VALUE_FLAGS = frozenset(
     }
 )
 
-# Complex regex metacharacters that could cause backtracking if passed to `re`.
 _UNSAFE_PATTERN_CHARS = frozenset("*+?{[(")
 
 
@@ -213,16 +215,10 @@ def _unescape_simple_regex(raw: str) -> str:
 
 
 def _match_simple_filter(pattern: str, text: str, *, default_on_complex: bool) -> bool:
-    """Strictly linear-time matcher for runner filter patterns (``-t``, ``-run``, ``-skip``).
-
-    Supports plain substrings, ``^`` / ``$`` anchors, ``|`` alternations, and escaped
-    literals without invoking backtracking regex engines. Falls back safely to
-    ``default_on_complex`` for complex regex syntax.
-    """
+    """Strictly linear-time matcher for runner filter patterns (``-t``, ``-run``, ``-skip``)."""
     if not pattern or len(pattern) > 200:
         return default_on_complex
 
-    # Inspect unescaped characters for unsafe regex constructs.
     i = 0
     n = len(pattern)
     branches: list[str] = []
@@ -230,7 +226,6 @@ def _match_simple_filter(pattern: str, text: str, *, default_on_complex: bool) -
     while i < n:
         ch = pattern[i]
         if ch == "\\" and i + 1 < n:
-            # Character class shorthand like \d, \w, \s -> treat as complex
             if pattern[i + 1].isalpha():
                 return default_on_complex
             i += 2
@@ -271,6 +266,9 @@ class _ParsedPassScope:
     exec_idx: int
     signal: RunnerPassSignal
     scope_known: bool
+    has_chdir: bool
+    norm_command: str
+    command_key_id: str
     explicit_ids: frozenset[str]
     passed_files: tuple[str, ...]
     passed_packages: frozenset[str]
@@ -288,8 +286,6 @@ class _ParsedPassScope:
     go_packages: tuple[str, ...] = ()
     go_run_pattern: str | None = None
     go_skip_pattern: str | None = None
-    # Generic command test_id
-    generic_cmd_id: str = ""
 
 
 def _parse_pytest_scope(
@@ -306,7 +302,10 @@ def _parse_pytest_scope(
     while idx < n:
         tok = args[idx]
         if tok == "--":
-            targets.extend(_normalize_path(t) for t in args[idx + 1 :])
+            for t in args[idx + 1 :]:
+                nt = _normalize_path(t)
+                if nt:
+                    targets.append(nt)
             break
         if tok == "-k" and idx + 1 < n:
             k_expr = args[idx + 1].strip()
@@ -317,7 +316,6 @@ def _parse_pytest_scope(
             idx += 1
             continue
         if tok.startswith("-k") and len(tok) > 2:
-            # Attached short option: `pytest -kb_only`
             k_expr = tok[2:].strip()
             idx += 1
             continue
@@ -351,7 +349,9 @@ def _parse_pytest_scope(
         if tok.startswith("-"):
             idx += 1
             continue
-        targets.append(_normalize_path(tok))
+        nt = _normalize_path(tok)
+        if nt:
+            targets.append(nt)
         idx += 1
 
     return targets, k_expr, has_marker, ignored, ignore_globs
@@ -394,7 +394,9 @@ def _parse_js_scope(runner: str, args: list[str]) -> tuple[list[str], str | None
         if tok.startswith("-"):
             idx += 1
             continue
-        targets.append(_normalize_path(tok))
+        nt = _normalize_path(tok)
+        if nt:
+            targets.append(nt)
         idx += 1
 
     return targets, name_pattern, path_pattern
@@ -409,19 +411,19 @@ def _parse_go_scope(args: list[str]) -> tuple[list[str], str | None, str | None]
     n = len(args)
     while idx < n:
         tok = args[idx]
-        if tok == "-run" and idx + 1 < n:
+        if tok in ("-run", "--run") and idx + 1 < n:
             run_pattern = args[idx + 1]
             idx += 2
             continue
-        if tok.startswith("-run="):
+        if tok.startswith(("-run=", "--run=")):
             run_pattern = tok.split("=", 1)[1]
             idx += 1
             continue
-        if tok == "-skip" and idx + 1 < n:
+        if tok in ("-skip", "--skip") and idx + 1 < n:
             skip_pattern = args[idx + 1]
             idx += 2
             continue
-        if tok.startswith("-skip="):
+        if tok.startswith(("-skip=", "--skip=")):
             skip_pattern = tok.split("=", 1)[1]
             idx += 1
             continue
@@ -431,7 +433,8 @@ def _parse_go_scope(args: list[str]) -> tuple[list[str], str | None, str | None]
         if tok.startswith("-"):
             idx += 1
             continue
-        packages.append(tok)
+        if tok.strip():
+            packages.append(tok.strip())
         idx += 1
 
     return packages, run_pattern, skip_pattern
@@ -442,19 +445,21 @@ def _compile_pass_scope(exec_idx: int, signal: RunnerPassSignal) -> _ParsedPassS
     inv = parse_runner_invocation(signal.command)
     scope_known = inv.scope_known and inv.runner == signal.runner
     explicit_ids = frozenset(signal.explicit_test_ids)
-    passed_files = tuple(_normalize_path(p) for p in signal.passed_files)
-    passed_packages = frozenset(_normalize_path(p).rstrip("/") for p in signal.passed_packages)
+    passed_files = tuple(_normalize_path(p) for p in signal.passed_files if p.strip())
+    passed_packages = frozenset(
+        _normalize_path(p).rstrip("/") for p in signal.passed_packages if p.strip()
+    )
 
     parsed = _ParsedPassScope(
         exec_idx=exec_idx,
         signal=signal,
         scope_known=scope_known,
+        has_chdir=inv.has_chdir,
+        norm_command=normalize_command(signal.command),
+        command_key_id=_bounded_generic_test_id(signal.command),
         explicit_ids=explicit_ids,
         passed_files=passed_files,
         passed_packages=passed_packages,
-        generic_cmd_id=_bounded_generic_test_id(signal.command)
-        if signal.runner == "generic"
-        else "",
     )
 
     if scope_known and signal.runner == "pytest":
@@ -479,11 +484,11 @@ def _compile_pass_scope(exec_idx: int, signal: RunnerPassSignal) -> _ParsedPassS
 
 
 def _pytest_target_covers(target: str, test_id: str, test_file: str) -> bool:
-    if target in ("", "."):
+    if target == ".":
         return True
     norm_target = target.rstrip("/")
     if not norm_target:
-        return True
+        return False
     if test_id == norm_target:
         return True
     if test_id.startswith(norm_target + "[") or test_id.startswith(norm_target + "::"):
@@ -515,6 +520,7 @@ def _pass_scope_covers_test(
     runner: str,
     assertion_loc: str | None,
     *,
+    fail_command: str | None = None,
     go_package: str | None = None,
 ) -> bool:
     """Return True iff ``parsed`` is a passing run whose scope provably covers ``test_id``."""
@@ -522,16 +528,35 @@ def _pass_scope_covers_test(
     if signal.runner != runner:
         return False
 
+    norm_fail_cmd = normalize_command(fail_command)
+    fail_cmd_key = _bounded_generic_test_id(fail_command)
+    is_command_keyed_fallback = bool(fail_cmd_key and test_id == fail_cmd_key)
+    same_command = bool(norm_fail_cmd and parsed.norm_command == norm_fail_cmd)
+
     # Generic fallback: exact bounded command match.
     if runner == "generic":
-        return parsed.generic_cmd_id == test_id
+        return parsed.command_key_id == test_id
+
+    # Command-only pass (e.g. redirected stdout `uv run pytest > out.log 2>&1` exiting 0 with
+    # empty output): resolves ONLY a command-keyed fallback attempt of the identical command.
+    if signal.is_command_only_pass:
+        return is_command_keyed_fallback and same_command
+
+    # Command-keyed fallback `error` attempt for pytest/vitest/jest/go (e.g. exit 4 or Go timeout):
+    # rerunning the exact same command cleanly resolves it.
+    if is_command_keyed_fallback and same_command:
+        return signal.skipped_count == 0 and signal.deselected_count == 0
 
     # Explicit per-test pass covers an exact test_id match (Go IDs are package-qualified).
     if test_id in parsed.explicit_ids:
         return True
 
-    # If the command was a fallback/wrapper/chdir whose scope cannot be verified, NEVER assume
-    # count-only coverage; only explicit file/package evidence may resolve.
+    # Identical command going fail -> clean pass (no skipped/deselected):
+    # restores coverage for `make test`, `tox -e py312`, `cd backend && pytest -q`,
+    # `coverage run -m pytest -q`, `docker compose exec app pytest -q`, etc.
+    if same_command and signal.skipped_count == 0 and signal.deselected_count == 0:
+        return True
+
     if runner == "pytest":
         if not parsed.scope_known:
             return False
@@ -559,8 +584,6 @@ def _pass_scope_covers_test(
     if runner in ("vitest", "jest"):
         test_file, test_name_only = _js_test_file_and_name(test_id, assertion_loc)
 
-        # If a name filter (-t / --testNamePattern) was given, match ONLY against the test name,
-        # never against the file path.
         if parsed.js_name_pattern is not None and not _match_simple_filter(
             parsed.js_name_pattern, test_name_only, default_on_complex=False
         ):
@@ -571,11 +594,11 @@ def _pass_scope_covers_test(
         ):
             return False
 
-        # Skipped tests inside a file mean we cannot trust a file-level PASS or summary count.
         if signal.skipped_count > 0:
             return False
 
-        if parsed.passed_files and test_file is not None:
+        # Relative JS file names from a different `cd` directory must not resolve unrelated dirs.
+        if parsed.passed_files and test_file is not None and not parsed.has_chdir:
             return any(
                 pf == test_file or pf.endswith("/" + test_file) or test_file.endswith("/" + pf)
                 for pf in parsed.passed_files
@@ -591,9 +614,11 @@ def _pass_scope_covers_test(
             return False
 
         for target in parsed.js_targets:
-            norm_t = target.rstrip("/")
-            if norm_t in ("", "."):
+            if target == ".":
                 return True
+            norm_t = target.rstrip("/")
+            if not norm_t:
+                continue
             if (
                 test_file == norm_t
                 or test_file.startswith(norm_t + "/")
@@ -623,11 +648,9 @@ def _pass_scope_covers_test(
         if signal.skipped_count > 0:
             return False
 
-        # Explicit package evidence from `ok <full_import_path>`: require exact package equality!
         if parsed.passed_packages:
             if norm_go_pkg is not None:
                 return norm_go_pkg in parsed.passed_packages
-            # Only resolve an unqualified Go test from `ok <pkg>` if the run was a repo-wide `./...`
             return parsed.scope_known and (
                 "./..." in parsed.go_packages or "..." in parsed.go_packages
             )
@@ -635,11 +658,9 @@ def _pass_scope_covers_test(
         if not parsed.scope_known:
             return False
 
-        # Only explicit `./...` or `...` is repo-wide; bare `go test` tests only `.` (current pkg)!
         if "./..." in parsed.go_packages or "..." in parsed.go_packages:
             return True
 
-        # Bare `go test` or `go test .` with no package metadata on either side.
         if (not parsed.go_packages or parsed.go_packages == (".",)) and norm_go_pkg is None:
             loc_file = _loc_file_only(assertion_loc)
             if "/" not in loc_file:
@@ -648,6 +669,134 @@ def _pass_scope_covers_test(
         return False
 
     return False
+
+
+@dataclass(slots=True)
+class _RunnerScopeIndex:
+    """O(1)-indexed pass scopes for a single runner so large ledgers run in O(N + M)."""
+
+    broad: list[_ParsedPassScope] = field(default_factory=list)
+    by_explicit_id: dict[str, list[_ParsedPassScope]] = field(
+        default_factory=lambda: defaultdict(list)
+    )
+    by_file: dict[str, list[_ParsedPassScope]] = field(default_factory=lambda: defaultdict(list))
+    by_go_pkg: dict[str, list[_ParsedPassScope]] = field(default_factory=lambda: defaultdict(list))
+    by_command: dict[str, list[_ParsedPassScope]] = field(default_factory=lambda: defaultdict(list))
+
+    def add(self, scope: _ParsedPassScope) -> None:
+        if scope.norm_command:
+            self.by_command[scope.norm_command].append(scope)
+        for tid in scope.explicit_ids:
+            self.by_explicit_id[tid].append(scope)
+
+        if scope.signal.is_command_only_pass or scope.signal.runner == "generic":
+            return
+
+        if scope.signal.runner == "pytest":
+            if not scope.scope_known:
+                return
+            if not scope.pytest_targets:
+                self.broad.append(scope)
+                return
+            is_broad = False
+            for target in scope.pytest_targets:
+                # Specific `.py` file or `file.py::node` targets can be indexed by file!
+                tfile = target.split("::", 1)[0]
+                if tfile.endswith(".py"):
+                    self.by_file[tfile].append(scope)
+                else:
+                    is_broad = True
+            if is_broad:
+                self.broad.append(scope)
+            return
+
+        if scope.signal.runner in ("vitest", "jest"):
+            if scope.passed_files:
+                for pf in scope.passed_files:
+                    self.by_file[pf].append(scope)
+                return
+            if not scope.scope_known:
+                return
+            if not scope.js_targets:
+                self.broad.append(scope)
+                return
+            is_broad = False
+            for target in scope.js_targets:
+                if "." in target and target != ".":
+                    self.by_file[target].append(scope)
+                else:
+                    is_broad = True
+            if is_broad:
+                self.broad.append(scope)
+            return
+
+        if scope.signal.runner == "go":
+            if scope.passed_packages:
+                for pkg in scope.passed_packages:
+                    self.by_go_pkg[pkg].append(scope)
+                if scope.scope_known and (
+                    "./..." in scope.go_packages or "..." in scope.go_packages
+                ):
+                    self.broad.append(scope)
+                return
+            if scope.scope_known:
+                self.broad.append(scope)
+
+    def candidates_for(
+        self,
+        runner: str,
+        test_id: str,
+        assertion_loc: str | None,
+        fail_command: str | None,
+        go_package: str | None,
+    ) -> list[_ParsedPassScope]:
+        buckets: list[list[_ParsedPassScope]] = []
+        if self.broad:
+            buckets.append(self.broad)
+        if test_id in self.by_explicit_id:
+            buckets.append(self.by_explicit_id[test_id])
+        norm_cmd = normalize_command(fail_command)
+        if norm_cmd and norm_cmd in self.by_command:
+            buckets.append(self.by_command[norm_cmd])
+
+        if runner == "pytest":
+            tfile = _normalize_path(test_id).split("::", 1)[0]
+            if tfile in self.by_file:
+                buckets.append(self.by_file[tfile])
+        elif runner in ("vitest", "jest"):
+            tfile, _ = _js_test_file_and_name(test_id, assertion_loc)
+            if tfile:
+                if tfile in self.by_file:
+                    buckets.append(self.by_file[tfile])
+                # Also check suffix matches when passed_files has different relative prefix.
+                if len(self.by_file) <= 16:
+                    for key_file, lst in self.by_file.items():
+                        if key_file != tfile and (
+                            key_file.endswith("/" + tfile) or tfile.endswith("/" + key_file)
+                        ):
+                            buckets.append(lst)
+        elif runner == "go":
+            pkg_from_id, _ = _split_go_test_id(test_id)
+            norm_pkg = pkg_from_id or (
+                _normalize_path(go_package).rstrip("/") if go_package else None
+            )
+            if norm_pkg and norm_pkg in self.by_go_pkg:
+                buckets.append(self.by_go_pkg[norm_pkg])
+
+        if not buckets:
+            return []
+        if len(buckets) == 1:
+            return buckets[0]
+
+        seen: set[int] = set()
+        merged: list[_ParsedPassScope] = []
+        for bucket in buckets:
+            for sc in bucket:
+                if sc.exec_idx not in seen:
+                    seen.add(sc.exec_idx)
+                    merged.append(sc)
+        merged.sort(key=lambda sc: sc.exec_idx)
+        return merged
 
 
 def _classify_attempts(attempts: Sequence[TestAttempt]) -> TrajectoryStatus:
@@ -738,18 +887,15 @@ def _build_trajectories_internal(
         exec_idx = attempt_exec_indices[idx] if attempt_exec_indices is not None else None
         grouped[key].append((exec_idx, att))
 
-    # Pre-compile pass scopes ONCE per passing execution and index by runner for O(1) lookup.
-    pass_scopes_by_runner: dict[str, list[_ParsedPassScope]] = defaultdict(list)
-    pass_exec_idxs_by_runner: dict[str, list[int]] = defaultdict(list)
+    # Pre-compile and O(1)-index pass scopes ONCE per passing execution.
+    scope_index_by_runner: dict[str, _RunnerScopeIndex] = defaultdict(_RunnerScopeIndex)
     failing_exec_indices_by_key: dict[tuple[str, str], list[int]] = defaultdict(list)
     go_package_by_test: dict[str, str] = {}
 
     for exec_idx, exe in enumerate(ordered_executions):
         sig = extract_pass_signal(exe)
         if sig is not None:
-            scope = _compile_pass_scope(exec_idx, sig)
-            pass_scopes_by_runner[sig.runner].append(scope)
-            pass_exec_idxs_by_runner[sig.runner].append(exec_idx)
+            scope_index_by_runner[sig.runner].add(_compile_pass_scope(exec_idx, sig))
         else:
             if detect_runner(exe.command, exe.output) == "go":
                 go_package_by_test.update(extract_go_failed_packages(exe.output))
@@ -771,17 +917,20 @@ def _build_trajectories_internal(
         if not has_failure:
             continue
 
-        runner_scopes = pass_scopes_by_runner.get(runner)
-        runner_exec_idxs = pass_exec_idxs_by_runner.get(runner)
+        runner_index = scope_index_by_runner.get(runner)
         go_pkg = go_package_by_test.get(test_id)
 
-        # Synthesize implicit covering passes both between failures (catching regressions after
-        # an implicit pass) and after the last failure (marking RESOLVED).
         test_attempts: list[TestAttempt] = []
-        if runner_scopes and runner_exec_idxs:
+        if runner_index is not None:
             for i, (e_idx, att) in enumerate(entries):
                 test_attempts.append(att)
                 if att.outcome not in ("failed", "error"):
+                    continue
+
+                candidates = runner_index.candidates_for(
+                    runner, test_id, att.assertion_loc, att.command, go_pkg
+                )
+                if not candidates:
                     continue
 
                 cur_exec_idx = e_idx
@@ -803,26 +952,26 @@ def _build_trajectories_internal(
                             next_exec_idx = f_list[i + 1]
 
                 if cur_exec_idx is not None:
-                    start_pos = bisect_right(runner_exec_idxs, cur_exec_idx)
+                    cand_idxs = [sc.exec_idx for sc in candidates]
+                    start_pos = bisect_right(cand_idxs, cur_exec_idx)
                     end_pos = (
-                        bisect_right(runner_exec_idxs, next_exec_idx - 1)
+                        bisect_right(cand_idxs, next_exec_idx - 1)
                         if next_exec_idx is not None
-                        else len(runner_scopes)
+                        else len(candidates)
                     )
-                    # Check newest matching pass in range (for trailing passes) or earliest
-                    # (for intermediate passes) to hit unfiltered passes in O(1).
                     scan_range = (
                         range(end_pos - 1, start_pos - 1, -1)
                         if next_entry is None
                         else range(start_pos, end_pos)
                     )
                     for pos in scan_range:
-                        scope = runner_scopes[pos]
+                        scope = candidates[pos]
                         if _pass_scope_covers_test(
                             scope,
                             test_id,
                             runner,
                             att.assertion_loc,
+                            fail_command=att.command,
                             go_package=go_pkg,
                         ):
                             test_attempts.append(
@@ -836,9 +985,7 @@ def _build_trajectories_internal(
                             )
                             break
                 elif next_entry is None:
-                    # Synthetic attempts without matching failing executions in tool_executions:
-                    # fall back to turn_index comparison.
-                    for scope in reversed(runner_scopes):
+                    for scope in reversed(candidates):
                         if scope.signal.turn_index < att.turn_index:
                             break
                         if _pass_scope_covers_test(
@@ -846,6 +993,7 @@ def _build_trajectories_internal(
                             test_id,
                             runner,
                             att.assertion_loc,
+                            fail_command=att.command,
                             go_package=go_pkg,
                         ):
                             test_attempts.append(
@@ -930,7 +1078,6 @@ def _detect_revert_on_path(edits: Sequence[FileEdit]) -> tuple[bool, int | None]
     """Return ``(reverted, reverted_from_turn)`` if a later edit restores an earlier state."""
     seen_old_texts: dict[str, int] = {}
     seen_pairs: dict[tuple[str, str], int] = {}
-    # Store full-file writes; `None` marks an intervening edit between writes.
     write_history: list[tuple[str | None, int]] = []
 
     for edit in edits:
@@ -941,10 +1088,8 @@ def _detect_revert_on_path(edits: Sequence[FileEdit]) -> tuple[bool, int | None]
             new_norm = _normalize_hunk(edit.new_text)
             if old_norm is None or new_norm is None or old_norm == new_norm:
                 continue
-            # Direct swap back: previous (A -> B), now (B -> A)
             if (new_norm, old_norm) in seen_pairs:
                 return True, seen_pairs[(new_norm, old_norm)]
-            # Multi-step cycle back: ignore tiny single-token stubs like `pass` to avoid noise
             if new_norm in seen_old_texts and not _is_trivial_stub(new_norm):
                 return True, seen_old_texts[new_norm]
             seen_old_texts.setdefault(old_norm, edit.turn_index)
@@ -953,7 +1098,6 @@ def _detect_revert_on_path(edits: Sequence[FileEdit]) -> tuple[bool, int | None]
             new_norm = _normalize_hunk(edit.new_text)
             if new_norm is None:
                 continue
-            # Restores an earlier write content after an intervening different write OR edit
             if len(write_history) >= 2 and write_history[-1][0] != new_norm:
                 for prev_content, prev_turn in write_history[:-1]:
                     if prev_content is not None and prev_content == new_norm:
@@ -1116,8 +1260,6 @@ def detect_edit_thrash(
             (f_pos, f_ev) for f_pos, f_ev in fail_positions if f_pos > first_edit_pos
         )
 
-        # Check if clean passing run(s) after the last edit cover EVERY failing test
-        # observed in this file's window (each covered after its own last failure).
         latest_fail_by_test: dict[tuple[str, str], tuple[int, TestAttempt]] = {}
         for f_pos, f_ev in window_fails:
             for att in f_ev.failed_attempts:
@@ -1142,6 +1284,7 @@ def detect_edit_thrash(
                             att.test_id,
                             att.runner,
                             att.assertion_loc,
+                            fail_command=att.command,
                             go_package=go_package_by_test.get(att.test_id),
                         )
                     )
@@ -1155,15 +1298,12 @@ def detect_edit_thrash(
             sum(1 for pos in edit_positions if pos > window_fails[0][0]) if window_fails else 0
         )
 
-        # Detect any recurring failure signature separated by at least one edit to this file
-        # (robust to unrelated noise failures occurring in between).
         has_stalled_failures = False
         first_seen_sig_pos: dict[tuple[str, tuple[str, ...]], int] = {}
         for f_pos, f_ev in window_fails:
             for sig in f_ev.fail_signatures:
                 prev_pos = first_seen_sig_pos.get(sig)
                 if prev_pos is not None:
-                    # Check if any edit to this file occurred strictly between prev_pos and f_pos.
                     ins = bisect_right(edit_positions, prev_pos)
                     if ins < len(edit_positions) and edit_positions[ins] < f_pos:
                         has_stalled_failures = True

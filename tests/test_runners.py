@@ -636,3 +636,69 @@ def test_adversarial_redos_whitespace_and_huge_outputs_complete_in_milliseconds(
     assert any(a.test_id == "tests/test_huge.py::test_huge" for a in p_atts)
     assert len(v_atts) == 1
     assert len(g_atts) == 1
+
+
+def test_round2_regressions_n3_n6_n7_and_non_shell_tools() -> None:
+    # N3: Probe command before real runner must NOT drop failing runs, nor `hatch run test`.
+    for cmd in (
+        "echo 'running' && npm test",
+        "pwd; npm test",
+        "ls && npm test",
+        "[ -f .env ] && npm test",
+        "which node && npm test",
+        "hatch run test",
+        "pdm run test",
+        "echo start\nnpx jest",
+    ):
+        exe = ToolExecution(
+            1,
+            "Bash",
+            cmd,
+            (
+                "FAIL src/a.test.js\n  ● adds\n    Expected: 2\n"
+                "    Received: 3\nTest Suites: 1 failed, 1 total\n"
+            ),
+            1,
+            True,
+        )
+        atts = parse_runner_output(exe)
+        assert len(atts) == 1, f"Dropped failure for {cmd!r}"
+        assert atts[0].outcome == "failed"
+
+    # `git commit` pre-commit hook failure must NOT be dropped.
+    commit_fail = ToolExecution(1, "Bash", "git commit -m 'msg'", "ruff failed\n", 1, True)
+    assert len(parse_runner_output(commit_fail)) == 1
+
+    # Non-shell Read/Agent results containing test output must NEVER produce attempts/signals.
+    read_pass = ToolExecution(
+        2, "Read", None, "tests/test_a.py::test_x PASSED\n=== 1 passed in 0.01s ===\n", None, False
+    )
+    assert parse_runner_output(read_pass) == []
+    assert extract_pass_signal(read_pass) is None
+
+    # N6: Passing Claude Code Jest run (exit_code=None) with open-handle warnings emits NO fail.
+    jest_claude_pass = ToolExecution(
+        2,
+        "Bash",
+        "npx jest",
+        (
+            "PASS src/a.test.js\n"
+            "  ● Cannot log after tests are done. Did you forget to wait for something async?\n"
+            "  ●  TCPSERVERWRAP\n"
+            "Test Suites: 1 passed, 1 total\n"
+            "Tests:       2 passed, 2 total\n"
+        ),
+        exit_code=None,
+        is_error=False,
+    )
+    assert [a for a in parse_runner_output(jest_claude_pass) if a.outcome != "passed"] == []
+
+    # N7: Former quadratic patterns (`❯` × 2040 and `✓ a` + 2030 spaces + `b`) run in milliseconds.
+    chevron_bomb = "\n".join(
+        [" RUN  v2.1.0", " FAIL  src/a.test.ts > Suite > bomb"] + ["❯" * 2040] * 100
+    )
+    space_bomb = "\n".join([" RUN  v2.1.0"] + [f"✓ a{' ' * 2030}b"] * 100)
+    t0 = time.perf_counter()
+    parse_runner_output(ToolExecution(1, "Bash", "vitest run", chevron_bomb, 1, True))
+    parse_runner_output(ToolExecution(1, "Bash", "vitest run", space_bomb, 0, False))
+    assert time.perf_counter() - t0 < 0.25
