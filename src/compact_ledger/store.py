@@ -147,13 +147,19 @@ class SessionStore:
             raise ValueError("Pass at most one of store_dir or base_dir")
 
         if store_dir is not None:
+            raw_store = str(store_dir)
+            if not raw_store.strip():
+                raise ValueError("store_dir must be a non-empty path")
             self.root_dir = Path(store_dir).expanduser()
         elif base_dir is not None:
+            raw_base = str(base_dir)
+            if not raw_base.strip():
+                raise ValueError("base_dir must be a non-empty path")
             self.root_dir = Path(base_dir).expanduser() / DEFAULT_DIR_NAME
         else:
             env_dir = os.environ.get(ENV_STORE_DIR)
-            if env_dir:
-                self.root_dir = Path(env_dir).expanduser()
+            if env_dir and env_dir.strip():
+                self.root_dir = Path(env_dir.strip()).expanduser()
             else:
                 self.root_dir = Path.cwd() / DEFAULT_DIR_NAME
 
