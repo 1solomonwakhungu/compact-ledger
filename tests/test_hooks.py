@@ -712,7 +712,7 @@ def test_init_claude_code_merge_preserves_custom_flags_matchers_and_unrelated_ho
                     ],
                 },
                 {
-                    "matcher": "compact|resume",
+                    "matcher": "compact",
                     "hooks": [
                         {"type": "command", "command": "compact-ledger hook session-start"},
                         {"type": "command", "command": "echo unrelated-hook"},
@@ -742,8 +742,8 @@ def test_init_claude_code_merge_preserves_custom_flags_matchers_and_unrelated_ho
         ss_entries[0]["hooks"][0]["command"]
         == "uvx compact-ledger hook session-start --max-chars 3000 --strict"
     )
-    # Second entry keeps its unrelated hook and does not duplicate compact-ledger
-    assert ss_entries[1]["matcher"] == "compact|resume"
+    # Second entry (same matcher "compact") drops duplicate compact-ledger hook, keeps unrelated
+    assert ss_entries[1]["matcher"] == "compact"
     assert ss_entries[1]["hooks"] == [{"type": "command", "command": "echo unrelated-hook"}]
 
     # PreCompact keeps custom matcher "auto" and --store-dir flag
@@ -828,3 +828,140 @@ def test_hook_tight_budget_bom_whitespace_store_and_task_notification_filter(
     tight_ctx = json.loads(tight_res.stdout)["hookSpecificOutput"]["additionalContext"]
     assert len(tight_ctx) <= 180 < len(full_ctx)
     assert "PIN_MUST_SURVIVE" in tight_ctx
+
+
+def test_init_merge_preserves_hand_edited_shell_commands_and_split_matchers(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # 1. Every hand-edited shell form stays byte-for-byte untouched on default re-run
+    hand_edited_commands = [
+        "compact-ledger hook pre-compact || true",
+        "compact-ledger hook pre-compact --strict 2>>/tmp/cl.log",
+        'compact-ledger hook pre-compact --store-dir "$CLAUDE_PROJECT_DIR/.compact-ledger"',
+        "COMPACT_LEDGER_DIR=/data/cl compact-ledger hook pre-compact",
+        "cd /repo && compact-ledger hook pre-compact",
+    ]
+    for raw_cmd in hand_edited_commands:
+        seed = {
+            "hooks": {
+                "PreCompact": [{"matcher": "", "hooks": [{"type": "command", "command": raw_cmd}]}]
+            }
+        }
+        merged = merge_claude_code_settings(seed)
+        assert merged["hooks"]["PreCompact"][0]["hooks"][0]["command"] == raw_cmd
+
+    # Prefix upgrade splices ONLY plain prefix, leaving trailing shell syntax intact
+    # and leaving env-prefixed / shell-wrapped commands untouched
+    for raw_cmd, expected in [
+        (
+            "compact-ledger hook pre-compact || true",
+            "uvx compact-ledger hook pre-compact || true",
+        ),
+        (
+            "compact-ledger hook pre-compact --strict 2>>/tmp/cl.log",
+            "uvx compact-ledger hook pre-compact --strict 2>>/tmp/cl.log",
+        ),
+        (
+            'compact-ledger hook pre-compact --store-dir "$CLAUDE_PROJECT_DIR/.compact-ledger"',
+            'uvx compact-ledger hook pre-compact --store-dir "$CLAUDE_PROJECT_DIR/.compact-ledger"',
+        ),
+        (
+            "COMPACT_LEDGER_DIR=/data/cl compact-ledger hook pre-compact",
+            "COMPACT_LEDGER_DIR=/data/cl compact-ledger hook pre-compact",
+        ),
+        (
+            "cd /repo && compact-ledger hook pre-compact",
+            "cd /repo && compact-ledger hook pre-compact",
+        ),
+    ]:
+        seed = {
+            "hooks": {
+                "PreCompact": [{"matcher": "", "hooks": [{"type": "command", "command": raw_cmd}]}]
+            }
+        }
+        upgraded = merge_claude_code_settings(seed, command="uvx compact-ledger")
+        assert upgraded["hooks"]["PreCompact"][0]["hooks"][0]["command"] == expected
+
+    # 2. Separate compact and resume SessionStart entries are BOTH preserved
+    split_seed = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "^compact$",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "compact-ledger hook session-start --max-chars 4000",
+                        }
+                    ],
+                },
+                {
+                    "matcher": "(resume)",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": "compact-ledger hook session-start --max-chars 6000",
+                        }
+                    ],
+                },
+            ]
+        }
+    }
+    merged_split = merge_claude_code_settings(split_seed)
+    assert merged_split["hooks"]["SessionStart"] == split_seed["hooks"]["SessionStart"]
+    # Regex matcher (compact|resume) is also recognized without adding a duplicate entry
+    regex_seed = {
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "(compact|resume)",
+                    "hooks": [{"type": "command", "command": "compact-ledger hook session-start"}],
+                }
+            ]
+        }
+    }
+    merged_regex = merge_claude_code_settings(regex_seed)
+    assert len(merged_regex["hooks"]["SessionStart"]) == 1
+
+    # 3. Print-only mode (without --write) works on a valid symlink without modifying anything
+    real_cfg = tmp_path / "real.json"
+    real_cfg.write_text('{"model": "keep"}\n', encoding="utf-8")
+    link_cfg = tmp_path / "link.json"
+    link_cfg.symlink_to(real_cfg)
+    rc = main(["init", "--claude-code", "--settings-path", str(link_cfg)])
+    assert rc == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["model"] == "keep"
+    assert "PreCompact" in preview["hooks"]
+    assert json.loads(real_cfg.read_text(encoding="utf-8")) == {"model": "keep"}
+
+
+def test_hook_broken_stderr_pipe_with_bad_flag_and_abbreviations() -> None:
+    import os
+
+    # 1. Broken stderr pipe + bad flag must exit 0 (NOT 120!)
+    read_fd, write_fd = os.pipe()
+    os.close(read_fd)
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-m", "compact_ledger", "hook", "pre-compact", "--bogus"],
+            input=b"{}",
+            stdout=subprocess.PIPE,
+            stderr=write_fd,
+            check=False,
+        )
+    finally:
+        os.close(write_fd)
+    assert proc.returncode == 0
+    assert proc.stdout == b""
+
+    # 2. Abbreviated flags (--store-di, --stric) are disabled via allow_abbrev=False
+    abbrev_open = subprocess.run(
+        [sys.executable, "-m", "compact_ledger", "hook", "pre-compact", "--stric"],
+        input=b"{broken",
+        capture_output=True,
+        check=False,
+    )
+    assert abbrev_open.returncode == 0
+    assert abbrev_open.stdout == b""

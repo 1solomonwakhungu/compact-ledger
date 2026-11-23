@@ -11,9 +11,9 @@ import contextlib
 import json
 import os
 import re
+import secrets
 import shlex
 import stat
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +46,9 @@ DEFAULT_CLAUDE_SETTINGS_RELPATH = Path(".claude") / "settings.json"
 SESSION_START_SOURCES: frozenset[str] = frozenset({"compact", "resume"})
 SESSION_START_MATCHER = "compact|resume"
 _MAX_STDIN_BYTES = 4 * 1024 * 1024  # 4 MiB hard cap for hook stdin payloads
-_COMPACTION_MATCHER_RE = re.compile(r"(?:^|\|)(?:compact|resume)(?:\||$)", re.IGNORECASE)
+_COMPACTION_MATCHER_RE = re.compile(r"\b(?:compact|resume)\b", re.IGNORECASE)
+_SHELL_META_RE = re.compile(r"(?:&&|\|\||[;|><`$])")
+_ENV_ASSIGN_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
 @dataclass(slots=True)
@@ -395,49 +397,78 @@ def _parse_tokens(cmd: str) -> list[str]:
         return cmd.split()
 
 
-def _match_compact_ledger_hook(
+def _is_compact_ledger_prefix_tokens(
+    prefix_tokens: list[str],
+    expected_prefix_tokens: list[str],
+) -> bool:
+    if not prefix_tokens:
+        return False
+    if prefix_tokens == expected_prefix_tokens:
+        return True
+    for tok in prefix_tokens:
+        base = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        if (
+            base
+            in (
+                "compact-ledger",
+                "compact-ledger.exe",
+                "compact_ledger",
+            )
+            or "compact-ledger" in base
+        ):
+            return True
+    return False
+
+
+def _match_and_rewrite_compact_ledger_hook(
     hook_item: Any,
     hook_subcommand: str,
     *,
+    command_prefix: str,
     expected_prefix_tokens: list[str],
-) -> tuple[bool, list[str]]:
-    """Check if ``hook_item`` is a compact-ledger command hook for ``hook_subcommand``.
+) -> tuple[bool, str | None]:
+    """Check if ``hook_item`` is a compact-ledger hook for ``hook_subcommand``.
 
-    Returns ``(is_match, trailing_args)`` where ``trailing_args`` preserves any
-    user-supplied CLI flags after ``hook <hook_subcommand>`` (such as
-    ``--max-chars``, ``--store-dir``, ``--strict``, or ``--always``).
+    Returns ``(is_match, updated_command)``:
+    - If not a compact-ledger hook, returns ``(False, None)``.
+    - If the prefix already matches, or the prefix contains shell operators
+      (e.g. ``cd /repo && ...``) or env assignments (e.g. ``COMPACT_LEDGER_DIR=...``),
+      returns the original command string **byte-for-byte untouched**.
+    - If the prefix is a plain compact-ledger prefix that differs from
+      ``command_prefix``, splices ONLY the prefix in the raw command string so
+      any trailing flags, redirections, pipes, ``|| true``, or ``"$VAR"``
+      expansions are preserved verbatim.
     """
     if not isinstance(hook_item, dict):
-        return False, []
+        return False, None
     if hook_item.get("type") != "command":
-        return False, []
+        return False, None
     cmd = hook_item.get("command")
     if not isinstance(cmd, str) or not cmd.strip():
-        return False, []
+        return False, None
 
-    tokens = _parse_tokens(cmd)
-    if len(tokens) < 3:
-        return False, []
+    raw_pattern = re.compile(
+        rf"^(?P<prefix>.*?)(?P<hook>\bhook\s+{re.escape(hook_subcommand)})(?P<suffix>(?:\s+.*)?)$"
+    )
+    match = raw_pattern.match(cmd.strip())
+    if match is None:
+        return False, None
 
-    for idx in range(len(tokens) - 1):
-        if tokens[idx] == "hook" and tokens[idx + 1] == hook_subcommand:
-            prefix_tokens = tokens[:idx]
-            trailing = tokens[idx + 2 :]
-            if prefix_tokens == expected_prefix_tokens:
-                return True, trailing
-            for tok in prefix_tokens:
-                base = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
-                if (
-                    base
-                    in (
-                        "compact-ledger",
-                        "compact-ledger.exe",
-                        "compact_ledger",
-                    )
-                    or "compact-ledger" in base
-                ):
-                    return True, trailing
-    return False, []
+    raw_prefix = match.group("prefix").strip()
+    raw_suffix = match.group("suffix")
+    prefix_tokens = _parse_tokens(raw_prefix)
+    if not _is_compact_ledger_prefix_tokens(prefix_tokens, expected_prefix_tokens):
+        return False, None
+
+    # Preserve byte-for-byte when prefix already matches or uses shell wrappers/env assignments.
+    if (
+        prefix_tokens == expected_prefix_tokens
+        or _SHELL_META_RE.search(raw_prefix)
+        or any(_ENV_ASSIGN_PREFIX_RE.match(tok) for tok in prefix_tokens)
+    ):
+        return True, cmd
+
+    return True, f"{command_prefix} hook {hook_subcommand}{raw_suffix}"
 
 
 def _matcher_covers_event(event_name: str, matcher_value: Any) -> bool:
@@ -499,8 +530,10 @@ def _upsert_event_hook(
     """Idempotently insert or update compact-ledger's hook entry for ``event_name``.
 
     - Never modifies unrelated hooks or their matchers.
-    - Preserves user-supplied CLI flags (e.g. ``--max-chars``, ``--store-dir``,
-      ``--strict``, ``--always``) and existing matchers on compact-ledger hooks.
+    - Preserves hand-edited shell syntax (``|| true``, redirections, ``$VAR``
+      expansions, env prefixes, ``cd ... &&``), CLI flags, and custom matchers.
+    - Deduplicates only within a single entry or across entries sharing the same
+      matcher, so separate ``compact`` and ``resume`` entries are both preserved.
     - For ``SessionStart``, leaves non-compaction custom entries (such as a
       ``startup`` matcher) untouched and ensures a compaction-covering entry exists.
     """
@@ -517,7 +550,8 @@ def _upsert_event_hook(
 
     base_command = _hook_command_for(command_prefix, hook_subcommand)
     expected_prefix_tokens = _parse_tokens(command_prefix)
-    found = False
+    found_any = False
+    seen_matchers: set[str] = set()
     updated_entries: list[Any] = []
 
     for entry in event_list:
@@ -530,30 +564,29 @@ def _upsert_event_hook(
             updated_entries.append(entry)
             continue
 
+        raw_matcher = entry.get("matcher")
+        matcher_key = raw_matcher.strip() if isinstance(raw_matcher, str) else ""
         entry_hooks = list(entry["hooks"])
         new_entry_hooks: list[Any] = []
         entry_had_match = False
 
         for h in entry_hooks:
-            is_match, trailing_args = _match_compact_ledger_hook(
+            is_match, rewritten_cmd = _match_and_rewrite_compact_ledger_hook(
                 h,
                 hook_subcommand,
+                command_prefix=command_prefix,
                 expected_prefix_tokens=expected_prefix_tokens,
             )
-            if is_match:
+            if is_match and rewritten_cmd is not None:
                 entry_had_match = True
-                if not found:
-                    rebuilt = (
-                        f"{base_command} {shlex.join(trailing_args)}"
-                        if trailing_args
-                        else base_command
-                    )
+                found_any = True
+                if matcher_key not in seen_matchers:
+                    seen_matchers.add(matcher_key)
                     updated_h = dict(h)
                     updated_h["type"] = "command"
-                    updated_h["command"] = rebuilt
+                    updated_h["command"] = rewritten_cmd
                     new_entry_hooks.append(updated_h)
-                    found = True
-                # Drop any duplicate compact-ledger hooks for the same event.
+                # Drop duplicate compact-ledger hooks within the same matcher.
             else:
                 new_entry_hooks.append(h)
 
@@ -565,7 +598,7 @@ def _upsert_event_hook(
         entry_copy["hooks"] = new_entry_hooks
         updated_entries.append(entry_copy)
 
-    if not found:
+    if not found_any:
         updated_entries.append(
             {
                 "matcher": matcher,
@@ -631,21 +664,30 @@ def _atomic_write_text(target: Path, content: str, *, mode: int | None = None) -
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=target.parent,
-            prefix=f".{target.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as tmp_file:
-            tmp_path = Path(tmp_file.name)
+        # Use os.open with mode 0o666 so new files respect the process umask atomically.
+        fd = -1
+        for _ in range(32):
+            candidate = target.parent / f".{target.name}.{secrets.token_hex(8)}.tmp"
+            try:
+                fd = os.open(
+                    candidate,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o666 if mode is None else mode,
+                )
+                tmp_path = candidate
+                break
+            except FileExistsError:
+                continue
+        if fd < 0 or tmp_path is None:
+            raise OSError(f"Failed to allocate temporary file in {target.parent}")
+
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
             tmp_file.write(content)
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
-        target_mode = mode if mode is not None else 0o644
-        with contextlib.suppress(OSError):
-            os.chmod(tmp_path, target_mode)
+        if mode is not None:
+            with contextlib.suppress(OSError):
+                os.chmod(tmp_path, mode)
         os.replace(tmp_path, target)
         tmp_path = None
         if hasattr(os, "O_RDONLY"):
@@ -671,8 +713,9 @@ def init_claude_code_settings(
     """Build or merge Claude Code settings and optionally write them atomically.
 
     Returns ``(merged_config, resolved_settings_path, wrote_file)``.
-    Raises ``ValueError`` if the settings path is a symlink or contains invalid
-    JSON or a non-object top-level structure (never corrupting the existing file).
+    Raises ``ValueError`` if ``write=True`` on a symlink, or if an existing
+    settings file contains invalid JSON or a non-object top-level structure
+    (never corrupting the existing file).
     """
     prefix = _validate_command_prefix(command)
     if settings_path is not None:
@@ -681,10 +724,15 @@ def init_claude_code_settings(
         base = cwd if cwd is not None else Path.cwd()
         target = base / DEFAULT_CLAUDE_SETTINGS_RELPATH
 
-    if target.is_symlink():
-        raise ValueError(f"Refusing to operate on symlinked settings file: {target}")
-    if target.parent.is_symlink():
-        raise ValueError(f"Refusing to operate on symlinked settings directory: {target.parent}")
+    if write:
+        if target.is_symlink():
+            raise ValueError(f"Refusing to operate on symlinked settings file: {target}")
+        if target.parent.is_symlink():
+            raise ValueError(
+                f"Refusing to operate on symlinked settings directory: {target.parent}"
+            )
+    elif target.is_symlink() and not target.exists():
+        raise ValueError(f"Settings path is a broken symlink: {target}")
 
     existing_data: dict[str, Any] | None = None
     existing_mode: int | None = None

@@ -104,7 +104,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "Override the compact-ledger store directory "
         "(default: .compact-ledger or COMPACT_LEDGER_DIR)."
     )
-    common = argparse.ArgumentParser(add_help=False)
+    common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     common.add_argument(
         "--store-dir",
         default=argparse.SUPPRESS,
@@ -114,6 +114,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="compact-ledger",
         description="Deterministic, zero-LLM compaction memory injector for AI coding agents.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--version",
@@ -236,6 +237,7 @@ def _build_parser() -> argparse.ArgumentParser:
     hook_parser = subparsers.add_parser(
         "hook",
         parents=[common],
+        allow_abbrev=False,
         help="Run Claude Code lifecycle hooks (pre-compact / session-start).",
     )
     hook_subparsers = hook_parser.add_subparsers(dest="hook_command")
@@ -243,6 +245,7 @@ def _build_parser() -> argparse.ArgumentParser:
     pre_compact_parser = hook_subparsers.add_parser(
         "pre-compact",
         parents=[common],
+        allow_abbrev=False,
         help="Read Claude Code PreCompact JSON from stdin and save a snapshot.",
     )
     pre_compact_parser.add_argument(
@@ -255,6 +258,7 @@ def _build_parser() -> argparse.ArgumentParser:
     session_start_parser = hook_subparsers.add_parser(
         "session-start",
         parents=[common],
+        allow_abbrev=False,
         help="Read Claude Code SessionStart JSON from stdin and inject the bounded ledger.",
     )
     session_start_parser.add_argument(
@@ -616,6 +620,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             args = parser.parse_args(effective_argv)
     except SystemExit as exc:
         if hook_fail_open and exc.code not in (0, None):
+            if sys.stderr is not None:
+                try:
+                    sys.stderr.flush()
+                except OSError:
+                    _neutralize_broken_stdio(sys.stderr)
             return 0
         raise
     except (OSError, AttributeError):
