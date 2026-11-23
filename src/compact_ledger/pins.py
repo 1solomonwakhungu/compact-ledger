@@ -529,6 +529,141 @@ _SWITCH_TO_Y_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Positive adoption phrases used to retire earlier active negative constraints that
+# directly forbid the newly adopted target (e.g., "Never use spaces." retired by
+# "Actually use 2 spaces instead of tabs.").
+_ADOPT_DIRECTIVE_RE = re.compile(
+    r"\b(?:use|stick (?:with|to)|go with|switch to|prefer|pick|choose|adopt|enable|allow) "
+    r"([^.!?;,]{1,60})",
+    re.IGNORECASE,
+)
+_ADOPT_BOUNDARY_RE = re.compile(
+    r"\b(?:instead of|rather than|over|for|in|on|under|inside|within|when|because|so|to|not)\b",
+    re.IGNORECASE,
+)
+_PROHIBIT_VERB_RE = re.compile(
+    r"\b(?:never|do not|don't|must not|mustn't|should not|shouldn't|cannot|can't|"
+    r"avoid|stop|disallow|forbid|prohibit) (?:ever )?"
+    r"(?:use|using|add|adding|import|importing|install|installing|allow|allowing|"
+    r"enable|enabling|prefer|pick|picking|choose|choosing) ([^.!?;,]{1,80})",
+    re.IGNORECASE,
+)
+_PROHIBIT_BARE_NO_RE = re.compile(
+    r"(?:^|[,;:] )(?:no|avoid|never|forbid|prohibit|disallow) ([^.!?;,]{1,60})",
+    re.IGNORECASE,
+)
+_PROHIBIT_IS_FORBIDDEN_RE = re.compile(
+    r"(?:^|[,;:] )([a-z0-9_./-]{2,40}(?: [a-z0-9_./-]{1,30}){0,2}) "
+    r"(?:is|are) (?:forbidden|prohibited|disallowed|not allowed)\b",
+    re.IGNORECASE,
+)
+_PROHIBIT_SCOPE_PREP_RE = re.compile(
+    r" (?:in|for|on|under|inside|within|when|during|at) (.+)$",
+    re.IGNORECASE,
+)
+_NON_NOUN_PROHIBIT_STARTS: frozenset[str] = frozenset(
+    {
+        "use",
+        "using",
+        "add",
+        "adding",
+        "import",
+        "importing",
+        "install",
+        "installing",
+        "touch",
+        "touching",
+        "modify",
+        "modifying",
+        "edit",
+        "editing",
+        "change",
+        "changing",
+        "changes",
+        "edits",
+        "modifications",
+        "break",
+        "breaking",
+        "delete",
+        "deleting",
+        "remove",
+        "removing",
+        "push",
+        "pushing",
+        "commit",
+        "committing",
+        "drop",
+        "dropping",
+        "skip",
+        "skipping",
+        "run",
+        "running",
+        "call",
+        "calling",
+        "leak",
+        "leaking",
+        "expose",
+        "exposing",
+        "mutate",
+        "mutating",
+        "write",
+        "writing",
+        "writes",
+        "rewrite",
+        "rewriting",
+        "leave",
+        "leaving",
+        "mention",
+        "mentioning",
+        "new",
+        "more",
+        "extra",
+        "additional",
+    }
+)
+_GENERIC_CONTRADICTION_TOKENS: frozenset[str] = frozenset(
+    {
+        "default",
+        "value",
+        "option",
+        "setting",
+        "config",
+        "mode",
+        "type",
+        "data",
+        "item",
+        "list",
+        "string",
+        "number",
+        "line",
+        "text",
+        "output",
+        "input",
+        "format",
+        "style",
+        "test",
+        "name",
+        "path",
+        "method",
+        "function",
+        "class",
+        "version",
+        "tool",
+        "command",
+        "script",
+        "package",
+        "library",
+        "module",
+        "service",
+        "server",
+        "client",
+        "system",
+        "state",
+        "error",
+        "result",
+    }
+)
+
 # Navigation targets ("switch to the main branch", "switch to the tests directory")
 _WORKSPACE_NAV_TARGET_RE = re.compile(
     r"\b(?:branch|directory|dir|folder|repo|repository|worktree|tab|window|terminal)\b",
@@ -757,6 +892,7 @@ class _OverrideSignal:
     is_unscoped_retraction: bool
     is_explicit_retraction: bool
     lifts_negation: bool
+    adopted_values: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -1027,6 +1163,120 @@ def _has_directive_sentence(sentences: Sequence[str]) -> bool:
     return False
 
 
+def _trim_adopted_phrase(raw: str) -> str:
+    """Trim trailing contrast/scope clauses from an adopted target phrase."""
+    match = _ADOPT_BOUNDARY_RE.search(raw)
+    trimmed = raw[: match.start()] if match else raw
+    cleaned = _clean_phrase(trimmed)
+    if not cleaned or _INFINITIVE_PURPOSE_START_RE.match(cleaned):
+        return ""
+    if _WORKSPACE_NAV_TARGET_RE.search(cleaned):
+        return ""
+    return cleaned
+
+
+def _core_non_numeric_tokens(text: str) -> frozenset[str]:
+    """Return canonical content tokens without bare numbers (e.g. '2 spaces' -> {'space'})."""
+    return frozenset(
+        tok
+        for tok in _extract_content_tokens(text)
+        if not tok.isdigit() and not _ORDINAL_DAY_RE.fullmatch(tok)
+    )
+
+
+def _extract_prohibited_targets(text: str) -> list[tuple[str, frozenset[str], frozenset[str]]]:
+    """Extract ``(clean_target, core_tokens, scope_tokens)`` forbidden by a negative constraint."""
+    prose = _normalize_prose(text)
+    if not prose:
+        return []
+
+    found: list[tuple[str, frozenset[str], frozenset[str]]] = []
+    seen: set[tuple[frozenset[str], frozenset[str]]] = set()
+
+    def _record(raw_span: str, *, allow_verb_start: bool) -> None:
+        span = raw_span.strip()
+        if not span:
+            return
+        scope_match = _PROHIBIT_SCOPE_PREP_RE.search(span)
+        if scope_match:
+            target_part = span[: scope_match.start()]
+            scope_part = scope_match.group(1)
+        else:
+            target_part = span
+            scope_part = ""
+        clean_target = _clean_phrase(target_part)
+        if not clean_target:
+            return
+        if not allow_verb_start:
+            first_word = clean_target.split(" ", 1)[0].lower()
+            if first_word in _NON_NOUN_PROHIBIT_STARTS:
+                return
+        core_toks = _core_non_numeric_tokens(clean_target)
+        if not core_toks:
+            return
+        scope_toks = _extract_content_tokens(scope_part) if scope_part else frozenset()
+        key = (core_toks, scope_toks)
+        if key not in seen:
+            seen.add(key)
+            found.append((clean_target.lower(), core_toks, scope_toks))
+
+    for raw_sent in _split_sentences(prose):
+        if _is_pure_info_question(raw_sent):
+            continue
+        sent = _strip_terminal_punct(raw_sent)
+        if not sent:
+            continue
+        for m in _bounded_finditer(_PROHIBIT_VERB_RE, sent):
+            _record(m.group(1), allow_verb_start=True)
+        for m in _bounded_finditer(_PROHIBIT_BARE_NO_RE, sent):
+            _record(m.group(1), allow_verb_start=False)
+        for m in _bounded_finditer(_PROHIBIT_IS_FORBIDDEN_RE, sent):
+            _record(m.group(1), allow_verb_start=False)
+
+    return found
+
+
+def _contradicts_negative_pin(
+    adopted_specs: Sequence[tuple[str, frozenset[str]]],
+    override_tokens: frozenset[str],
+    old_val_tokens: frozenset[str],
+    candidate: PinEntry,
+    candidate_own_tokens: frozenset[str],
+    candidate_prohibited: Sequence[tuple[str, frozenset[str], frozenset[str]]],
+) -> bool:
+    """Return True if an override's adopted target directly contradicts an active negative pin.
+
+    False-positive guards:
+    - Candidate must be an active negative constraint with explicit prohibited targets.
+    - Every core non-numeric token of the prohibited target must appear in the adopted target
+      (so "Never use trailing spaces" is NOT retired by "Actually use 2 spaces").
+    - Single overly generic tokens (e.g. "value", "option", "config") never trigger retirement.
+    - Scoped negative constraints (e.g. "Never use spaces in filenames.") are NOT retired
+      unless the override mentions the scope or shares an explicit old value with the candidate.
+    """
+    if not candidate.is_negative or not adopted_specs or not candidate_prohibited:
+        return False
+
+    for _, adopted_core in adopted_specs:
+        if not adopted_core:
+            continue
+        for _, prohib_core, scope_toks in candidate_prohibited:
+            if not prohib_core:
+                continue
+            if len(prohib_core) == 1 and next(iter(prohib_core)) in _GENERIC_CONTRADICTION_TOKENS:
+                continue
+            if not prohib_core.issubset(adopted_core):
+                continue
+            if (
+                scope_toks
+                and not (scope_toks & override_tokens)
+                and not (old_val_tokens and (old_val_tokens & candidate_own_tokens))
+            ):
+                continue
+            return True
+    return False
+
+
 def _detect_override_signal(text: str) -> _OverrideSignal | None:
     """Inspect ``text`` for superseding correction / override cues in O(N) time."""
     prose = _normalize_prose(text)
@@ -1045,11 +1295,17 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
     lifts_negation = False
     old_values: list[str] = []
     topic_hints: list[str] = []
+    adopted_values: list[str] = []
 
     def _add_unique(target: list[str], value: str) -> None:
         cleaned = _clean_phrase(value)
         if cleaned and cleaned.lower() not in {v.lower() for v in target}:
             target.append(cleaned)
+
+    def _add_adopted(raw: str) -> None:
+        trimmed = _trim_adopted_phrase(raw)
+        if trimmed:
+            _add_unique(adopted_values, trimmed)
 
     for raw_sent in non_question_sentences:
         sent = _strip_terminal_punct(raw_sent)
@@ -1205,6 +1461,7 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
             if m.group(1):
                 _add_unique(topic_hints, m.group(1))
             _add_unique(old_values, m.group(2))
+            _add_adopted(m.group(3))
 
         # 10. "replace <OLD> with <NEW>" (directive position only)
         for m in _bounded_finditer(_REPLACE_X_WITH_Y_RE, sent):
@@ -1212,6 +1469,7 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
                 continue
             hard = True
             _add_unique(old_values, m.group(1))
+            _add_adopted(m.group(2))
 
         # 11. "change/switch <OLD> to <NEW>" (directive position, not from..to, not infinitive)
         if not old_values:
@@ -1229,6 +1487,7 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
                     hard = True
                     _add_unique(old_values, lhs)
                     _add_unique(topic_hints, lhs)
+                    _add_adopted(m.group(2))
 
         # 12. "update the <TOPIC> to <NEW>" (soft override cue; skip infinitives)
         for m in _bounded_finditer(_UPDATE_TOPIC_TO_Y_RE, sent):
@@ -1244,6 +1503,7 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
             ):
                 soft = True
                 _add_unique(topic_hints, topic)
+                _add_adopted(m.group(2))
 
         # 13. "switch to <NEW>" (soft override cue; skip infinitives & workspace navigation)
         if not old_values:
@@ -1257,6 +1517,7 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
                     and not _WORKSPACE_NAV_TARGET_RE.search(rhs)
                 ):
                     soft = True
+                    _add_adopted(m.group(1))
 
         # 14. Soft "actually" ONLY when accompanied by a directive/constraint and NOT additive
         if (
@@ -1274,6 +1535,16 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
     if not hard and not soft:
         return None
 
+    # Extract explicit positive adoption targets from non-negated directive clauses.
+    for raw_sent in non_question_sentences:
+        sent = _strip_terminal_punct(raw_sent)
+        if not sent:
+            continue
+        for m in _bounded_finditer(_ADOPT_DIRECTIVE_RE, sent):
+            if _is_negated_or_conditional_clause(sent, m.start()):
+                continue
+            _add_adopted(m.group(1))
+
     if old_values or topic_hints:
         unscoped_retraction = False
 
@@ -1284,6 +1555,7 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
         is_unscoped_retraction=unscoped_retraction,
         is_explicit_retraction=explicit_retraction,
         lifts_negation=lifts_negation,
+        adopted_values=tuple(adopted_values),
     )
 
 
@@ -1677,8 +1949,18 @@ def extract_pins(
       repeated retractions (e.g., ``Scratch that.`` used twice on separate rules).
     """
     result: list[PinEntry] = []
-    # pin_id -> (order_idx, own_tokens, chain_tokens, norm_lower_prose, has_date)
-    pin_meta: dict[str, tuple[int, frozenset[str], frozenset[str], str, bool]] = {}
+    # pin_id -> (order_idx, own_tokens, chain_tokens, norm_lower, has_date, prohibited_targets)
+    pin_meta: dict[
+        str,
+        tuple[
+            int,
+            frozenset[str],
+            frozenset[str],
+            str,
+            bool,
+            tuple[tuple[str, frozenset[str], frozenset[str]], ...],
+        ],
+    ] = {}
     # Inverted index: canonical token -> active pins containing that token (newest at tail)
     token_index: dict[str, list[PinEntry]] = {}
     # Prefix bucket (first 4 chars) for abbreviation topic hints ("auth" <-> "authentication")
@@ -1697,7 +1979,15 @@ def extract_pins(
     ) -> None:
         order_idx = len(result)
         result.append(pin)
-        pin_meta[pin.pin_id] = (order_idx, own_tokens, chain_tokens, norm_lower, has_date)
+        prohibited = tuple(_extract_prohibited_targets(pin.text)) if pin.is_negative else ()
+        pin_meta[pin.pin_id] = (
+            order_idx,
+            own_tokens,
+            chain_tokens,
+            norm_lower,
+            has_date,
+            prohibited,
+        )
         for tok in chain_tokens:
             token_index.setdefault(tok, []).append(pin)
             if len(tok) >= 4:
@@ -1801,6 +2091,7 @@ def extract_pins(
         norm_lower = " ".join(_normalize_prose(clean_text).lower().split())
         override_has_date = bool(_DATE_VALUE_RE.search(norm_lower))
         superseded_target: PinEntry | None = None
+        contradicted_negatives: list[PinEntry] = []
 
         if signal is not None:
             # Precompute normalized phrases and tokens ONCE per override turn (not per candidate)
@@ -1810,6 +2101,11 @@ def extract_pins(
             hint_specs = [
                 (_clean_phrase(h).lower(), _extract_content_tokens(h)) for h in signal.topic_hints
             ]
+            adopted_specs = [
+                (_clean_phrase(a).lower(), _core_non_numeric_tokens(a))
+                for a in signal.adopted_values
+            ]
+            all_old_val_tokens = frozenset(tok for _, toks in old_val_specs for tok in toks)
 
             # Gather up to _MAX_BUCKET_SCAN newest active candidates per token (strictly O(1))
             query_tokens: set[str] = set(own_tokens)
@@ -1817,6 +2113,8 @@ def extract_pins(
                 query_tokens.update(old_toks)
             for _, hint_toks in hint_specs:
                 query_tokens.update(hint_toks)
+            for _, adopted_toks in adopted_specs:
+                query_tokens.update(adopted_toks)
 
             candidate_map: dict[str, PinEntry] = {}
 
@@ -1862,7 +2160,7 @@ def extract_pins(
             best_score = 0
             best_candidate: PinEntry | None = None
             for cand in eligible:
-                _, cand_own, cand_chain, cand_norm_lower, cand_has_date = pin_meta[cand.pin_id]
+                _, cand_own, cand_chain, cand_norm_lower, cand_has_date, _ = pin_meta[cand.pin_id]
                 score = _score_supersede_candidate(
                     signal=signal,
                     override_tokens=own_tokens,
@@ -1890,6 +2188,28 @@ def extract_pins(
                 and not (unit.longform and prev_non_chatter_pin.turn_index == turn.turn_index)
             ):
                 superseded_target = prev_non_chatter_pin
+
+            # Also find earlier active negative constraints directly contradicted by the
+            # target adopted in this override (e.g. "Never use spaces." retired when
+            # "Actually use 2 spaces instead of tabs." supersedes "Use tabs.").
+            if adopted_specs:
+                for cand in eligible:
+                    if cand is superseded_target or not cand.is_negative or cand.source == "manual":
+                        continue
+                    if cand.turn_index is not None and cand.turn_index >= turn.turn_index:
+                        continue
+                    _, cand_own, _, _, _, cand_prohibited = pin_meta[cand.pin_id]
+                    if _contradicts_negative_pin(
+                        adopted_specs,
+                        own_tokens,
+                        all_old_val_tokens,
+                        cand,
+                        cand_own,
+                        cand_prohibited,
+                    ):
+                        contradicted_negatives.append(cand)
+                if superseded_target is None and contradicted_negatives:
+                    superseded_target = contradicted_negatives.pop(0)
 
         if (
             unit.longform
@@ -1947,7 +2267,7 @@ def extract_pins(
             old_norm = normalize_pin_text(superseded_target.text)
             if active_by_norm.get(old_norm) is superseded_target:
                 active_by_norm.pop(old_norm, None)
-            _, _, prev_chain, _, prev_has_date = pin_meta[superseded_target.pin_id]
+            _, _, prev_chain, _, prev_has_date, _ = pin_meta[superseded_target.pin_id]
             # Cap inherited chain tokens to _MAX_CHAIN_TOKENS so long chains stay O(1)/step
             merged = set(own_tokens)
             if len(merged) < _MAX_CHAIN_TOKENS:
@@ -1960,6 +2280,12 @@ def extract_pins(
                             break
             chain_tokens = frozenset(merged)
             override_has_date = override_has_date or prev_has_date
+
+        for extra_neg in contradicted_negatives:
+            extra_neg.superseded_by = new_pin.pin_id
+            neg_norm = normalize_pin_text(extra_neg.text)
+            if active_by_norm.get(neg_norm) is extra_neg:
+                active_by_norm.pop(neg_norm, None)
 
         seen_pin_ids.add(new_pin.pin_id)
         active_by_norm[norm] = new_pin
