@@ -1248,14 +1248,40 @@ def _extract_target_tokens(text: str) -> tuple[frozenset[str], frozenset[str]]:
     return frozenset(idents), frozenset(nums)
 
 
+_ADOPT_HEADER_COLON_RE = re.compile(
+    r"(?:correction|override|update|change of plan|new rule|revised rule|updated rule)$",
+    re.IGNORECASE,
+)
+_PARENTHETICAL_NEG_RE = re.compile(
+    r"\b(?:never|do not|don't|must not|mustn't|should not|shouldn't|cannot|can't|"
+    r"avoid|stop|no longer)\s*,\s*[^,]{1,50},\s*$",
+    re.IGNORECASE,
+)
+
+
 def _is_directive_adopt_prefix(sentence: str, pos: int) -> bool:
     """Return True if the clause prefix before ``pos`` is in directive position."""
     window_start = max(0, pos - _NEGATION_LOOKBACK_CHARS)
-    prefix = sentence[window_start:pos]
-    for sep in (";", ":", ",", " but "):
+    raw_prefix = sentence[window_start:pos]
+    if _PARENTHETICAL_NEG_RE.search(raw_prefix):
+        return False
+    prefix = raw_prefix
+    for sep in (";", " but "):
         idx = prefix.lower().rfind(sep)
         if idx != -1:
             prefix = prefix[idx + len(sep) :]
+    colon_idx = prefix.rfind(":")
+    if colon_idx != -1:
+        before_colon = prefix[:colon_idx].strip()
+        if _ADOPT_HEADER_COLON_RE.search(before_colon):
+            prefix = prefix[colon_idx + 1 :]
+        elif _CLAUSE_NEGATION_RE.search(before_colon):
+            return False
+        else:
+            prefix = prefix[colon_idx + 1 :]
+    comma_idx = prefix.rfind(",")
+    if comma_idx != -1:
+        prefix = prefix[comma_idx + 1 :]
     prefix = prefix.strip()
     if not prefix:
         return True
@@ -2225,6 +2251,7 @@ def extract_pins(
         norm_lower = " ".join(_normalize_prose(clean_text).lower().split())
         override_has_date = bool(_DATE_VALUE_RE.search(norm_lower))
         superseded_target: PinEntry | None = None
+        primary_was_contradicted_ban = False
         contradicted_negatives: list[PinEntry] = []
         adopted_specs: list[tuple[str, frozenset[str], frozenset[str], frozenset[str]]] = []
         all_old_val_tokens: frozenset[str] = frozenset()
@@ -2347,6 +2374,7 @@ def extract_pins(
                         contradicted_negatives.append(cand)
                 if superseded_target is None and contradicted_negatives:
                     superseded_target = contradicted_negatives.pop(0)
+                    primary_was_contradicted_ban = True
 
         if (
             unit.longform
@@ -2418,9 +2446,10 @@ def extract_pins(
             chain_tokens = frozenset(merged)
             override_has_date = override_has_date or prev_has_date
 
-            # If the superseded override had retired extra contradictory negative constraints,
-            # either keep them retired (if this newer override still contradicts them) or
-            # reactivate them (e.g. on "Scratch that." or switching back to the old choice).
+            # If the superseded override had retired contradictory negative constraints
+            # (either as extra bans or as its promoted primary target), either keep them
+            # retired (if this newer override still contradicts them) or reactivate them
+            # (e.g. on "Scratch that." or switching back to the old choice).
             prev_extra_bans = extra_retired_by.pop(superseded_target.pin_id, [])
             for ban in prev_extra_bans:
                 _, ban_own, _, _, _, ban_prohibited = pin_meta[ban.pin_id]
@@ -2442,9 +2471,14 @@ def extract_pins(
                     extra_retired_by.setdefault(new_pin.pin_id, []).append(ban)
                 else:
                     ban.superseded_by = None
+                    if superseded_target.supersedes == ban.pin_id:
+                        superseded_target.supersedes = None
                     ban_norm = normalize_pin_text(ban.text)
                     if ban_norm:
                         active_by_norm[ban_norm] = ban
+
+        if primary_was_contradicted_ban and superseded_target is not None:
+            extra_retired_by.setdefault(new_pin.pin_id, []).append(superseded_target)
 
         for extra_neg in contradicted_negatives:
             extra_neg.superseded_by = new_pin.pin_id

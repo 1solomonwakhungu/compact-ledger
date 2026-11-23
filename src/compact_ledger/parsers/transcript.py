@@ -828,6 +828,21 @@ class _FallbackPatchRecord:
     moves: list[tuple[str | None, str | None, str]]
 
 
+def _paths_overlap(a_paths: frozenset[str], b_paths: frozenset[str]) -> bool:
+    """Return True if two path sets share an exact or relative/absolute suffix match."""
+    if not a_paths or not b_paths:
+        return False
+    if a_paths & b_paths:
+        return True
+    norm_a = [p.replace("\\", "/").lstrip("./") for p in a_paths]
+    norm_b = [p.replace("\\", "/").lstrip("./") for p in b_paths]
+    for a in norm_a:
+        for b in norm_b:
+            if a == b or a.endswith("/" + b) or b.endswith("/" + a):
+                return True
+    return False
+
+
 def _extract_patch_paths(patch_text: str) -> frozenset[str]:
     """Quickly collect file paths referenced by an ``apply_patch`` payload."""
     paths: set[str] = set()
@@ -1377,7 +1392,9 @@ def parse_codex_records(
         if paths:
             for pending in live:
                 for idx, exp_paths in enumerate(pending.expected_patch_paths):
-                    if idx not in pending.matched_patch_indices and (exp_paths & paths):
+                    if idx not in pending.matched_patch_indices and _paths_overlap(
+                        exp_paths, paths
+                    ):
                         pending.matched_patch_indices.add(idx)
                         return True
         for pending in live:
@@ -1386,6 +1403,15 @@ def parse_codex_records(
                     pending.matched_patch_indices.add(idx)
                     return True
         return False
+
+    def _enqueue_fallback_cmd(exe: ToolExecution) -> None:
+        # Drop any stale queued fallbacks for the same command from earlier exec calls so a
+        # late event from a newer run can never overwrite an older run's record.
+        if exe.command:
+            fallback_cmd_execs[:] = [
+                prev for prev in fallback_cmd_execs if prev.command != exe.command
+            ]
+        fallback_cmd_execs.append(exe)
 
     def _reconcile_fallback_cmd(
         cmd: str | None,
@@ -1398,7 +1424,8 @@ def parse_codex_records(
     ) -> bool:
         if not cmd:
             return False
-        for idx, fb_exec in enumerate(fallback_cmd_execs):
+        for idx in range(len(fallback_cmd_execs) - 1, -1, -1):
+            fb_exec = fallback_cmd_execs[idx]
             if fb_exec.command == cmd:
                 fb_exec.output = output
                 fb_exec.exit_code = exit_code
@@ -1414,8 +1441,9 @@ def parse_codex_records(
     def _remove_fallback_patch(paths: frozenset[str]) -> bool:
         if not paths:
             return False
-        for idx, fb in enumerate(fallback_patch_records):
-            if fb.paths & paths:
+        for idx in range(len(fallback_patch_records) - 1, -1, -1):
+            fb = fallback_patch_records[idx]
+            if _paths_overlap(fb.paths, paths):
                 drop_ids = {id(e) for e in fb.edits}
                 file_edits[:] = [e for e in file_edits if id(e) not in drop_ids]
                 if fb.moves:
@@ -1472,24 +1500,28 @@ def parse_codex_records(
                             )
                         )
 
-        unmatched_cmds = [
-            cmd
+        unmatched_cmd_pairs = [
+            (idx, cmd)
             for idx, cmd in enumerate(pending.expected_cmds)
             if idx not in pending.matched_cmd_indices
         ]
-        if unmatched_cmds:
+        if unmatched_cmd_pairs:
             structured = _extract_codex_exec_results(unwrapped_body)
             if structured is not None:
-                # Align to the tail when fewer structured results were printed than commands run.
-                offset = max(0, len(unmatched_cmds) - len(structured))
-                for idx, formatted_cmd in enumerate(unmatched_cmds):
-                    res_idx = idx - offset
+                # Align structured results against ALL expected commands (tail-aligned when
+                # fewer results were printed than calls) so partial in-window claims keep exact
+                # index alignment.
+                total_expected = len(pending.expected_cmds)
+                offset = max(0, total_expected - len(structured))
+                first_emitted = True
+                for orig_idx, formatted_cmd in unmatched_cmd_pairs:
+                    res_idx = orig_idx - offset
                     if 0 <= res_idx < len(structured):
                         out_text, ec = structured[res_idx]
                     else:
                         out_text, ec = "", None
                     is_err = (ec is not None and ec != 0) or (
-                        script_failed and ec is None and idx == len(unmatched_cmds) - 1
+                        script_failed and ec is None and orig_idx == total_expected - 1
                     )
                     exe = ToolExecution(
                         turn_index=pending.turn_index,
@@ -1501,16 +1533,17 @@ def parse_codex_records(
                         timestamp=ts,
                         call_id=(
                             pending.call_id
-                            if len(unmatched_cmds) == 1
-                            else (f"{pending.call_id}#{idx}" if pending.call_id else None)
+                            if len(unmatched_cmd_pairs) == 1
+                            else (f"{pending.call_id}#{orig_idx}" if pending.call_id else None)
                         ),
-                        seq=pending.seq if idx == 0 else _next_seq(),
+                        seq=pending.seq if first_emitted else _next_seq(),
                     )
+                    first_emitted = False
                     tool_executions.append(exe)
-                    fallback_cmd_execs.append(exe)
+                    _enqueue_fallback_cmd(exe)
             elif not is_eof_leftover:
-                for idx, formatted_cmd in enumerate(unmatched_cmds):
-                    is_last = idx == len(unmatched_cmds) - 1
+                for pos, (orig_idx, formatted_cmd) in enumerate(unmatched_cmd_pairs):
+                    is_last = pos == len(unmatched_cmd_pairs) - 1
                     out_text = unwrapped_body if is_last else ""
                     ec = header_exit if is_last else None
                     is_err = is_last and (script_failed or (ec is not None and ec != 0))
@@ -1524,13 +1557,13 @@ def parse_codex_records(
                         timestamp=ts,
                         call_id=(
                             pending.call_id
-                            if len(unmatched_cmds) == 1
-                            else (f"{pending.call_id}#{idx}" if pending.call_id else None)
+                            if len(unmatched_cmd_pairs) == 1
+                            else (f"{pending.call_id}#{orig_idx}" if pending.call_id else None)
                         ),
-                        seq=pending.seq if idx == 0 else _next_seq(),
+                        seq=pending.seq if pos == 0 else _next_seq(),
                     )
                     tool_executions.append(exe)
-                    fallback_cmd_execs.append(exe)
+                    _enqueue_fallback_cmd(exe)
         elif (
             not pending.expected_cmds
             and not pending.expected_patches

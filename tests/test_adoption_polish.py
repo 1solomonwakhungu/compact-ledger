@@ -1158,6 +1158,267 @@ def test_m1_retracting_override_reactivates_extra_retired_ban() -> None:
     )
     assert "Never use spaces." in _active_texts(back_to_tabs)
 
+    # Primary-promoted ban (no positive "Use tabs." rule) ALSO reactivates on Scratch that / revert
+    # AND reappears in rendered Markdown!
+    from compact_ledger.models import CompactionSnapshot
+
+    solo_scratch = extract_pins(
+        _turns("Never use spaces.", "Actually use 2 spaces.", "Scratch that.")
+    )
+    assert "Never use spaces." in _active_texts(solo_scratch)
+    md_scratch = render_snapshot(CompactionSnapshot(session_id="solo-scratch", pins=solo_scratch))
+    assert "Never use spaces." in md_scratch
+
+    solo_revert = extract_pins(
+        _turns(
+            "Never use spaces.",
+            "Actually use 2 spaces.",
+            "Actually use tabs instead of spaces.",
+        )
+    )
+    assert "Never use spaces." in _active_texts(solo_revert)
+    md_revert = render_snapshot(CompactionSnapshot(session_id="solo-revert", pins=solo_revert))
+    assert "Never use spaces." in md_revert
+
+    # Negation across parenthetical comma or colon does NOT extract a false adoption
+    assert "Never use tabs." in _active_texts(
+        extract_pins(
+            _turns("Never use tabs.", "Actually you must never, under any circumstances, use tabs.")
+        )
+    )
+    assert "Never use mocks." in _active_texts(
+        extract_pins(_turns("Never use mocks.", "Actually stop: use fewer mocks."))
+    )
+
+
+def test_codex_stale_fallback_queue_partial_claims_and_absolute_late_file_change() -> None:
+    fail_out = (
+        "=================================== FAILURES ===================================\n"
+        "_________________________________ test_x _______________________________________\n"
+        ">       assert calc() == 100\n"
+        "E       assert 400 == 100\n\n"
+        "tests/test_x.py:10: AssertionError\n"
+        "=========================== short test summary info ============================\n"
+        "FAILED tests/test_x.py::test_x - assert 400 == 100\n"
+        "============================== 1 failed in 0.04s ===============================\n"
+    )
+    # 1. Run 1 fails (no event), run 2 passes with a late event -> run 1 MUST NOT be overwritten!
+    records: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": {"id": "codex-stale"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "run1",
+                "input": 'await tools.exec_command({cmd: "pytest tests/test_x.py"});',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "run1",
+                "output": json.dumps({"exit_code": 1, "output": fail_out}),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "run2",
+                "input": 'await tools.exec_command({cmd: "pytest tests/test_x.py"});',
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "run2",
+                "output": "Script running with cell ID g1:2",
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "ev-run2",
+                    "command": ["pytest", "tests/test_x.py"],
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregated_output": "1 passed in 0.02s\n",
+                },
+            },
+        },
+    ]
+    parsed = parse_transcript_lines(_jsonl(records))
+    assert len(parsed.tool_executions) == 2
+    assert parsed.tool_executions[0].exit_code == 1
+    assert parsed.tool_executions[1].exit_code == 0
+    _, trajs, _ = build_attempt_ledger(parsed)
+    assert len(trajs) == 1
+    assert trajs[0].status == "RESOLVED"
+
+    # 2. Partial in-window claim + both structured results printed -> 2nd cmd gets 2nd result!
+    partial_records: list[dict[str, object]] = [
+        {"type": "session_meta", "payload": {"id": "codex-partial"}},
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "p1",
+                "input": (
+                    'await Promise.all([tools.exec_command({cmd: "ruff check ."}), '
+                    'tools.exec_command({cmd: "pytest -q"})]);'
+                ),
+            },
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "ev-ruff",
+                    "command": ["ruff", "check", "."],
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregated_output": "All checks passed!",
+                },
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call_output",
+                "call_id": "p1",
+                "output": json.dumps(
+                    [
+                        {"exit_code": 0, "output": "All checks passed!"},
+                        {"exit_code": 1, "output": "1 failed"},
+                    ]
+                ),
+            },
+        },
+        # 3. Late FileChange with absolute path replaces relative fallback patch cleanly
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "custom_tool_call",
+                "name": "exec",
+                "call_id": "p_abs",
+                "input": (
+                    'await tools.apply_patch("*** Begin Patch\\n'
+                    '*** Update File: src/a.py\\n@@\\n-1\\n+2\\n*** End Patch");'
+                ),
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {"type": "custom_tool_call_output", "call_id": "p_abs", "output": "{}"},
+        },
+        {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "item": {
+                    "type": "FileChange",
+                    "id": "fc-abs",
+                    "status": "completed",
+                    "changes": {
+                        "/work/proj/src/a.py": {
+                            "type": "update",
+                            "unified_diff": "@@ -1,1 +1,1 @@\n-1\n+2\n",
+                        }
+                    },
+                },
+            },
+        },
+    ]
+    parsed_partial = parse_transcript_lines(_jsonl(partial_records))
+    by_cmd = {e.command: e for e in parsed_partial.tool_executions}
+    assert by_cmd["ruff check ."].exit_code == 0
+    assert by_cmd["pytest -q"].exit_code == 1
+    assert by_cmd["pytest -q"].output == "1 failed"
+    assert parsed_partial.modified_files == ["/work/proj/src/a.py"]
+
+
+def test_doctor_plugin_disabled_precedence_and_recursion_error_safety(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    _make_fake_cli(fake_bin)
+
+    # 1. Explicit enabledPlugins: false overrides installed_plugins.json -> FAIL (not false OK)
+    proj = tmp_path / "disabled-plugin"
+    proj.mkdir()
+    home = tmp_path / "home"
+    (home / ".claude" / "plugins").mkdir(parents=True)
+    (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
+        json.dumps({"plugins": {"compact-ledger@mkt": [{"scope": "user"}]}}),
+        encoding="utf-8",
+    )
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"enabledPlugins": {"compact-ledger@mkt": False}}),
+        encoding="utf-8",
+    )
+    r_disabled = run_doctor(cwd=proj, env={"PATH": str(fake_bin)}, home_dir=home)
+    assert r_disabled.ok is False
+    assert next(c for c in r_disabled.checks if c.name == "claude_hooks").status == "fail"
+
+    # 2. File-only installed_plugins.json (no enabledPlugins) -> WARN (not silent OK)
+    (home / ".claude" / "settings.json").write_text("{}", encoding="utf-8")
+    r_warn = run_doctor(cwd=proj, env={"PATH": str(fake_bin)}, home_dir=home)
+    assert r_warn.ok is True
+    assert next(c for c in r_warn.checks if c.name == "claude_hooks").status == "warn"
+
+    # 3. User disableAllHooks: true overridden by project settings.local.json false -> OK!
+    (home / ".claude" / "settings.json").write_text(
+        json.dumps({"disableAllHooks": True}), encoding="utf-8"
+    )
+    (proj / ".claude").mkdir()
+    (proj / ".claude" / "settings.local.json").write_text(
+        json.dumps(
+            {
+                "disableAllHooks": False,
+                "hooks": {
+                    "PreCompact": [
+                        {
+                            "matcher": "",
+                            "hooks": [
+                                {"type": "command", "command": "compact-ledger hook pre-compact"}
+                            ],
+                        }
+                    ],
+                    "SessionStart": [
+                        {
+                            "matcher": "compact|resume",
+                            "hooks": [
+                                {"type": "command", "command": "compact-ledger hook session-start"}
+                            ],
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    r_override = run_doctor(cwd=proj, env={"PATH": str(fake_bin)}, home_dir=home)
+    assert r_override.ok is True
+    assert next(c for c in r_override.checks if c.name == "claude_hooks").status == "ok"
+
+    # 4. Deeply nested JSON (RecursionError) in plugin.json must NOT crash doctor
+    bad_plugin = tmp_path / "deep-json"
+    bad_plugin.mkdir()
+    (bad_plugin / ".claude-plugin").mkdir()
+    (bad_plugin / ".claude-plugin" / "plugin.json").write_text(
+        "[" * 2000 + "]" * 2000, encoding="utf-8"
+    )
+    r_deep = run_doctor(cwd=bad_plugin, env={"PATH": str(fake_bin)}, home_dir=tmp_path / "h_deep")
+    assert next(c for c in r_deep.checks if c.name == "claude_plugin").status == "fail"
+
 
 def test_m4_doctor_scopes_unrelated_plugin_disable_all_hooks_and_symlink_fixes(
     tmp_path: Path,

@@ -197,23 +197,26 @@ def _check_python_version(version_info: tuple[int, int, int]) -> DoctorCheck:
     )
 
 
-def _has_installed_plugin_in_settings(settings_data: dict[str, Any]) -> bool:
+def _plugin_enabled_in_settings(settings_data: dict[str, Any]) -> bool | None:
+    """Return ``True`` if enabled, ``False`` if explicitly disabled, else ``None``."""
     enabled = settings_data.get("enabledPlugins")
     if isinstance(enabled, dict):
+        result: bool | None = None
         for key, val in enabled.items():
             if not isinstance(key, str):
                 continue
             base = key.split("@", 1)[0].strip().lower()
-            if base == "compact-ledger" and bool(val):
-                return True
-    elif isinstance(enabled, list):
+            if base == "compact-ledger":
+                result = bool(val)
+        return result
+    if isinstance(enabled, list):
         for item in enabled:
             if isinstance(item, str) and item.split("@", 1)[0].strip().lower() == "compact-ledger":
                 return True
-    return False
+    return None
 
 
-def _has_installed_plugin_file(home_dir: Path | None) -> bool:
+def _has_installed_plugin_file(home_dir: Path | None, *, project_root: Path) -> bool:
     if home_dir is None:
         return False
     installed_path = home_dir / _INSTALLED_PLUGINS_RELPATH
@@ -221,22 +224,39 @@ def _has_installed_plugin_file(home_dir: Path | None) -> bool:
         if not installed_path.is_file():
             return False
         data = json.loads(installed_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, RecursionError):
         return False
+
+    def _entry_applies(entry: Any) -> bool:
+        if not isinstance(entry, dict):
+            return True
+        scope = entry.get("scope")
+        proj_path = entry.get("projectPath")
+        if scope == "project" and isinstance(proj_path, str) and proj_path.strip():
+            with contextlib.suppress(OSError, RuntimeError):
+                return Path(proj_path).expanduser().resolve() == project_root.resolve()
+        return True
+
     if isinstance(data, dict):
         plugins = data.get("plugins")
         if isinstance(plugins, dict):
-            return any(
-                isinstance(k, str) and k.split("@", 1)[0].strip().lower() == "compact-ledger"
-                for k in plugins
-            )
+            for k, val in plugins.items():
+                if not isinstance(k, str) or k.split("@", 1)[0].strip().lower() != "compact-ledger":
+                    continue
+                if isinstance(val, list):
+                    if any(_entry_applies(item) for item in val):
+                        return True
+                elif _entry_applies(val):
+                    return True
         if isinstance(plugins, list):
-            return any(
-                isinstance(p, dict)
-                and isinstance(p.get("name"), str)
-                and p["name"].strip().lower() == "compact-ledger"
-                for p in plugins
-            )
+            for p in plugins:
+                if (
+                    isinstance(p, dict)
+                    and isinstance(p.get("name"), str)
+                    and p["name"].strip().lower() == "compact-ledger"
+                    and _entry_applies(p)
+                ):
+                    return True
     return False
 
 
@@ -294,7 +314,13 @@ def _check_claude_plugin(project_root: Path) -> tuple[DoctorCheck, bool]:
 
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            RecursionError,
+        ) as exc:
             return (
                 DoctorCheck(
                     name="claude_plugin",
@@ -354,7 +380,13 @@ def _check_claude_plugin(project_root: Path) -> tuple[DoctorCheck, bool]:
                         issues.append(f"hooks/hooks.json missing {', '.join(missing)}")
                 else:
                     issues.append("hooks/hooks.json is not a JSON object")
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            except (
+                OSError,
+                UnicodeDecodeError,
+                json.JSONDecodeError,
+                ValueError,
+                RecursionError,
+            ) as exc:
                 issues.append(f"invalid hooks/hooks.json: {exc}")
         else:
             issues.append("missing hooks/hooks.json")
@@ -439,32 +471,33 @@ def _check_cli_on_path(env_path: str | None, *, plugin_ready: bool) -> DoctorChe
     )
 
 
-def _read_settings_file(path: Path) -> tuple[dict[str, Any] | None, str | None, bool]:
+def _read_settings_file(path: Path) -> tuple[dict[str, Any] | None, str | None, str | None, bool]:
     """Read one Claude Code settings file safely.
 
-    Returns ``(parsed_dict_or_None, error_message_or_None, file_existed)``.
+    Returns ``(parsed_dict_or_None, error_message_or_None, error_kind_or_None, file_existed)``
+    where ``error_kind`` is ``"io"``, ``"json"``, ``"type"``, or ``None``.
     """
     try:
         exists = path.exists() or path.is_symlink()
     except OSError as exc:
-        return None, f"cannot access {path}: {exc}", False
+        return None, f"cannot access {path}: {exc}", "io", False
     if not exists:
-        return None, None, False
+        return None, None, None, False
     try:
         if not path.is_file():
-            return None, f"{path} exists but is not a regular file", True
+            return None, f"{path} exists but is not a regular file", "type", True
         raw = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        return None, f"cannot read {path}: {exc}", True
+        return None, f"cannot read {path}: {exc}", "io", True
     if not raw.strip():
-        return None, f"{path} is empty (invalid JSON)", True
+        return None, f"{path} is empty (invalid JSON)", "json", True
     try:
         parsed = json.loads(raw)
     except (json.JSONDecodeError, ValueError, RecursionError) as exc:
-        return None, f"invalid JSON in {path}: {exc}", True
+        return None, f"invalid JSON in {path}: {exc}", "json", True
     if not isinstance(parsed, dict):
-        return None, f"{path} must contain a JSON object at top level", True
-    return parsed, None, True
+        return None, f"{path} must contain a JSON object at top level", "json", True
+    return parsed, None, None, True
 
 
 def _check_claude_hooks(
@@ -482,41 +515,47 @@ def _check_claude_hooks(
         else "compact-ledger init --write"
     )
 
-    scopes: list[tuple[str, Path]] = [
-        ("target" if explicit_settings_path else "project", settings_target)
-    ]
-    if not explicit_settings_path:
+    # Scopes ordered from lowest to highest precedence so higher-precedence settings
+    # (project_local > project > user) cleanly override flags like disableAllHooks / enabledPlugins.
+    scopes: list[tuple[str, Path]] = []
+    if explicit_settings_path:
+        scopes.append(("target", settings_target))
+    else:
         local_settings = project_root / _LOCAL_CLAUDE_SETTINGS_RELPATH
-        if local_settings != settings_target:
-            scopes.append(("project_local", local_settings))
         if home_dir is not None:
             user_settings = home_dir / DEFAULT_CLAUDE_SETTINGS_RELPATH
             if user_settings not in (settings_target, local_settings):
                 scopes.append(("user", user_settings))
+        scopes.append(("project", settings_target))
+        if local_settings != settings_target:
+            scopes.append(("project_local", local_settings))
 
     merged_pre = False
     merged_start = False
     commands_found: list[str] = []
     missing_execs: list[str] = []
     wired_sources: list[str] = []
-    read_errors: list[tuple[str, Path, str]] = []
-    disabled_paths: list[str] = []
-    plugin_enabled_in_settings = False
+    read_errors: list[tuple[str, Path, str, str | None]] = []
+    disable_all_hooks_effective = False
+    disable_all_hooks_path: str | None = None
+    plugin_enabled_state: bool | None = None
     target_existed = False
 
     for scope_name, path in scopes:
-        data, err, existed = _read_settings_file(path)
+        data, err, err_kind, existed = _read_settings_file(path)
         if path == settings_target:
             target_existed = existed
         if err is not None:
-            read_errors.append((scope_name, path, err))
+            read_errors.append((scope_name, path, err, err_kind))
             continue
         if data is None:
             continue
-        if data.get("disableAllHooks") is True:
-            disabled_paths.append(str(path))
-        if _has_installed_plugin_in_settings(data):
-            plugin_enabled_in_settings = True
+        if isinstance(data.get("disableAllHooks"), bool):
+            disable_all_hooks_effective = data["disableAllHooks"]
+            disable_all_hooks_path = str(path) if disable_all_hooks_effective else None
+        plugin_state = _plugin_enabled_in_settings(data)
+        if plugin_state is not None:
+            plugin_enabled_state = plugin_state
         pre, start, cmds, missing = _inspect_hooks_object(data.get("hooks"), env_path=env_path)
         if pre or start:
             wired_sources.append(str(path))
@@ -527,17 +566,23 @@ def _check_claude_hooks(
             if exe not in missing_execs:
                 missing_execs.append(exe)
 
-    # Report corrupt / unreadable target settings file directly with a repairable fix.
-    for scope_name, err_path, err_msg in read_errors:
+    # Report corrupt / unreadable target settings file directly with an accurate fix.
+    for scope_name, err_path, err_msg, err_kind in read_errors:
         if err_path == settings_target or (not merged_pre and not merged_start):
+            if err_kind == "io":
+                err_fix = f"Check read permissions on {shlex.quote(str(err_path))}"
+            elif err_kind == "type":
+                err_fix = f"Replace non-file {shlex.quote(str(err_path))} with a valid JSON file"
+            else:
+                err_fix = (
+                    f"Fix {shlex.quote(str(err_path))} so it contains valid JSON, "
+                    f"then run: {init_fix}"
+                )
             return DoctorCheck(
                 name="claude_hooks",
                 status="fail",
                 summary=err_msg,
-                fix=(
-                    f"Fix {shlex.quote(str(err_path))} so it contains valid JSON, "
-                    f"then run: {init_fix}"
-                ),
+                fix=err_fix,
                 details={
                     "settings_path": str(err_path),
                     "scope": scope_name,
@@ -546,16 +591,20 @@ def _check_claude_hooks(
                 },
             )
 
-    if disabled_paths:
+    if disable_all_hooks_effective and disable_all_hooks_path is not None:
         return DoctorCheck(
             name="claude_hooks",
             status="fail",
             summary=(
-                f"Claude Code hooks are disabled (disableAllHooks: true in {disabled_paths[0]})"
+                f"Claude Code hooks are disabled "
+                f"(disableAllHooks: true in {disable_all_hooks_path})"
             ),
-            fix=f'Set "disableAllHooks": false (or remove it) in {shlex.quote(disabled_paths[0])}',
+            fix=(
+                'Set "disableAllHooks": false (or remove it) in '
+                f"{shlex.quote(disable_all_hooks_path)}"
+            ),
             details={
-                "settings_path": disabled_paths[0],
+                "settings_path": disable_all_hooks_path,
                 "disable_all_hooks": True,
                 "pre_compact": merged_pre,
                 "session_start": merged_start,
@@ -590,19 +639,37 @@ def _check_claude_hooks(
             details=details,
         )
 
-    installed_plugin = (not explicit_settings_path) and (
-        plugin_enabled_in_settings or _has_installed_plugin_file(home_dir)
-    )
-    if installed_plugin:
+    if not explicit_settings_path and plugin_enabled_state is True:
         return DoctorCheck(
             name="claude_hooks",
             status="ok",
-            summary="compact-ledger Claude Code plugin is installed/enabled",
+            summary="compact-ledger Claude Code plugin is enabled in settings",
             details={
                 "settings_path": str(settings_target),
                 "pre_compact": True,
                 "session_start": True,
                 "provided_by_installed_plugin": True,
+            },
+        )
+
+    if (
+        not explicit_settings_path
+        and plugin_enabled_state is None
+        and _has_installed_plugin_file(home_dir, project_root=project_root)
+    ):
+        return DoctorCheck(
+            name="claude_hooks",
+            status="warn",
+            summary=(
+                "compact-ledger appears in installed_plugins.json but is not explicitly enabled "
+                "in enabledPlugins or .claude/settings.json"
+            ),
+            fix=init_fix,
+            details={
+                "settings_path": str(settings_target),
+                "pre_compact": merged_pre,
+                "session_start": merged_start,
+                "installed_plugin_unconfirmed": True,
             },
         )
 
@@ -799,6 +866,7 @@ def _check_store(store: SessionStore, project_root: Path) -> DoctorCheck:
                     UnicodeDecodeError,
                     json.JSONDecodeError,
                     ValueError,
+                    RecursionError,
                 ):
                     corrupt_count += 1
     except OSError as exc:
