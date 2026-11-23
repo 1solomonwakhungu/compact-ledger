@@ -450,3 +450,189 @@ def test_end_to_end_extract_pins_and_render_snapshot() -> None:
     assert "ok, sounds good!" not in md
     assert "That actually worked!" not in md
     assert "- [CONSTRAINT] [turn 1] Use June 30 as the cutoff date." not in md
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Fable 5.2 adversarial review findings (B5, NB4-NB8)
+# ---------------------------------------------------------------------------
+
+
+def test_b5_json_pin_text_never_shrinks_as_budget_grows() -> None:
+    rule_text = "Never modify the production billing schema without an approved migration."
+    snap = CompactionSnapshot(
+        session_id="550e8400-e29b-41d4-a716-446655440000",
+        transcript_path="/Users/developer/workspaces/super-long-project-name/sessions/2026-11-22/claude-transcript-session-550e8400.jsonl",
+        pins=[
+            PinEntry(
+                pin_id="pin-manual-1",
+                text=rule_text,
+                source="manual",
+                is_negative=True,
+            )
+        ],
+    )
+
+    prev_len = 0
+    for budget in (240, 280, 300, 340, 380, 420, 460, 500, 520, 600, 800):
+        raw = render_snapshot(snap, max_chars=budget, output_format="json")
+        assert len(raw) <= budget
+        parsed = json.loads(raw)
+        cur_len = len(parsed["pins"][0]["text"]) if parsed.get("pins") else 0
+        assert cur_len >= prev_len, (
+            f"Pin text shrank when budget grew to {budget}: {cur_len} < {prev_len} ({raw!r})"
+        )
+        prev_len = cur_len
+        if budget >= 280:
+            assert parsed["pins"][0]["text"] == rule_text
+
+
+def test_long_override_does_not_starve_tier2_do_not_rules() -> None:
+    snap = CompactionSnapshot(
+        session_id="sess-starve",
+        pins=[
+            PinEntry(
+                pin_id="pin-huge-ovr",
+                text="Update: " + ("log line details " * 500),
+                source="override",
+                turn_index=10,
+            ),
+            *[
+                PinEntry(
+                    pin_id=f"pin-neg-{i}",
+                    text=f"Never touch module_{i}.py.",
+                    source="auto",
+                    turn_index=i + 1,
+                    is_negative=True,
+                )
+                for i in range(5)
+            ],
+        ],
+    )
+    md = render_snapshot(snap, max_chars=6000, output_format="markdown")
+    assert len(md) <= 6000
+    for i in range(5):
+        assert f"Never touch module_{i}.py." in md
+
+    js_raw = render_snapshot(snap, max_chars=6000, output_format="json")
+    assert len(js_raw) <= 6000
+    js = json.loads(js_raw)
+    texts = [p["text"] for p in js["pins"]]
+    for i in range(5):
+        assert f"Never touch module_{i}.py." in texts
+
+
+def test_malformed_links_never_vanish_pins() -> None:
+    # 1. Cycle expressed ONLY via `supersedes` (superseded_by=None on both)
+    cyc_snap = CompactionSnapshot(
+        session_id="s-cyc",
+        pins=[
+            PinEntry(pin_id="a", text="Rule A", source="auto", turn_index=1, supersedes="b"),
+            PinEntry(pin_id="b", text="Rule B", source="auto", turn_index=2, supersedes="a"),
+        ],
+    )
+    cyc_md = render_snapshot(cyc_snap, output_format="markdown")
+    assert "Rule B" in cyc_md
+
+    # 2. Manual pin whose superseded_by points to a missing pin_id
+    dangling_snap = CompactionSnapshot(
+        session_id="s-dangling",
+        pins=[
+            PinEntry(
+                pin_id="m1",
+                text="Never delete prod tables.",
+                source="manual",
+                superseded_by="does-not-exist",
+                is_negative=True,
+            )
+        ],
+    )
+    dangling_md = render_snapshot(dangling_snap, output_format="markdown")
+    assert "Never delete prod tables." in dangling_md
+
+    # 3. Duplicate pin_id where only one copy has superseded_by
+    dup_snap = CompactionSnapshot(
+        session_id="s-dup",
+        pins=[
+            PinEntry(
+                pin_id="dup-1",
+                text="Stale copy",
+                source="auto",
+                turn_index=1,
+                superseded_by="real-ovr",
+            ),
+            PinEntry(
+                pin_id="dup-1",
+                text="Active sibling copy",
+                source="auto",
+                turn_index=2,
+            ),
+            PinEntry(pin_id="real-ovr", text="Override copy", source="override", turn_index=3),
+        ],
+    )
+    dup_md = render_snapshot(dup_snap, output_format="markdown")
+    assert "Active sibling copy" in dup_md
+    assert "Override copy" in dup_md
+
+
+def test_json_nan_safety_and_over_200_items_metadata_consistency() -> None:
+    snap = CompactionSnapshot(
+        session_id="s-meta",
+        pins=[
+            PinEntry(pin_id=f"p-{i}", text=f"Rule {i}", source="auto", turn_index=i)
+            for i in range(205)
+        ],
+        metadata={"ratio": float("nan"), "inf": float("inf"), "ok": "yes"},
+    )
+    raw = render_snapshot(snap, max_chars=100_000, output_format="json")
+    assert "NaN" not in raw
+    assert "Infinity" not in raw
+    parsed = json.loads(raw)
+    assert parsed["metadata"] == {"ratio": None, "inf": None, "ok": "yes"}
+    assert len(parsed["pins"]) == 205
+
+
+def test_raw_failing_attempts_not_dropped_when_other_test_has_trajectory() -> None:
+    snap = CompactionSnapshot(
+        session_id="s-mixed-tests",
+        trajectories=[
+            TestTrajectory(
+                test_id="tests/test_a.py::test_ok",
+                runner="pytest",
+                status="RESOLVED",
+                summary="Passed",
+            )
+        ],
+        attempts=[
+            TestAttempt(
+                test_id="tests/test_a.py::test_ok",
+                runner="pytest",
+                outcome="passed",
+                turn_index=2,
+            ),
+            TestAttempt(
+                test_id="tests/test_b.py::test_broken",
+                runner="pytest",
+                outcome="failed",
+                expected="42",
+                actual="0",
+                turn_index=3,
+            ),
+        ],
+    )
+    md = render_snapshot(snap, output_format="markdown")
+    assert "tests/test_b.py::test_broken" in md
+
+    parsed = json.loads(render_snapshot(snap, output_format="json"))
+    assert [a["test_id"] for a in parsed["attempts"]] == ["tests/test_b.py::test_broken"]
+
+
+def test_markdown_tiny_budgets_use_compact_header_instead_of_clipping_full_header() -> None:
+    snap = CompactionSnapshot(
+        session_id="very-long-session-identifier-1234567890",
+        pins=[PinEntry(pin_id="p1", text="Keep zero deps.", source="manual")],
+    )
+    for budget in (18, 25, 40, 50):
+        md = render_snapshot(snap, max_chars=budget, output_format="markdown")
+        assert len(md) <= budget
+        assert md.startswith("## Compact Ledger")
+        assert "(Ses" not in md

@@ -456,6 +456,9 @@ def test_redos_and_linear_time_performance() -> None:
         UserTurn(turn_index=3, text="don't " * 2000 + "know", seq=3),
         UserTurn(turn_index=4, text="change " + ("a " * 2000) + "to b", seq=4),
         UserTurn(turn_index=5, text="ok, " * 3000 + "thanks", seq=5),
+        UserTurn(turn_index=6, text="a" + ("!" * 40000) + "b", seq=6),
+        UserTurn(turn_index=7, text="zz" + (" " * 40000) + "qq", seq=7),
+        UserTurn(turn_index=8, text="a" + ("\n" * 40000) + "b", seq=8),
         *[
             UserTurn(
                 turn_index=10 + i,
@@ -470,3 +473,204 @@ def test_redos_and_linear_time_performance() -> None:
     elapsed = time.monotonic() - t0
     assert elapsed < 1.0, f"extract_pins took {elapsed:.3f}s (expected < 1.0s)"
     assert len(pins) >= 500
+
+    # Direct linear-time checks on non-word and whitespace runs (B4)
+    t1 = time.monotonic()
+    assert is_chatter("a" + ("!" * 80000) + "b") is False
+    assert is_override_turn("zz" + (" " * 40000) + "qq") is False
+    assert (time.monotonic() - t1) < 0.25
+
+    # Inverted index scaling: 4,000 override-bearing turns must stay fast (< 1.0s, B4)
+    override_turns = [
+        UserTurn(turn_index=i + 1, text=f"Switch from old{i} to new{i}.", seq=i + 1)
+        for i in range(4000)
+    ]
+    t2 = time.monotonic()
+    override_pins = extract_pins(override_turns)
+    elapsed_overrides = time.monotonic() - t2
+    assert len(override_pins) == 4000
+    assert elapsed_overrides < 1.0, (
+        f"4,000 override turns took {elapsed_overrides:.3f}s (expected < 1.0s)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Fable 5.2 adversarial review findings (B1-B4, NB1-NB3)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("turns_list", "expected_preserved"),
+    [
+        (
+            [
+                "Never commit directly to main.",
+                "Where is the config file?",
+                "Never mind, I found it.",
+            ],
+            "Never commit directly to main.",
+        ),
+        (
+            [
+                "Never run migrations against prod.",
+                "Ignore that lint warning for now.",
+            ],
+            "Never run migrations against prod.",
+        ),
+        (
+            [
+                "Never run migrations against prod.",
+                "Drop the old date column from the users table.",
+            ],
+            "Never run migrations against prod.",
+        ),
+        (
+            [
+                "Never touch the database schema.",
+                "Actually, also add an index to the database.",
+            ],
+            "Never touch the database schema.",
+        ),
+        (
+            [
+                "Always run the tests before committing.",
+                "Actually, don't mock the database in tests.",
+            ],
+            "Always run the tests before committing.",
+        ),
+        (
+            [
+                "Always return a list from parse().",
+                "The function returns None instead of a list.",
+            ],
+            "Always return a list from parse().",
+        ),
+        (
+            [
+                "Always run the tests before committing.",
+                "Update: the tests pass now.",
+            ],
+            "Always run the tests before committing.",
+        ),
+        (
+            [
+                "Never force push to origin.",
+                "Pull from origin to get the latest changes.",
+            ],
+            "Never force push to origin.",
+        ),
+        (
+            [
+                "The tests must stay passing on CI.",
+                "The tests change from passing to failing when I run them twice.",
+            ],
+            "The tests must stay passing on CI.",
+        ),
+        (
+            [
+                "Do not edit the config loader.",
+                "Make a small change to the config to enable caching.",
+            ],
+            "Do not edit the config loader.",
+        ),
+        (
+            [
+                "Keep the parser deterministic.",
+                "New rule-based parser looks slow, can you profile the parser?",
+            ],
+            "Keep the parser deterministic.",
+        ),
+    ],
+)
+def test_b1_ordinary_messages_never_falsely_supersede_active_constraints(
+    turns_list: list[str],
+    expected_preserved: str,
+) -> None:
+    pins = extract_pins(_turns(*turns_list))
+    by_text = {p.text: p for p in pins}
+    assert expected_preserved in by_text
+    assert by_text[expected_preserved].superseded_by is None
+
+
+@pytest.mark.parametrize(
+    ("initial", "later"),
+    [
+        ("Use Postgres for storage.", "Let's not switch from Postgres to MySQL."),
+        ("Use port 8080.", "Please don't ever change the port from 8080 to 3000."),
+        ("Use Postgres for storage.", "There is no need to switch from Postgres to MySQL."),
+        ("Use requests for HTTP.", "I don't want to replace requests with httpx."),
+        (
+            "Use Postgres for storage.",
+            "If we switch from Postgres to MySQL the tests break, so keep it.",
+        ),
+    ],
+)
+def test_b2_negated_and_conditional_replacement_verbs_never_supersede(
+    initial: str,
+    later: str,
+) -> None:
+    assert is_override_turn(later) is False
+    pins = extract_pins(_turns(initial, later))
+    by_text = {p.text: p for p in pins}
+    assert by_text[initial].superseded_by is None
+
+
+def test_b2_do_not_ever_switch_is_not_override() -> None:
+    assert is_override_turn("Do not ever switch from npm to pnpm.") is False
+    assert is_negative_constraint("Do not ever switch from npm to pnpm.") is True
+
+
+@pytest.mark.parametrize("retraction", ["Scratch that.", "Never mind."])
+def test_b3_repeated_retraction_phrase_supersedes_each_preceding_rule(retraction: str) -> None:
+    turns = _turns(
+        "Use tabs.",
+        retraction,
+        "Use 2-space indentation.",
+        retraction,
+    )
+    pins = extract_pins(turns)
+    assert len(pins) == 4
+    p1, p2, p3, p4 = pins
+    assert p1.superseded_by == p2.pin_id
+    assert p2.supersedes == p1.pin_id
+    assert p3.superseded_by == p4.pin_id
+    assert p4.supersedes == p3.pin_id
+    assert p4.superseded_by is None
+
+
+@pytest.mark.parametrize(
+    ("initial", "override"),
+    [
+        ("Use Python 3.11.", "Switch from Python 3.11 to Python 3.12."),
+        ("Set the timeout to 1.5 seconds.", "Change the timeout from 1.5 to 2.5 seconds."),
+        ("Use requests 2.31 for HTTP.", "Replace requests 2.31 with httpx 0.27."),
+    ],
+)
+def test_dotted_values_in_overrides_match_and_supersede(initial: str, override: str) -> None:
+    pins = extract_pins(_turns(initial, override))
+    assert len(pins) == 2
+    old_pin, new_pin = pins
+    assert new_pin.source == "override"
+    assert new_pin.supersedes == old_pin.pin_id
+    assert old_pin.superseded_by == new_pin.pin_id
+
+
+def test_inline_triple_backticks_do_not_swallow_turn() -> None:
+    text = "```pip install foo``` never do that again, always use uv."
+    assert "never do that again" in strip_fenced_code_blocks(text)
+    pins = extract_pins(_turns(text))
+    assert len(pins) == 1
+    assert pins[0].is_negative is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "The tests don't pass.",
+        "The loop never terminates.",
+        "I never said that.",
+        "They don't compile on Windows.",
+    ],
+)
+def test_bug_reports_are_not_labeled_negative_constraints(text: str) -> None:
+    assert is_negative_constraint(text) is False

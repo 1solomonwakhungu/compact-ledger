@@ -12,6 +12,7 @@ budget compliance across both Markdown and JSON output formats:
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Sequence
 from typing import Any, Literal
 
@@ -31,6 +32,10 @@ __all__ = [
 
 DEFAULT_MAX_CHARS = 6000
 _MAX_SUPERSEDED_SNIPPET_CHARS = 120
+# Under roomy budgets (>= 2000 chars) with multiple active pins, cap any single
+# unusually long pin so one 8KB log dump cannot starve all remaining [DO NOT] rules.
+_SINGLE_PIN_STARVATION_CAP = 1200
+_STARVATION_BUDGET_THRESHOLD = 2000
 
 _TRAJECTORY_PRIORITY: dict[str, int] = {
     "OSCILLATING": 0,
@@ -42,7 +47,7 @@ _TRAJECTORY_PRIORITY: dict[str, int] = {
 
 
 # ---------------------------------------------------------------------------
-# Shared text & ordering helpers
+# Shared text, JSON-safety & ordering helpers
 # ---------------------------------------------------------------------------
 
 
@@ -62,6 +67,21 @@ def _truncate_text(text: str, max_len: int) -> str:
     return text[: max_len - 3].rstrip() + "..."
 
 
+def _sanitize_json_value(value: Any) -> Any:
+    """Recursively sanitize strings (surrogates) and non-finite floats (NaN/Inf -> None)."""
+    if isinstance(value, str):
+        return sanitize_unicode(value)
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {sanitize_unicode(str(k)): _sanitize_json_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_json_value(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_json_value(item) for item in value]
+    return value
+
+
 def _partition_pins(
     pins: Sequence[PinEntry],
 ) -> tuple[list[PinEntry], list[PinEntry], list[PinEntry], list[PinEntry], dict[str, PinEntry]]:
@@ -71,26 +91,48 @@ def _partition_pins(
     - ``manual`` preserves original order.
     - ``overrides`` and ``auto`` are ordered newest first.
     - Superseded pins are NEVER included in the active lists.
+    - Malformed inputs (dangling ``superseded_by`` pointing to a missing pin, cycles via
+      ``superseded_by`` or ``supersedes``, or duplicate ``pin_id``s) never cause all pins
+      to vanish silently.
     """
-    pins_by_id: dict[str, PinEntry] = {p.pin_id: p for p in pins}
+    # Deduplicate by pin_id cleanly (first occurrence owns the ID for link resolution,
+    # while duplicate entries with identical pin_id are tracked per-index so one stale
+    # duplicate cannot silently hide an active sibling).
+    pins_by_id: dict[str, PinEntry] = {}
+    id_to_indices: dict[str, list[int]] = {}
+    for idx, p in enumerate(pins):
+        id_to_indices.setdefault(p.pin_id, []).append(idx)
+        if p.pin_id not in pins_by_id:
+            pins_by_id[p.pin_id] = p
 
-    superseded_ids: set[str] = set()
-    for p in pins:
-        if p.superseded_by is not None and p.superseded_by != p.pin_id:
-            superseded_ids.add(p.pin_id)
-        if p.supersedes is not None and p.supersedes != p.pin_id:
-            superseded_ids.add(p.supersedes)
+    # Build unified directed "old_id -> newer_id" edges from BOTH superseded_by and supersedes,
+    # only when the target pin_id actually exists in this snapshot (prevents dangling links
+    # from vanishing a pin whose replacement isn't present).
+    superseded_by_map: dict[str, str] = {}
+    superseded_indices: set[int] = set()
 
-    # Guard against cycles of any length (e.g., A -> B -> A or A -> B -> C -> A):
-    # if following superseded_by pointers loops back to a visited pin, keep the
-    # newest pin in that cycle active so malformed cyclic inputs don't vanish.
+    for idx, p in enumerate(pins):
+        if (
+            p.superseded_by is not None
+            and p.superseded_by != p.pin_id
+            and p.superseded_by in pins_by_id
+        ):
+            superseded_indices.add(idx)
+            superseded_by_map.setdefault(p.pin_id, p.superseded_by)
+        if p.supersedes is not None and p.supersedes != p.pin_id and p.supersedes in pins_by_id:
+            for target_idx in id_to_indices[p.supersedes]:
+                superseded_indices.add(target_idx)
+            superseded_by_map.setdefault(p.supersedes, p.pin_id)
+
+    # Break cycles of any length (expressed via superseded_by, supersedes, or mixed) by
+    # keeping the newest pin in each cycle active.
     visited_global: set[str] = set()
-    for p in pins:
-        if p.pin_id not in superseded_ids or p.pin_id in visited_global:
+    for start_id in superseded_by_map:
+        if start_id in visited_global:
             continue
         path: list[str] = []
         path_index: dict[str, int] = {}
-        cur: str | None = p.pin_id
+        cur: str | None = start_id
         while cur is not None and cur in pins_by_id and cur not in visited_global:
             if cur in path_index:
                 cycle_ids = path[path_index[cur] :]
@@ -103,11 +145,12 @@ def _partition_pins(
                         pid,
                     ),
                 )
-                superseded_ids.discard(newest_id)
+                for keep_idx in id_to_indices[newest_id]:
+                    superseded_indices.discard(keep_idx)
                 break
             path_index[cur] = len(path)
             path.append(cur)
-            nxt = pins_by_id[cur].superseded_by
+            nxt = superseded_by_map.get(cur)
             cur = nxt if nxt != cur else None
         visited_global.update(path)
 
@@ -117,7 +160,7 @@ def _partition_pins(
     superseded: list[PinEntry] = []
 
     for idx, p in enumerate(pins):
-        if p.pin_id in superseded_ids:
+        if idx in superseded_indices:
             superseded.append(p)
             continue
         if p.source == "manual":
@@ -175,11 +218,15 @@ def _order_thrash_entries(entries: Sequence[EditThrashEntry]) -> list[EditThrash
     )
 
 
-def _unresolved_raw_attempts(attempts: Sequence[TestAttempt]) -> list[TestAttempt]:
-    """Return unresolved failing/error raw attempts (newest first)."""
-    # Determine latest outcome per test_id so already-passing tests are excluded
+def _unresolved_raw_attempts(
+    attempts: Sequence[TestAttempt],
+    covered_test_ids: frozenset[str] = frozenset(),
+) -> list[TestAttempt]:
+    """Return unresolved failing/error raw attempts not already covered by trajectories."""
     latest_by_test: dict[str, tuple[int, int, TestAttempt]] = {}
     for idx, att in enumerate(attempts):
+        if att.test_id in covered_test_ids:
+            continue
         key = (att.turn_index, idx)
         prev = latest_by_test.get(att.test_id)
         if prev is None or key >= (prev[0], prev[1]):
@@ -211,7 +258,13 @@ def _dedupe_files(files: Sequence[str]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def _format_manual_pin(pin: PinEntry) -> str:
+def _cap_pin_body(body: str, per_pin_cap: int | None) -> str:
+    if per_pin_cap is None or len(body) <= per_pin_cap:
+        return body
+    return _truncate_text(body, per_pin_cap)
+
+
+def _format_manual_pin(pin: PinEntry, per_pin_cap: int | None = None) -> str:
     prefixes: list[str] = ["[MANUAL]"]
     if pin.is_negative:
         prefixes.append("[DO NOT]")
@@ -219,12 +272,17 @@ def _format_manual_pin(pin: PinEntry) -> str:
         clean_tags = ", ".join(_flatten_single_line(t) for t in pin.tags if t.strip())
         if clean_tags:
             prefixes.append(f"[tags: {clean_tags}]")
-    return f"{' '.join(prefixes)} {_flatten_single_line(pin.text)}"
+    body = _cap_pin_body(_flatten_single_line(pin.text), per_pin_cap)
+    return f"{' '.join(prefixes)} {body}"
 
 
-def _format_override_pin(pin: PinEntry, pins_by_id: dict[str, PinEntry]) -> str:
+def _format_override_pin(
+    pin: PinEntry,
+    pins_by_id: dict[str, PinEntry],
+    per_pin_cap: int | None = None,
+) -> str:
     prefix = "[OVERRIDE] [DO NOT]" if pin.is_negative else "[OVERRIDE]"
-    body = _flatten_single_line(pin.text)
+    body = _cap_pin_body(_flatten_single_line(pin.text), per_pin_cap)
     if pin.supersedes and pin.supersedes in pins_by_id:
         old_text = _flatten_single_line(pins_by_id[pin.supersedes].text)
         if old_text:
@@ -233,9 +291,9 @@ def _format_override_pin(pin: PinEntry, pins_by_id: dict[str, PinEntry]) -> str:
     return f"{prefix} {body}"
 
 
-def _format_constraint_pin(pin: PinEntry) -> str:
+def _format_constraint_pin(pin: PinEntry, per_pin_cap: int | None = None) -> str:
     tag = "[DO NOT]" if pin.is_negative else "[CONSTRAINT]"
-    body = _flatten_single_line(pin.text)
+    body = _cap_pin_body(_flatten_single_line(pin.text), per_pin_cap)
     if pin.turn_index is not None:
         return f"{tag} [turn {pin.turn_index}] {body}"
     return f"{tag} {body}"
@@ -258,7 +316,6 @@ def _format_trajectory(traj: TestTrajectory) -> str:
     latest = traj.attempts[-1]
     parts: list[str] = [f"{len(traj.attempts)} attempt{'s' if len(traj.attempts) != 1 else ''}"]
     if actuals:
-        # Keep last 5 observations concise
         trail = " -> ".join(actuals[-5:])
         parts.append(f"actual: {trail}")
     if latest.expected:
@@ -308,13 +365,20 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
     manual, overrides, auto, _superseded, pins_by_id = _partition_pins(snapshot.pins)
     unresolved_traj, resolved_traj = _order_trajectories(snapshot.trajectories)
     thrash = _order_thrash_entries(snapshot.thrash_entries)
-    raw_attempts = _unresolved_raw_attempts(snapshot.attempts) if not snapshot.trajectories else []
+    covered_test_ids = frozenset(t.test_id for t in snapshot.trajectories)
+    raw_attempts = _unresolved_raw_attempts(snapshot.attempts, covered_test_ids)
     modified_files = _dedupe_files(snapshot.modified_files)
 
-    # Build prioritized sections: (title, items, allow_truncate_last_item)
+    # Prevent a single anomalously huge turn (e.g., an 8KB log dump inside an Update:)
+    # from starving all other active pins under normal budgets (>= 2000 chars).
+    active_pin_count = len(manual) + len(overrides) + len(auto)
+    per_pin_cap: int | None = None
+    if active_pin_count > 1 and max_chars >= _STARVATION_BUDGET_THRESHOLD:
+        per_pin_cap = min(_SINGLE_PIN_STARVATION_CAP, max(400, max_chars // 3))
+
     tier1_items: list[str] = [
-        *(_format_manual_pin(p) for p in manual),
-        *(_format_override_pin(p, pins_by_id) for p in overrides),
+        *(_format_manual_pin(p, per_pin_cap) for p in manual),
+        *(_format_override_pin(p, pins_by_id, per_pin_cap) for p in overrides),
     ]
     if manual and overrides:
         tier1_title = "Manual Pins & Active Overrides"
@@ -323,7 +387,7 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
     else:
         tier1_title = "Active Overrides"
 
-    tier2_items = [_format_constraint_pin(p) for p in auto]
+    tier2_items = [_format_constraint_pin(p, per_pin_cap) for p in auto]
 
     tier3_items: list[str] = [
         *(_format_trajectory(t) for t in unresolved_traj),
@@ -346,18 +410,19 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
     full_header = f"## Compact Ledger (Session: {session_label})"
     compact_header = "## Compact Ledger"
 
-    # Choose compact header if full header would crowd out the first non-empty section
+    # Choose compact header if full header doesn't fit cleanly or crowds out the first section
     first_non_empty = next(((t, items) for t, items, _ in sections if items), None)
     header = full_header
-    if first_non_empty is not None:
-        first_title, first_items = first_non_empty
+    if len(full_header) > max_chars and len(compact_header) <= max_chars:
+        header = compact_header
+    elif first_non_empty is not None:
+        first_title, _ = first_non_empty
         min_needed_with_full = len(full_header) + len(f"\n\n### {first_title}\n- ") + 16
         min_needed_with_compact = len(compact_header) + len(f"\n\n### {first_title}\n- ") + 16
         if min_needed_with_full > max_chars and min_needed_with_compact <= max_chars:
             header = compact_header
 
     if len(header) > max_chars:
-        # For tiny budgets (e.g. 20 chars), still try to preserve header cleanly
         return _truncate_text(header, max_chars)
 
     parts: list[str] = [header]
@@ -397,8 +462,6 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
                         used += len(entry)
                 break
 
-        # Strict priority enforcement: once a higher-priority section overflows,
-        # never leak lower-priority sections into leftover crumbs.
         if overflowed:
             break
 
@@ -414,21 +477,31 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
 
 
 def _compact_json(obj: Any) -> str:
-    return sanitize_unicode(json.dumps(obj, separators=(",", ":"), ensure_ascii=False))
+    return sanitize_unicode(
+        json.dumps(obj, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    )
 
 
-def _sanitize_pin_dict(pin: PinEntry) -> dict[str, Any]:
+def _sanitize_pin_dict(pin: PinEntry, per_pin_cap: int | None = None) -> dict[str, Any]:
     d = pin.to_dict()
     d["pin_id"] = sanitize_unicode(d["pin_id"])
-    d["text"] = sanitize_unicode(d["text"])
+    text = sanitize_unicode(d["text"])
+    if per_pin_cap is not None and len(text) > per_pin_cap:
+        text = _truncate_text(text, per_pin_cap)
+    d["text"] = text
     if d["timestamp"] is not None:
         d["timestamp"] = sanitize_unicode(d["timestamp"])
     d["tags"] = [sanitize_unicode(t) for t in d["tags"]]
     return d
 
 
-def _truncate_pin_for_json_budget(pin_dict: dict[str, Any], max_item_chars: int) -> str | None:
-    """Truncate a pin dict's ``text`` field so its compact JSON fits in ``max_item_chars``."""
+def _truncate_pin_for_json_budget(
+    pin_dict: dict[str, Any], max_item_chars: int
+) -> tuple[str, int] | None:
+    """Truncate a pin dict's ``text`` so its compact JSON fits in ``max_item_chars``.
+
+    Returns ``(serialized_json, preserved_text_len)`` or ``None`` if it cannot fit.
+    """
     base = dict(pin_dict)
     base["text"] = ""
     empty_len = len(_compact_json(base))
@@ -437,14 +510,15 @@ def _truncate_pin_for_json_budget(pin_dict: dict[str, Any], max_item_chars: int)
 
     original_text = sanitize_unicode(str(pin_dict.get("text", "")))
     lo, hi = 1, len(original_text)
-    best: str | None = None
+    best: tuple[str, int] | None = None
     while lo <= hi:
         mid = (lo + hi) // 2
         candidate = dict(pin_dict)
-        candidate["text"] = _truncate_text(original_text, mid)
+        trunc_text = _truncate_text(original_text, mid)
+        candidate["text"] = trunc_text
         serialized = _compact_json(candidate)
         if len(serialized) <= max_item_chars:
-            best = serialized
+            best = (serialized, len(trunc_text))
             lo = mid + 1
         else:
             hi = mid - 1
@@ -458,33 +532,39 @@ def _render_json(snapshot: CompactionSnapshot, max_chars: int) -> str:
     manual, overrides, auto, superseded, _pins_by_id = _partition_pins(snapshot.pins)
     unresolved_traj, resolved_traj = _order_trajectories(snapshot.trajectories)
     thrash = _order_thrash_entries(snapshot.thrash_entries)
-    raw_attempts = _unresolved_raw_attempts(snapshot.attempts) if not snapshot.trajectories else []
+    covered_test_ids = frozenset(t.test_id for t in snapshot.trajectories)
+    raw_attempts = _unresolved_raw_attempts(snapshot.attempts, covered_test_ids)
     modified_files = _dedupe_files(snapshot.modified_files)
 
-    manual_dicts = [_sanitize_pin_dict(p) for p in manual]
-    override_dicts = [_sanitize_pin_dict(p) for p in overrides]
-    auto_dicts = [_sanitize_pin_dict(p) for p in auto]
-    superseded_dicts = [_sanitize_pin_dict(p) for p in superseded]
+    active_pin_count = len(manual) + len(overrides) + len(auto)
+    per_pin_cap: int | None = None
+    if active_pin_count > 1 and max_chars >= _STARVATION_BUDGET_THRESHOLD:
+        per_pin_cap = min(_SINGLE_PIN_STARVATION_CAP, max(400, max_chars // 3))
+
+    manual_dicts = [_sanitize_pin_dict(p, per_pin_cap) for p in manual]
+    override_dicts = [_sanitize_pin_dict(p, per_pin_cap) for p in overrides]
+    auto_dicts = [_sanitize_pin_dict(p, per_pin_cap) for p in auto]
+    superseded_dicts = [_sanitize_pin_dict(p, _MAX_SUPERSEDED_SNIPPET_CHARS) for p in superseded]
 
     ordered_pins: list[tuple[bool, dict[str, Any]]] = [
         *((True, p) for p in manual_dicts),
         *((True, p) for p in override_dicts),
         *((True, p) for p in auto_dicts),
     ]
-    tier1_count = len(manual_dicts) + len(override_dicts)
 
-    traj_dicts = [t.to_dict() for t in unresolved_traj]
-    resolved_traj_dicts = [t.to_dict() for t in resolved_traj]
-    thrash_dicts = [e.to_dict() for e in thrash]
-    attempt_dicts = [a.to_dict() for a in raw_attempts]
+    traj_dicts = [_sanitize_json_value(t.to_dict()) for t in unresolved_traj]
+    resolved_traj_dicts = [_sanitize_json_value(t.to_dict()) for t in resolved_traj]
+    thrash_dicts = [_sanitize_json_value(e.to_dict()) for e in thrash]
+    attempt_dicts = [_sanitize_json_value(a.to_dict()) for a in raw_attempts]
 
     clean_session_id = sanitize_unicode(snapshot.session_id)
     clean_created_at = sanitize_unicode(snapshot.created_at)
     clean_transcript_path = (
         sanitize_unicode(snapshot.transcript_path) if snapshot.transcript_path is not None else None
     )
+    clean_metadata = _sanitize_json_value(dict(snapshot.metadata))
 
-    # Fast path for small snapshots that fit comfortably in pretty JSON
+    # Fast path for snapshots that plausibly fit in pretty JSON (no arbitrary 200-item cliff).
     total_items = (
         len(ordered_pins)
         + len(superseded_dicts)
@@ -494,7 +574,7 @@ def _render_json(snapshot: CompactionSnapshot, max_chars: int) -> str:
         + len(attempt_dicts)
         + len(modified_files)
     )
-    if total_items <= 200:
+    if total_items * 50 <= max_chars:
         full_payload: dict[str, Any] = {
             "schema_version": snapshot.schema_version,
             "session_id": clean_session_id,
@@ -505,11 +585,13 @@ def _render_json(snapshot: CompactionSnapshot, max_chars: int) -> str:
             "thrash_entries": thrash_dicts,
             "attempts": attempt_dicts,
             "modified_files": modified_files,
-            "metadata": dict(snapshot.metadata),
+            "metadata": clean_metadata,
         }
         if superseded_dicts:
             full_payload["superseded_pins"] = superseded_dicts
-        pretty = sanitize_unicode(json.dumps(full_payload, indent=2, ensure_ascii=False))
+        pretty = sanitize_unicode(
+            json.dumps(full_payload, indent=2, ensure_ascii=False, allow_nan=False)
+        )
         if len(pretty) <= max_chars:
             return pretty
 
@@ -524,7 +606,7 @@ def _render_json(snapshot: CompactionSnapshot, max_chars: int) -> str:
             "thrash_entries": [],
             "attempts": [],
             "modified_files": [],
-            "metadata": {},
+            "metadata": clean_metadata,
             **({"superseded_pins": []} if superseded_dicts else {}),
         },
         {
@@ -553,86 +635,129 @@ def _render_json(snapshot: CompactionSnapshot, max_chars: int) -> str:
         },
     ]
 
-    def _try_envelope(template: dict[str, Any]) -> tuple[str, int, int, int, int] | None:
+    # Score tuple prioritizes preserving FULL untruncated Tier 1 pin text above optional
+    # envelope fields, guaranteeing monotonicity as max_chars grows (fixes B5).
+    # (full_tier1, included_tier1, tier1_chars, full_pins, included_pins, pin_chars,
+    #  tier3_count, file_count, -env_idx)
+    Score = tuple[int, int, int, int, int, int, int, int, int]
+
+    def _try_envelope(env_idx: int, template: dict[str, Any]) -> tuple[str, Score] | None:
         env: dict[str, Any] = {
-            k: ([] if isinstance(v, list) else ({} if isinstance(v, dict) else v))
+            k: ([] if isinstance(v, list) else (dict(v) if isinstance(v, dict) else v))
             for k, v in template.items()
         }
         used = len(_compact_json(env))
         if used > max_chars:
             return None
 
-        def _fill_list(key: str, items: Sequence[tuple[bool, Any]]) -> bool:
-            """Fill ``env[key]`` incrementally; return True if all items fit without overflow."""
+        full_tier1 = 0
+        included_tier1 = 0
+        tier1_chars = 0
+        full_pins = 0
+        included_pins = 0
+        pin_chars = 0
+
+        def _fill_pins(items: Sequence[tuple[bool, dict[str, Any]]]) -> bool:
+            nonlocal used, full_tier1, included_tier1, tier1_chars
+            nonlocal full_pins, included_pins, pin_chars
+            if "pins" not in env or not items:
+                return True
+            bucket: list[Any] = env["pins"]
+            for allow_truncate, item in items:
+                sep = 1 if bucket else 0
+                serialized = _compact_json(item)
+                needed = sep + len(serialized)
+                is_tier1 = item.get("source") in ("manual", "override")
+                if used + needed <= max_chars:
+                    bucket.append(item)
+                    used += needed
+                    text_len = len(str(item.get("text", "")))
+                    full_pins += 1
+                    included_pins += 1
+                    pin_chars += text_len
+                    if is_tier1:
+                        full_tier1 += 1
+                        included_tier1 += 1
+                        tier1_chars += text_len
+                elif allow_truncate and "text" in item:
+                    remaining = max_chars - used - sep
+                    truncated = _truncate_pin_for_json_budget(item, remaining)
+                    if truncated is not None:
+                        truncated_json, preserved_len = truncated
+                        bucket.append(json.loads(truncated_json))
+                        used += sep + len(truncated_json)
+                        included_pins += 1
+                        pin_chars += preserved_len
+                        if is_tier1:
+                            included_tier1 += 1
+                            tier1_chars += preserved_len
+                    return False
+                else:
+                    return False
+            return True
+
+        def _fill_list(key: str, items: Sequence[Any]) -> bool:
             nonlocal used
             if key not in env or not items:
                 return True
             bucket: list[Any] = env[key]
-            for allow_truncate, item in items:
+            for item in items:
                 sep = 1 if bucket else 0
                 serialized = _compact_json(item)
                 needed = sep + len(serialized)
                 if used + needed <= max_chars:
                     bucket.append(item)
                     used += needed
-                elif allow_truncate and isinstance(item, dict) and "text" in item:
-                    remaining = max_chars - used - sep
-                    truncated_json = _truncate_pin_for_json_budget(item, remaining)
-                    if truncated_json is not None:
-                        bucket.append(json.loads(truncated_json))
-                        used += sep + len(truncated_json)
-                    return False
                 else:
                     return False
             return True
 
-        # Strict priority order: stop filling lower tiers as soon as a higher tier overflows.
-        all_fit = _fill_list("pins", ordered_pins)
+        all_fit = _fill_pins(ordered_pins)
         if all_fit:
-            all_fit = _fill_list("trajectories", [(False, t) for t in traj_dicts])
+            all_fit = _fill_list("trajectories", traj_dicts)
         if all_fit:
-            all_fit = _fill_list("thrash_entries", [(False, e) for e in thrash_dicts])
+            all_fit = _fill_list("thrash_entries", thrash_dicts)
         if all_fit:
-            all_fit = _fill_list("attempts", [(False, a) for a in attempt_dicts])
+            all_fit = _fill_list("attempts", attempt_dicts)
         if all_fit:
-            all_fit = _fill_list("modified_files", [(False, f) for f in modified_files])
+            all_fit = _fill_list("modified_files", modified_files)
         if all_fit and resolved_traj_dicts:
-            all_fit = _fill_list("trajectories", [(False, t) for t in resolved_traj_dicts])
+            all_fit = _fill_list("trajectories", resolved_traj_dicts)
         if all_fit and superseded_dicts:
-            _fill_list("superseded_pins", [(False, p) for p in superseded_dicts])
+            _fill_list("superseded_pins", superseded_dicts)
 
         rendered = _compact_json(env)
         if len(rendered) > max_chars:
             return None
 
-        included_pins = env.get("pins", [])
-        included_tier1 = sum(1 for p in included_pins if p.get("source") in ("manual", "override"))
-        included_tier3 = (
+        tier3_count = (
             len(env.get("trajectories", []))
             + len(env.get("thrash_entries", []))
             + len(env.get("attempts", []))
         )
-        included_files = len(env.get("modified_files", []))
-        return rendered, included_tier1, len(included_pins), included_tier3, included_files
+        file_count = len(env.get("modified_files", []))
+        score: Score = (
+            full_tier1,
+            included_tier1,
+            tier1_chars,
+            full_pins,
+            included_pins,
+            pin_chars,
+            tier3_count,
+            file_count,
+            -env_idx,
+        )
+        return rendered, score
 
     best_result: str | None = None
-    best_score: tuple[int, int, int, int] = (-1, -1, -1, -1)
-    want_pins = len(ordered_pins) > 0
-    want_tier3 = bool(traj_dicts or thrash_dicts or attempt_dicts)
-    want_files = bool(modified_files)
+    best_score: Score | None = None
 
-    for env_template in envelopes:
-        attempt = _try_envelope(env_template)
+    for idx, env_template in enumerate(envelopes):
+        attempt = _try_envelope(idx, env_template)
         if attempt is None:
             continue
-        rendered_candidate, included_tier1, pin_count, tier3_count, file_count = attempt
-        if not want_pins:
-            if (not want_tier3 or tier3_count > 0) and (not want_files or file_count > 0):
-                return rendered_candidate
-        elif included_tier1 >= tier1_count and pin_count > 0:
-            return rendered_candidate
-        score = (included_tier1, pin_count, tier3_count, file_count)
-        if score > best_score:
+        rendered_candidate, score = attempt
+        if best_score is None or score > best_score:
             best_score = score
             best_result = rendered_candidate
 

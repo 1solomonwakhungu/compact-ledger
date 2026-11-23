@@ -1,9 +1,10 @@
 """Deterministic user constraint extraction and superseding correction engine.
 
 Zero third-party dependencies, zero LLM calls, strictly linear-time scanning
-(ReDoS-safe regexes only). Extracts verbatim user directives, negative
-constraints, and superseding corrections from ordered transcript turns while
-filtering conversational chatter and preserving explicit manual pins.
+(ReDoS-safe regexes and inverted-index candidate lookup). Extracts verbatim
+user directives, negative constraints, and superseding corrections from ordered
+transcript turns while filtering conversational chatter and preserving explicit
+manual pins.
 """
 
 from __future__ import annotations
@@ -30,16 +31,16 @@ __all__ = [
 ]
 
 # ---------------------------------------------------------------------------
-# Unicode / fenced-code helpers (linear time, zero catastrophic backtracking)
+# Unicode / fenced-code helpers (strictly linear time, zero backtracking)
 # ---------------------------------------------------------------------------
 
-_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
+_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
 _SMART_APOSTROPHE_RE = re.compile(r"[\u2018\u2019\u2032]")
 _DASH_VARIANTS_RE = re.compile(r"[\u2013\u2014]")
 _WORD_TOKEN_RE = re.compile(r"[a-z0-9]+")
 _CAMEL_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
-_SENTENCE_SPLIT_RE = re.compile(r"(?:\n+|(?<=[.!?])\s+)")
-_CLAUSE_SPLIT_RE = re.compile(r"[.!?;,\n]+")
+_SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?]) ")
+_CLAUSE_SPLIT_RE = re.compile(r"[.!?;,]+")
 
 # ---------------------------------------------------------------------------
 # Chatter / acknowledgement filtering
@@ -189,11 +190,10 @@ _CHATTER_PHRASES: frozenset[str] = frozenset(
     }
 )
 
-_CHATTER_TRIM_RE = re.compile(r"^[\W_]+|[\W_]+$")
 _LEADING_FILLER_RE = re.compile(
-    r"^(?:(?:ok(?:ay)?|yes|yep|yeah|sure|thanks?|thank\s+you|great|nice|cool|awesome|"
-    r"alright|all\s+right|got\s+it|lgtm|sounds\s+good|looks\s+good|wait|hey|hi|hello|"
-    r"and|also|plus|btw|by\s+the\s+way|one\s+more\s+thing|one\s+more\s+rule)\b[\s,:;-]*){1,3}",
+    r"^(?:(?:ok(?:ay)?|yes|yep|yeah|sure|thanks?|thank you|great|nice|cool|awesome|"
+    r"alright|all right|got it|lgtm|sounds good|looks good|wait|hey|hi|hello|"
+    r"and|also|plus|btw|by the way|one more thing|one more rule)\b[,:; -]*){1,3}",
     re.IGNORECASE,
 )
 
@@ -204,122 +204,131 @@ _LEADING_FILLER_RE = re.compile(
 _INFO_QUESTION_START_RE = re.compile(
     r"^(?:what|where|when|why|who|whom|whose|which|how|"
     r"is|are|was|were|am|do|does|did|have|has|had|should|"
-    r"would\s+(?:it|that|this|we|there)|"
-    r"could\s+(?:it|that|this|we|there)|"
-    r"can\s+(?:it|that|this|we|there)|"
-    r"will\s+(?:it|that|this|there)|"
-    r"might|may\s+i)\b",
+    r"would (?:it|that|this|we|there)|"
+    r"could (?:it|that|this|we|there)|"
+    r"can (?:it|that|this|we|there)|"
+    r"will (?:it|that|this|there)|"
+    r"might|may i)\b",
     re.IGNORECASE,
 )
 
 _POLITE_REQUEST_START_RE = re.compile(
-    r"^(?:can|could|would|will)\s+you\s+(?:please\s+)?",
+    r"^(?:can|could|would|will) you (?:please )?",
     re.IGNORECASE,
 )
 
 _NON_DIRECTIVE_REQUEST_VERB_RE = re.compile(
-    r"^(?:explain|tell\s+me|show\s+me|describe|list|summarize|clarify|confirm|"
-    r"check\s+(?:if|whether|why)|see\s+(?:if|whether|why)|find\s+out|look\s+up)\b",
+    r"^(?:explain|tell me|show me|describe|list|summarize|clarify|confirm|"
+    r"check (?:if|whether|why)|see (?:if|whether|why)|find out|look up)\b",
     re.IGNORECASE,
 )
 
 # ---------------------------------------------------------------------------
-# Negative constraint detection
+# Negative constraint detection (all run on single-space normalized sentences)
 # ---------------------------------------------------------------------------
 
 _NEG_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"\bdo\s+not\b", re.IGNORECASE),
+    re.compile(r"\bdo not\b", re.IGNORECASE),
     re.compile(r"\bdon't\b", re.IGNORECASE),
-    re.compile(r"\bmust\s+not\b|\bmustn't\b|\bshall\s+not\b", re.IGNORECASE),
-    re.compile(r"\bshould\s+not\b|\bshouldn't\b", re.IGNORECASE),
+    re.compile(r"\bmust not\b|\bmustn't\b|\bshall not\b", re.IGNORECASE),
+    re.compile(r"\bshould not\b|\bshouldn't\b", re.IGNORECASE),
     re.compile(r"\bnever\b", re.IGNORECASE),
     re.compile(
-        r"\bavoid\s+(?:using|modifying|touching|changing|adding|breaking|introducing|"
+        r"\bavoid (?:using|modifying|touching|changing|adding|breaking|introducing|"
         r"calling|mutating|rewriting|deleting|removing|importing|editing|installing|"
         r"external|third[- ]party|global|hardcod\w*|[a-z][a-z0-9_-]*ing\b)",
         re.IGNORECASE,
     ),
-    re.compile(r"(?:^|[.!?;:\n]\s*)(?:please\s+)?avoid\b", re.IGNORECASE),
+    re.compile(r"^(?:please )?avoid\b", re.IGNORECASE),
     re.compile(
-        r"\b(?:forbid(?:den)?|prohibit(?:ed)?|disallow(?:ed)?|not\s+allowed\s+to|"
-        r"under\s+no\s+circumstances|hands\s+off)\b",
+        r"\b(?:forbid(?:den)?|prohibit(?:ed)?|disallow(?:ed)?|not allowed to|"
+        r"under no circumstances|hands off)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:cannot|can't)\s+(?:break|modify|touch|change|use|depend|delete|remove|"
+        r"\b(?:cannot|can't) (?:break|modify|touch|change|use|depend|delete|remove|"
         r"commit|push|alter|mutate|drop|exceed|import|call|expose|leak)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bno\s+(?:third[- ]party|external|llm|network|breaking|extra|additional|"
-        r"changes?\s+to|edits?\s+to|modifications?\s+to|writes?\s+to|dependencies|"
+        r"\bno (?:third[- ]party|external|llm|network|breaking|extra|additional|"
+        r"changes? to|edits? to|modifications? to|writes? to|dependencies|"
         r"deps|mocking|mocks|skipping|skipped)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bzero\s+(?:(?:third[- ]party|external|runtime)\s+){1,2}dependenc(?:y|ies)\b",
+        r"\bzero (?:(?:third[- ]party|external|runtime) ){1,2}dependenc(?:y|ies)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bwithout\s+(?:modifying|touching|changing|breaking|adding|using|installing|"
+        r"\bwithout (?:modifying|touching|changing|breaking|adding|using|installing|"
         r"mutating|altering|deleting|removing|calling)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bstop\s+(?:using|modifying|touching|changing|editing|adding|rewriting|calling)\b",
+        r"\bstop (?:using|modifying|touching|changing|editing|adding|rewriting|calling)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bleave\s+\S+(?:\s+\S+){0,4}\s+(?:alone|untouched|as[- ]is|unchanged)\b",
+        r"\bleave \S+(?: \S+){0,4} (?:alone|untouched|as[- ]is|unchanged)\b",
         re.IGNORECASE,
     ),
-    re.compile(r"\b(?:please|could\s+you|can\s+you|would\s+you)\s+not\b", re.IGNORECASE),
+    re.compile(r"\b(?:please|could you|can you|would you|let's|lets) not\b", re.IGNORECASE),
 )
 
 _NEG_DONT_FALSE_POSITIVE_RE = re.compile(
-    r"\b(?:why\s+don't|"
-    r"(?:i|we)\s+(?:just\s+)?don't\s+(?:know|think|see|understand|remember|believe|"
-    r"mind|care|have\s+a|get\s+why|get\s+how)|"
-    r"(?:if|when|whenever|since|because|although|though)\s+(?:you|we|they|it)\s+don't|"
-    r"if\s+(?:it|this|that)\s+does\s+not)\b",
+    r"\b(?:why don't|"
+    r"(?:i|we) (?:just )?don't (?:know|think|see|understand|remember|believe|"
+    r"mind|care|have a|get why|get how)|"
+    r"(?:if|when|whenever|since|because|although|though) (?:you|we|they|it) don't|"
+    r"if (?:it|this|that) does not|"
+    r"(?:the [a-z0-9_.-]+(?: [a-z0-9_.-]+)?|they|it|this|that|tests?|builds?|hooks?|"
+    r"checks?|loops?|scripts?|files?) (?:still )?(?:don't|do not) "
+    r"(?:pass|work|run|compile|build|finish|terminate|match|load|start|connect|"
+    r"exist|return|appear|show|support|handle|include|have))\b",
     re.IGNORECASE,
 )
 
 _NEG_NEVER_FALSE_POSITIVE_RE = re.compile(
-    r"\b(?:never\s*mind|"
-    r"(?:i|we|it|that|this|he|she|they)(?:'ve|'s|'d|\s+(?:have|has|had))?\s+never\s+"
-    r"(?:seen|worked|happened|got|gotten|ran|run|failed|crashed|been|had|heard|tried|"
-    r"noticed|encountered|used\s+(?:it|this|that)\s+before))\b",
+    r"\b(?:never ?mind|"
+    r"(?:i|we|it|that|this|he|she|they)(?:'ve|'s|'d| (?:have|has|had))? never "
+    r"(?:seen|worked|happened|got|gotten|ran|run|runs|failed|crashed|been|had|heard|tried|"
+    r"noticed|encountered|said|asked|mentioned|requested|meant|wanted|changed|touched|"
+    r"edited|broke|terminat\w*|finish\w*|pass\w*|complet\w*|return\w*|exits?|stops?|"
+    r"resolves?|triggers?|used (?:it|this|that) before)|"
+    r"the [a-z0-9_.-]+(?: [a-z0-9_.-]+)? (?:still )?never "
+    r"(?:terminat\w*|finish\w*|pass\w*|work\w*|ran|run|runs|complet\w*|return\w*|"
+    r"exits?|stops?|resolves?|triggers?|loads?|starts?|matches?|fires?))\b",
     re.IGNORECASE,
 )
 
 # ---------------------------------------------------------------------------
-# Positive directive / constraint detection
+# Positive directive / constraint detection (single-space normalized sentences)
 # ---------------------------------------------------------------------------
 
 _CONSTRAINT_KEYWORDS_RE = re.compile(
-    r"\b(?:must|have\s+to|need(?:s)?\s+to|required\s+to|always|strictly|exclusively|"
-    r"ensure|make\s+sure|guarantee|enforce|preserve|maintain|stick\s+(?:to|with)|"
-    r"adhere\s+to|comply\s+with|remember\s+(?:to|that)|"
-    r"backward[s]?[- ]compatible|compatible\s+with|stdlib\s+only|zero[- ]dependenc(?:y|ies)|"
+    r"\b(?:must|have to|need(?:s)? to|required to|always|strictly|exclusively|"
+    r"ensure|make sure|guarantee|enforce|preserve|maintain|stick (?:to|with)|"
+    r"adhere to|comply with|remember (?:to|that)|"
+    r"backward[s]?[- ]compatible|compatible with|stdlib only|zero[- ]dependenc(?:y|ies)|"
     r"fail[- ]open|deterministic)\b|"
-    r"(?:^|[.!?\n]\s*)(?:requirement|constraint|rule|important|note|policy|invariant)\s*:",
+    r"^(?:requirement|constraint|rule|important|note|policy|invariant):",
     re.IGNORECASE,
 )
 
 _RESTRICTIVE_DIRECTIVE_RE = re.compile(
-    r"\b(?:only\s+(?:use|modify|edit|touch|change|return|accept|allow|support|import|"
+    r"\b(?:only (?:use|modify|edit|touch|change|return|accept|allow|support|import|"
     r"run|update|write|target|keep|emit|read|output|print)|"
-    r"use\s+only|"
-    r"limit\s+(?:it\s+|this\s+|the\s+\w+\s+)?to|"
-    r"stay\s+(?:under|below|within)|"
-    r"keep\s+(?:it|this|that|the|all|our|every|runtime|output|changes?|diffs?|deps?|"
+    r"use only|"
+    r"limit (?:it |this |the \w+ )?to|"
+    r"stay (?:under|below|within)|"
+    r"keep (?:it|this|that|the|all|our|every|runtime|output|changes?|diffs?|deps?|"
     r"dependencies|compatibility|under|below|within|at|to|in|backward|public|api|tests?))\b",
     re.IGNORECASE,
 )
 
 _IMPERATIVE_VERBS = (
-    "use|keep|set|format|output|return|write|store|save|add|remove|delete|rename|move|"
+    "use|keep|set|make|format|output|return|write|store|save|add|remove|delete|rename|move|"
     "pin|limit|cap|enforce|preserve|maintain|ensure|avoid|prevent|block|reject|validate|"
     "sanitize|escape|sort|deduplicate|default|switch|change|replace|update|implement|"
     "refactor|migrate|convert|support|include|exclude|skip|ignore|restrict|require|"
@@ -331,126 +340,153 @@ _IMPERATIVE_VERBS = (
 )
 
 _IMPERATIVE_START_RE = re.compile(
-    rf"^(?:(?:please|kindly|let's|lets|we\s+should|you\s+should|we\s+must|you\s+must|"
-    rf"be\s+sure\s+to|go\s+ahead\s+and)\s+)?(?:{_IMPERATIVE_VERBS})\b",
+    rf"^(?:(?:please|kindly|let's|lets|we should|you should|we must|you must|"
+    rf"be sure to|go ahead and) )?(?:{_IMPERATIVE_VERBS})\b",
     re.IGNORECASE,
 )
 
 # ---------------------------------------------------------------------------
-# Superseding correction / override detection (linear-time patterns)
+# Superseding correction / override detection (all strictly linear-time)
+# All patterns run on single-space normalized sentences with trailing [.!?] stripped.
 # ---------------------------------------------------------------------------
 
 _EXPLICIT_OVERRIDE_HEADER_RE = re.compile(
-    r"(?:^|[.!?;:\n]\s*)(?:correction|override|change\s+of\s+plan|new\s+rule|"
-    r"revised\s+rule|updated\s+rule|retract(?:ion)?)\s*[:\-]",
+    r"^(?:correction|override|change of plan|new rule|revised rule|updated rule|"
+    r"retract(?:ion)?)(?::| - )",
     re.IGNORECASE,
 )
 
-_UPDATE_HEADER_RE = re.compile(
-    r"(?:^|[.!?;:\n]\s*)update\s*:\s*\S",
-    re.IGNORECASE,
-)
+_UPDATE_HEADER_RE = re.compile(r"^update:\s*(.+)$", re.IGNORECASE)
 
 _SOFT_ACTUALLY_RE = re.compile(
-    r"(?:^|[.!?;,\n]\s*)(?:no\s*,\s*|wait\s*,\s*|sorry\s*,\s*)?actually\b",
+    r"^(?:(?:no|wait|sorry), )?actually\b",
+    re.IGNORECASE,
+)
+
+_ADDITIVE_AFTER_ACTUALLY_RE = re.compile(
+    r"^(?:(?:no|wait|sorry), )?actually,? (?:(?:let's|lets|can you|could you|please|we should) )?"
+    r"(?:also|in addition|as well|additionally)\b",
     re.IGNORECASE,
 )
 
 _HARD_NO_ACTUALLY_RE = re.compile(
-    r"(?:^|[.!?;:\n]\s*)(?:no\s*,\s*actually|actually\s*,?\s*no\b|"
-    r"wait\s*,\s*actually|on\s+second\s+thought)\b",
+    r"^(?:no, actually|actually,? no\b|wait, actually|on second thought)\b",
     re.IGNORECASE,
 )
 
 _IGNORE_FORGET_ABOUT_RE = re.compile(
-    r"\b(?:ignore|forget|disregard|drop|cancel|undo|revert|retract)\s+"
-    r"(?:what\s+i\s+said\s+(?:earlier|before|previously)|"
-    r"(?:my|the)\s+(?:previous|earlier|prior|last|old|original)\s+"
+    r"\b(?:ignore|forget|disregard|cancel|undo|revert|retract) "
+    r"(?:what i said (?:earlier|before|previously)|"
+    r"(?:my|the) (?:previous|earlier|prior|last|old|original) "
     r"(?:instruction|instructions|constraint|constraints|rule|rules|requirement|"
-    r"requirements|message|directive|directives|note|pin|cutoff|date|setting|config)|"
-    r"my\s+last\s+(?:message|instruction|rule|constraint)|"
-    r"that\s+(?:earlier|previous|last)\s+(?:instruction|rule|constraint|requirement))"
-    r"(?:\s+(?:about|regarding|on|for|with)\s+([^.!?;,\n]{1,80}))?",
+    r"requirements|message|directive|directives|note|pin)|"
+    r"my last (?:message|instruction|rule|constraint)|"
+    r"that (?:earlier|previous|last) (?:instruction|rule|constraint|requirement))"
+    r"(?: (?:about|regarding|on|for|with) ([^,;!?]{1,80}))?",
     re.IGNORECASE,
 )
 
 _FORGET_ABOUT_DIRECT_RE = re.compile(
-    r"\b(?:ignore|forget|disregard)\s+(?:about\s+)?the\s+([^.!?;,\n]{1,60})\s+"
+    r"\b(?:ignore|forget|disregard) (?:about )?the ([^,;!?]{1,60}) "
     r"(?:rule|constraint|requirement|instruction|cutoff|limit|setting)\b",
     re.IGNORECASE,
 )
 
+# Must end at clause boundary so "ignore that lint warning" NEVER matches!
 _SCRATCH_THAT_RE = re.compile(
-    r"(?:^|[.!?;,\n]\s*)(?:scratch\s+that|strike\s+that|belay\s+that|cancel\s+that|"
-    r"disregard\s+that|forget\s+that|ignore\s+that)\b",
+    r"^(?:scratch that|strike that|belay that|cancel that|"
+    r"disregard that|forget that|ignore that)(?:$|[,;:-])",
     re.IGNORECASE,
 )
 
 _NEVER_MIND_RE = re.compile(
-    r"(?:^|[.!?;,\n]\s*)(?:never\s*mind|nvm)(?:\s+(?:about\s+)?([^.!?;,\n]{1,60}))?",
+    r"^(?:never ?mind|nvm)(?:$|[,;:-] ?(.*)$| (?:about )?([^,;!?]{1,60}))",
     re.IGNORECASE,
 )
 
 _INSTEAD_OF_PREFIX_RE = re.compile(
-    r"\binstead\s+of\s+([^,.;!?\n]{1,60}?)(?:\s*,\s*|\s+(?:use|do|keep|set|make|pick|"
-    r"choose|go\s+with|try|run|write|return|output|format|switch\s+to)\b)\s*([^.!?\n]{0,80})",
+    r"\binstead of ([^,;!?]{1,60}?)(?:, | (?:use|do|keep|set|make|pick|"
+    r"choose|go with|try|run|write|return|output|format|switch to)\b) ?([^!?]{0,80})",
     re.IGNORECASE,
 )
 
 _INSTEAD_OF_SUFFIX_RE = re.compile(
-    r"\binstead\s+of\s+([^,.;!?\n]{1,60})",
+    r"\binstead of ([^,;!?]{1,60})",
     re.IGNORECASE,
 )
 
 _RATHER_THAN_RE = re.compile(
-    r"\brather\s+than\s+([^,.;!?\n]{1,60})",
+    r"\brather than ([^,;!?]{1,60})",
     re.IGNORECASE,
 )
 
+# Strictly linear on single-space normalized text (no unanchored \s+)
 _NOT_CONTRAST_RE = re.compile(
-    r"(?:,\s*|\s+-\s+|\s+—\s+)not\s+([^,.;!?\n]{1,50})",
+    r"(?:, | - )not ([^,;!?]{1,50})",
     re.IGNORECASE,
+)
+
+# Directive prefix allowed before a replacement verb (excludes nouns like "a small change"
+# and third-person observations like "The tests change from passing to failing").
+_DIRECTIVE_VERB_PREFIX = (
+    r"(?:^|[,;:] )(?:(?:please|kindly|let's|lets|we should|you should|we must|you must|"
+    r"can you|could you|would you|will you|actually|now|and|then|so|instead|correction:|"
+    r"override:|update:|go ahead and|be sure to) )*"
 )
 
 _FROM_X_TO_Y_RE = re.compile(
-    r"\b(?:switch|change|update|move|migrate|convert|bump|raise|lower|increase|decrease|"
-    r"extend|shorten|push|pull|shift|alter)\b"
-    r"(?:\s+(?:the\s+)?([a-z0-9_./-]{1,40}(?:\s+[a-z0-9_./-]{1,30}){0,2}))?"
-    r"\s+from\s+([^,.;!?\n]{1,50}?)\s+to\s+([^,.;!?\n]{1,50})",
+    _DIRECTIVE_VERB_PREFIX
+    + r"(?:switch|change|update|move|migrate|convert|bump|raise|lower|increase|decrease|"
+    r"extend|shorten|alter)"
+    r"(?: (?:the )?([a-z0-9_./-]{1,40}(?: [a-z0-9_./-]{1,30}){0,2}))?"
+    r" from ([^,;!?]{1,50}?) to ([^,;!?]{1,50})",
     re.IGNORECASE,
 )
 
 _CHANGE_X_TO_Y_RE = re.compile(
-    r"\b(?:change|switch)\s+([^,.;!?\n]{1,50}?)\s+to\s+([^,.;!?\n]{1,50})",
+    _DIRECTIVE_VERB_PREFIX + r"(?:change|switch) ([^,;!?]{1,50}?) to ([^,;!?]{1,50})",
     re.IGNORECASE,
 )
 
 _REPLACE_X_WITH_Y_RE = re.compile(
-    r"\breplace\s+([^,.;!?\n]{1,50}?)\s+with\s+([^,.;!?\n]{1,50})",
+    _DIRECTIVE_VERB_PREFIX + r"replace ([^,;!?]{1,50}?) with ([^,;!?]{1,50})",
     re.IGNORECASE,
 )
 
 _UPDATE_TOPIC_TO_Y_RE = re.compile(
-    r"\bupdate\s+(?:the\s+)?([a-z0-9_./-]{2,40}(?:\s+[a-z0-9_./-]{2,30}){0,2})"
-    r"\s+to\s+([^,.;!?\n]{1,50})",
+    _DIRECTIVE_VERB_PREFIX
+    + r"update (?:the )?([a-z0-9_./-]{2,40}(?: [a-z0-9_./-]{2,30}){0,2}) to ([^,;!?]{1,50})",
     re.IGNORECASE,
 )
 
 _SWITCH_TO_Y_RE = re.compile(
-    r"\bswitch\s+to\s+([^,.;!?\n]{1,50})",
+    _DIRECTIVE_VERB_PREFIX + r"switch to ([^,;!?]{1,50})",
     re.IGNORECASE,
 )
 
-_NEGATION_BEFORE_VERB_RE = re.compile(
-    r"(?:^|[\s,.;:!?\n])(?:do\s+not|don't|never|must\s+not|mustn't|shall\s+not|"
-    r"should\s+not|shouldn't|cannot|can't|avoid|not\s+to|please\s+not)\s+$",
+# Clause-level negation and conditional/hypothetical guards (prevents B2 false positives)
+_CLAUSE_NEGATION_RE = re.compile(
+    r"\b(?:do not|don't|never|must not|mustn't|shall not|should not|shouldn't|"
+    r"cannot|can't|avoid|let's not|lets not|please not|not to|rather not|"
+    r"no need to|don't want to|do not want to|don't need to|do not need to|"
+    r"without|stop|refuse to|forbid\w*|prohibit\w*)\b",
+    re.IGNORECASE,
+)
+
+_CLAUSE_CONDITIONAL_RE = re.compile(
+    r"^(?:if|when|whenever|unless|suppose|assuming|what if|in case)\b",
+    re.IGNORECASE,
+)
+
+_INFINITIVE_PURPOSE_START_RE = re.compile(
+    r"^(?:get|see|check|find|verify|ensure|avoid|enable|disable|make|be|have|keep)\b",
     re.IGNORECASE,
 )
 
 # Value-domain detectors for short bare-value overrides (e.g., "Use June 30" -> "Actually July 31")
 _DATE_VALUE_RE = re.compile(
     r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
-    r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+"
+    r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?) "
     r"\d{1,2}(?:st|nd|rd|th)?\b|"
     r"\b\d{4}-\d{2}-\d{2}\b",
     re.IGNORECASE,
@@ -639,7 +675,6 @@ _STOPWORDS: frozenset[str] = frozenset(
 class _OverrideSignal:
     kind: str  # "hard" or "soft"
     old_values: tuple[str, ...]
-    new_values: tuple[str, ...]
     topic_hints: tuple[str, ...]
     is_unscoped_retraction: bool
 
@@ -649,11 +684,26 @@ class _OverrideSignal:
 # ---------------------------------------------------------------------------
 
 
+def _trim_non_alnum(text: str) -> str:
+    """Strip leading and trailing non-alphanumeric characters in O(N) time."""
+    n = len(text)
+    start = 0
+    while start < n and not text[start].isalnum():
+        start += 1
+    end = n
+    while end > start and not text[end - 1].isalnum():
+        end -= 1
+    return text[start:end]
+
+
 def strip_fenced_code_blocks(text: str) -> str:
     """Remove Markdown fenced code blocks (`` ``` `` or ``~~~``) in O(N) time.
 
-    Unclosed fences consume the remainder of the text so pasted code snippets
-    never falsely trigger constraint or override detectors.
+    Per CommonMark, a backtick opening fence cannot contain backticks in its info
+    string, so inline triple-backtick spans (e.g., `` ```cmd``` do not run ``)
+    are preserved as prose rather than treated as an unclosed code fence.
+    Unclosed multi-line fences consume the remainder of the text so pasted code
+    snippets never falsely trigger constraint or override detectors.
     """
     clean = sanitize_unicode(text)
     if "```" not in clean and "~~~" not in clean:
@@ -669,6 +719,12 @@ def strip_fenced_code_blocks(text: str) -> str:
             match = _FENCE_OPEN_RE.match(line)
             if match:
                 marker = match.group(1)
+                rest = match.group(2)
+                # CommonMark rule: backtick fence info strings cannot contain backticks;
+                # a same-line closing backtick run is an inline code span, not a block fence.
+                if marker[0] == "`" and "`" in rest:
+                    out_lines.append(line)
+                    continue
                 fence_char = marker[0]
                 fence_len = len(marker)
                 in_fence = True
@@ -697,12 +753,25 @@ def _normalize_prose(text: str) -> str:
 
 
 def _split_sentences(prose: str) -> list[str]:
+    """Split prose into single-space-normalized sentences in strictly O(N) time."""
     parts: list[str] = []
-    for raw in _SENTENCE_SPLIT_RE.split(prose):
-        s = raw.strip()
-        if s:
-            parts.append(s)
+    for raw_line in prose.splitlines():
+        compact_line = " ".join(raw_line.split())
+        if not compact_line:
+            continue
+        for raw_sent in _SENTENCE_BREAK_RE.split(compact_line):
+            s = raw_sent.strip()
+            if s:
+                parts.append(s)
     return parts
+
+
+def _strip_terminal_punct(sentence: str) -> str:
+    """Strip sentence-ending punctuation while keeping internal dots (e.g., 3.11, auth.py)."""
+    end = len(sentence)
+    while end > 0 and sentence[end - 1] in ".!?":
+        end -= 1
+    return sentence[:end].strip()
 
 
 def _is_pure_info_question(sentence: str) -> bool:
@@ -710,9 +779,8 @@ def _is_pure_info_question(sentence: str) -> bool:
     s = sentence.strip()
     if not s.endswith("?"):
         return False
-    # Strip conversational filler like "Wait, " or "Actually, " before checking interrogative
     trimmed = _LEADING_FILLER_RE.sub("", s).strip()
-    trimmed = re.sub(r"^actually\s*,?\s*", "", trimmed, flags=re.IGNORECASE).strip()
+    trimmed = re.sub(r"^actually,? ", "", trimmed, flags=re.IGNORECASE).strip()
     if _POLITE_REQUEST_START_RE.match(trimmed):
         remainder = _POLITE_REQUEST_START_RE.sub("", trimmed, count=1).strip()
         return bool(_NON_DIRECTIVE_REQUEST_VERB_RE.match(remainder))
@@ -735,9 +803,8 @@ def _stem_token(tok: str) -> str:
 
 
 def _extract_content_tokens(text: str) -> frozenset[str]:
-    """Extract normalized domain/topic tokens (splitting camelCase and paths)."""
+    """Extract canonical stemmed domain/topic tokens (1 word -> 1 token)."""
     prose = _normalize_prose(text)
-    # Split camelCase before lowercasing so authHandler -> auth handler
     split_camel = _CAMEL_SPLIT_RE.sub(r"\1 \2", prose).lower()
     tokens: set[str] = set()
     for raw in _WORD_TOKEN_RE.findall(split_camel):
@@ -749,31 +816,41 @@ def _extract_content_tokens(text: str) -> frozenset[str]:
         if stemmed in _STOPWORDS:
             continue
         tokens.add(stemmed)
-        if stemmed != raw:
-            tokens.add(raw)
     return frozenset(tokens)
 
 
 def _clean_phrase(raw: str) -> str:
-    """Clean an extracted old/new/topic phrase for matching."""
+    """Clean an extracted old/topic phrase for matching."""
     cleaned = raw.strip().strip("\"'`()[]{}")
-    cleaned = re.sub(r"^(?:the|a|an)\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^(?:the|a|an) ", "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.rstrip(".,;:!?")
     return " ".join(cleaned.split())
 
 
-def _phrase_in_text(phrase: str, text: str) -> bool:
-    """Check whether ``phrase`` appears in ``text`` on token boundaries."""
+def _phrase_in_norm_text(phrase: str, norm_lower_text: str) -> bool:
+    """Check whether ``phrase`` appears in pre-normalized lowercase text on token boundaries."""
     clean_phrase = _clean_phrase(phrase).lower()
-    if not clean_phrase:
-        return False
-    norm_text = " ".join(_normalize_prose(text).lower().split())
-    if not norm_text:
+    if not clean_phrase or not norm_lower_text:
         return False
     escaped = re.escape(clean_phrase)
-    # Require non-alphanumeric boundaries so "10" doesn't match "100" and "go" != "good".
     pattern = rf"(?<![a-z0-9]){escaped}(?![a-z0-9])"
-    return re.search(pattern, norm_text) is not None
+    return re.search(pattern, norm_lower_text) is not None
+
+
+def _is_negated_or_conditional_clause(sentence: str, pos: int) -> bool:
+    """Return True if the clause preceding ``pos`` is negated or conditional/hypothetical."""
+    prefix = sentence[:pos]
+    # Trim to the current sub-clause (after last semicolon, colon, or "but"/"instead")
+    for sep in (";", ":", " but "):
+        idx = prefix.lower().rfind(sep)
+        if idx != -1:
+            prefix = prefix[idx + len(sep) :]
+    prefix = prefix.strip()
+    if not prefix:
+        return False
+    if _CLAUSE_CONDITIONAL_RE.search(prefix):
+        return True
+    return _CLAUSE_NEGATION_RE.search(prefix) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -790,7 +867,6 @@ def is_negative_constraint(text: str) -> bool:
     for sentence in _split_sentences(prose):
         if _is_pure_info_question(sentence):
             continue
-        # Remove polite question prefix ("Can you make sure...") for inner check
         check = sentence
         if check.endswith("?") and _POLITE_REQUEST_START_RE.match(check):
             check = _POLITE_REQUEST_START_RE.sub("", check, count=1).strip()
@@ -803,9 +879,8 @@ def is_negative_constraint(text: str) -> bool:
             if ("don't" in matched or "do not" in matched) and _NEG_DONT_FALSE_POSITIVE_RE.search(
                 check
             ):
-                # Verify whether there's another non-excluded do-not / don't in this sentence
                 scrubbed = _NEG_DONT_FALSE_POSITIVE_RE.sub(" ", check)
-                if not re.search(r"\b(?:do\s+not|don't)\b", scrubbed, re.IGNORECASE):
+                if not re.search(r"\b(?:do not|don't)\b", scrubbed, re.IGNORECASE):
                     continue
             if matched == "never" and _NEG_NEVER_FALSE_POSITIVE_RE.search(check):
                 scrubbed = _NEG_NEVER_FALSE_POSITIVE_RE.sub(" ", check)
@@ -813,202 +888,6 @@ def is_negative_constraint(text: str) -> bool:
                     continue
             return True
     return False
-
-
-def _is_negated_before(text: str, pos: int) -> bool:
-    """Return True if a negation cue immediately precedes ``pos`` in ``text``."""
-    window = text[max(0, pos - 32) : pos]
-    return _NEGATION_BEFORE_VERB_RE.search(window) is not None
-
-
-def _detect_override_signal(text: str) -> _OverrideSignal | None:
-    """Inspect ``text`` for superseding correction / override cues."""
-    prose = _normalize_prose(text)
-    if not prose:
-        return None
-
-    sentences = _split_sentences(prose)
-    # Filter out pure information-seeking questions
-    non_question_sentences = [s for s in sentences if not _is_pure_info_question(s)]
-    if not non_question_sentences:
-        return None
-
-    active_prose = " ".join(non_question_sentences)
-
-    hard = False
-    soft = False
-    unscoped_retraction = False
-    old_values: list[str] = []
-    new_values: list[str] = []
-    topic_hints: list[str] = []
-
-    def _add_unique(target: list[str], value: str) -> None:
-        cleaned = _clean_phrase(value)
-        if cleaned and cleaned.lower() not in {v.lower() for v in target}:
-            target.append(cleaned)
-
-    # 1. Explicit headers ("Correction:", "Override:", "Update:")
-    if _EXPLICIT_OVERRIDE_HEADER_RE.search(active_prose) or _UPDATE_HEADER_RE.search(active_prose):
-        hard = True
-
-    # 2. Explicit ignore/forget previous instruction (unless negated: "don't ignore ...")
-    for m in _IGNORE_FORGET_ABOUT_RE.finditer(active_prose):
-        if _is_negated_before(active_prose, m.start()):
-            continue
-        hard = True
-        topic = m.group(1)
-        if topic and topic.strip():
-            _add_unique(topic_hints, topic)
-        else:
-            unscoped_retraction = True
-
-    for m in _FORGET_ABOUT_DIRECT_RE.finditer(active_prose):
-        if _is_negated_before(active_prose, m.start()):
-            continue
-        hard = True
-        _add_unique(topic_hints, m.group(1))
-
-    # 3. Scratch that / strike that / cancel that
-    if _SCRATCH_THAT_RE.search(active_prose):
-        hard = True
-        unscoped_retraction = True
-
-    # 4. Never mind ...
-    for m in _NEVER_MIND_RE.finditer(active_prose):
-        hard = True
-        topic = m.group(1)
-        if topic and _extract_content_tokens(topic):
-            _add_unique(topic_hints, topic)
-            _add_unique(old_values, topic)
-        else:
-            unscoped_retraction = True
-
-    # 5. "no, actually ..." / "wait, actually ..." / "on second thought ..."
-    if _HARD_NO_ACTUALLY_RE.search(active_prose):
-        hard = True
-
-    # 6. "instead of <OLD>, use <NEW>" and "<NEW> instead of <OLD>"
-    for m in _INSTEAD_OF_PREFIX_RE.finditer(active_prose):
-        hard = True
-        _add_unique(old_values, m.group(1))
-        if m.group(2):
-            _add_unique(new_values, m.group(2))
-
-    for m in _INSTEAD_OF_SUFFIX_RE.finditer(active_prose):
-        hard = True
-        _add_unique(old_values, m.group(1))
-
-    # 7. "rather than <OLD>"
-    for m in _RATHER_THAN_RE.finditer(active_prose):
-        # Require directive context so casual prose doesn't trigger
-        if _has_directive_sentence(non_question_sentences):
-            hard = True
-            _add_unique(old_values, m.group(1))
-
-    # 8. ", not <OLD>" contrast inside a directive sentence
-    for m in _NOT_CONTRAST_RE.finditer(active_prose):
-        if _has_directive_sentence(non_question_sentences):
-            candidate_old = _clean_phrase(m.group(1))
-            # Avoid matching ", not sure" / ", not really" / ", not yet"
-            if candidate_old and candidate_old.lower() not in {
-                "sure",
-                "really",
-                "yet",
-                "now",
-                "anymore",
-                "at all",
-                "bad",
-                "good",
-                "working",
-                "needed",
-                "necessary",
-            }:
-                hard = True
-                _add_unique(old_values, candidate_old)
-
-    # 9. "switch/change/update/move <topic?> from <OLD> to <NEW>" (unless negated)
-    for m in _FROM_X_TO_Y_RE.finditer(active_prose):
-        if _is_negated_before(active_prose, m.start()):
-            continue
-        hard = True
-        if m.group(1):
-            _add_unique(topic_hints, m.group(1))
-        _add_unique(old_values, m.group(2))
-        _add_unique(new_values, m.group(3))
-
-    # 10. "replace <OLD> with <NEW>" (unless negated)
-    for m in _REPLACE_X_WITH_Y_RE.finditer(active_prose):
-        if _is_negated_before(active_prose, m.start()):
-            continue
-        hard = True
-        _add_unique(old_values, m.group(1))
-        _add_unique(new_values, m.group(2))
-
-    # 11. "change/switch <OLD> to <NEW>" (when not already matched by from..to and not negated)
-    if not old_values:
-        for m in _CHANGE_X_TO_Y_RE.finditer(active_prose):
-            if _is_negated_before(active_prose, m.start()):
-                continue
-            lhs = _clean_phrase(m.group(1))
-            rhs = _clean_phrase(m.group(2))
-            if lhs and rhs and " from " not in lhs.lower():
-                hard = True
-                _add_unique(old_values, lhs)
-                _add_unique(topic_hints, lhs)
-                _add_unique(new_values, rhs)
-
-    # 12. "update the <TOPIC> to <NEW>" (soft unless paired with hard cue; skip if negated)
-    for m in _UPDATE_TOPIC_TO_Y_RE.finditer(active_prose):
-        if _is_negated_before(active_prose, m.start()):
-            continue
-        topic = _clean_phrase(m.group(1))
-        rhs = _clean_phrase(m.group(2))
-        if topic and rhs and _extract_content_tokens(topic):
-            soft = True
-            _add_unique(topic_hints, topic)
-            _add_unique(new_values, rhs)
-
-    # 13. "switch to <NEW>" (soft override cue; skip if negated)
-    if not old_values:
-        for m in _SWITCH_TO_Y_RE.finditer(active_prose):
-            if _is_negated_before(active_prose, m.start()):
-                continue
-            rhs = _clean_phrase(m.group(1))
-            if rhs:
-                soft = True
-                _add_unique(new_values, rhs)
-
-    # 14. Soft "actually" ONLY when accompanied by a genuine directive/constraint!
-    # Strictly guards against "that actually worked!", "thanks, that actually looks great",
-    # "is it actually broken?", "I actually like this".
-    if not hard and _SOFT_ACTUALLY_RE.search(active_prose):
-        # Strip leading "actually," to check if the remainder is a real directive
-        after_actually = re.sub(
-            r"^(?:(?:no|wait|sorry)\s*,\s*)?actually\s*,?\s*",
-            "",
-            active_prose,
-            count=1,
-            flags=re.IGNORECASE,
-        ).strip()
-        if _has_directive_sentence(_split_sentences(after_actually)) or is_negative_constraint(
-            after_actually
-        ):
-            soft = True
-
-    if not hard and not soft:
-        return None
-
-    # If we had specific old_values or topic_hints, it's scoped (not an unscoped retraction)
-    if old_values or topic_hints:
-        unscoped_retraction = False
-
-    return _OverrideSignal(
-        kind="hard" if hard else "soft",
-        old_values=tuple(old_values),
-        new_values=tuple(new_values),
-        topic_hints=tuple(topic_hints),
-        is_unscoped_retraction=unscoped_retraction,
-    )
 
 
 def _has_directive_sentence(sentences: Sequence[str]) -> bool:
@@ -1029,19 +908,263 @@ def _has_directive_sentence(sentences: Sequence[str]) -> bool:
         if _RESTRICTIVE_DIRECTIVE_RE.search(cleaned):
             return True
         if _IMPERATIVE_START_RE.match(cleaned):
-            # Guard against 1-word chatter imperatives like "continue", "go", "run it", "try again"
-            norm_clause = _CHATTER_TRIM_RE.sub("", cleaned.lower())
+            norm_clause = _trim_non_alnum(cleaned.lower())
             if norm_clause not in _CHATTER_PHRASES:
                 return True
-        # Check sub-clauses after ":" or "," (e.g., "One rule: use UTC", "From now on, keep X")
         for sep in (":", ","):
             if sep in cleaned:
-                tail = cleaned.split(sep, 1)[1].strip()
+                tail = _LEADING_FILLER_RE.sub("", cleaned.split(sep, 1)[1].strip()).strip()
                 if tail and _IMPERATIVE_START_RE.match(tail):
-                    norm_tail = _CHATTER_TRIM_RE.sub("", tail.lower())
+                    norm_tail = _trim_non_alnum(tail.lower())
                     if norm_tail not in _CHATTER_PHRASES:
                         return True
     return False
+
+
+def _detect_override_signal(text: str) -> _OverrideSignal | None:
+    """Inspect ``text`` for superseding correction / override cues in O(N) time."""
+    prose = _normalize_prose(text)
+    if not prose:
+        return None
+
+    sentences = _split_sentences(prose)
+    non_question_sentences = [s for s in sentences if not _is_pure_info_question(s)]
+    if not non_question_sentences:
+        return None
+
+    hard = False
+    soft = False
+    unscoped_retraction = False
+    old_values: list[str] = []
+    topic_hints: list[str] = []
+
+    def _add_unique(target: list[str], value: str) -> None:
+        cleaned = _clean_phrase(value)
+        if cleaned and cleaned.lower() not in {v.lower() for v in target}:
+            target.append(cleaned)
+
+    has_any_directive = _has_directive_sentence(non_question_sentences) or is_negative_constraint(
+        " ".join(non_question_sentences)
+    )
+
+    for raw_sent in non_question_sentences:
+        sent = _strip_terminal_punct(raw_sent)
+        if not sent:
+            continue
+
+        # 1. Explicit override headers ("Correction:", "Override:", "New rule:")
+        if _EXPLICIT_OVERRIDE_HEADER_RE.match(sent):
+            hard = True
+
+        # 1b. "Update: <body>" is ONLY an override if <body> is a directive/constraint
+        # (guards against status lines like "Update: the tests pass now.")
+        upd_match = _UPDATE_HEADER_RE.match(sent)
+        if upd_match:
+            body = upd_match.group(1).strip()
+            body_sents = _split_sentences(body)
+            if _has_directive_sentence(body_sents) or is_negative_constraint(body):
+                hard = True
+
+        # 2. Explicit ignore/forget previous instruction (unless negated/conditional)
+        for m in _IGNORE_FORGET_ABOUT_RE.finditer(sent):
+            if _is_negated_or_conditional_clause(sent, m.start()):
+                continue
+            hard = True
+            topic = m.group(1)
+            if topic and topic.strip():
+                _add_unique(topic_hints, topic)
+            else:
+                unscoped_retraction = True
+
+        for m in _FORGET_ABOUT_DIRECT_RE.finditer(sent):
+            if _is_negated_or_conditional_clause(sent, m.start()):
+                continue
+            hard = True
+            _add_unique(topic_hints, m.group(1))
+
+        # 3. Scratch that / strike that / cancel that (only at clause boundary)
+        if _SCRATCH_THAT_RE.match(sent):
+            hard = True
+            unscoped_retraction = True
+
+        # 4. Never mind ...
+        nm_match = _NEVER_MIND_RE.match(sent)
+        if nm_match:
+            after_punct = nm_match.group(1)
+            topic_arg = nm_match.group(2)
+            if topic_arg and _extract_content_tokens(topic_arg):
+                hard = True
+                _add_unique(topic_hints, topic_arg)
+                _add_unique(old_values, topic_arg)
+            elif after_punct is not None:
+                # "Never mind, use 30s" -> retraction; "Never mind, I found it" -> conversational!
+                tail = after_punct.strip()
+                if not tail or _has_directive_sentence([tail]) or is_negative_constraint(tail):
+                    hard = True
+                    unscoped_retraction = True
+            else:
+                # Bare "Never mind."
+                hard = True
+                unscoped_retraction = True
+
+        # 5. "no, actually ..." / "wait, actually ..." / "on second thought ..."
+        if _HARD_NO_ACTUALLY_RE.match(sent):
+            after = _HARD_NO_ACTUALLY_RE.sub("", sent, count=1).lstrip(",:;- ")
+            if not after or _has_directive_sentence([after]) or is_negative_constraint(after):
+                hard = True
+
+        # 6. "instead of <OLD>, use <NEW>" (prefix form has built-in directive verb)
+        for m in _INSTEAD_OF_PREFIX_RE.finditer(sent):
+            if _is_negated_or_conditional_clause(sent, m.start()):
+                continue
+            hard = True
+            _add_unique(old_values, m.group(1))
+
+        sent_after_actually = (
+            re.sub(
+                r"^(?:(?:no|wait|sorry), )?actually,? ",
+                "",
+                sent,
+                count=1,
+                flags=re.IGNORECASE,
+            ).strip()
+            if _SOFT_ACTUALLY_RE.match(sent)
+            else ""
+        )
+        sent_has_directive = has_any_directive or (
+            bool(sent_after_actually)
+            and (
+                _has_directive_sentence([sent_after_actually])
+                or is_negative_constraint(sent_after_actually)
+            )
+        )
+
+        # 6b. "<NEW> instead of <OLD>" ONLY in directive/override sentences
+        # (guards against bug reports like "The function returns None instead of a list.")
+        if sent_has_directive or hard:
+            for m in _INSTEAD_OF_SUFFIX_RE.finditer(sent):
+                if _is_negated_or_conditional_clause(sent, m.start()):
+                    continue
+                hard = True
+                _add_unique(old_values, m.group(1))
+
+        # 7. "rather than <OLD>" (only in directive sentences)
+        if sent_has_directive:
+            for m in _RATHER_THAN_RE.finditer(sent):
+                if _is_negated_or_conditional_clause(sent, m.start()):
+                    continue
+                hard = True
+                _add_unique(old_values, m.group(1))
+
+        # 8. ", not <OLD>" contrast inside a directive sentence
+        if sent_has_directive:
+            for m in _NOT_CONTRAST_RE.finditer(sent):
+                candidate_old = _clean_phrase(m.group(1))
+                if candidate_old and candidate_old.lower() not in {
+                    "sure",
+                    "really",
+                    "yet",
+                    "now",
+                    "anymore",
+                    "at all",
+                    "bad",
+                    "good",
+                    "working",
+                    "needed",
+                    "necessary",
+                }:
+                    hard = True
+                    _add_unique(old_values, candidate_old)
+
+        # 9. "switch/change/update/move <topic?> from <OLD> to <NEW>" (directive position only)
+        for m in _FROM_X_TO_Y_RE.finditer(sent):
+            if _is_negated_or_conditional_clause(sent, m.start()):
+                continue
+            rhs = _clean_phrase(m.group(3))
+            if not rhs or _INFINITIVE_PURPOSE_START_RE.match(rhs):
+                continue
+            hard = True
+            if m.group(1):
+                _add_unique(topic_hints, m.group(1))
+            _add_unique(old_values, m.group(2))
+
+        # 10. "replace <OLD> with <NEW>" (directive position only)
+        for m in _REPLACE_X_WITH_Y_RE.finditer(sent):
+            if _is_negated_or_conditional_clause(sent, m.start()):
+                continue
+            hard = True
+            _add_unique(old_values, m.group(1))
+
+        # 11. "change/switch <OLD> to <NEW>" (directive position, not from..to, not infinitive)
+        if not old_values:
+            for m in _CHANGE_X_TO_Y_RE.finditer(sent):
+                if _is_negated_or_conditional_clause(sent, m.start()):
+                    continue
+                lhs = _clean_phrase(m.group(1))
+                rhs = _clean_phrase(m.group(2))
+                if (
+                    lhs
+                    and rhs
+                    and " from " not in lhs.lower()
+                    and not _INFINITIVE_PURPOSE_START_RE.match(rhs)
+                ):
+                    hard = True
+                    _add_unique(old_values, lhs)
+                    _add_unique(topic_hints, lhs)
+
+        # 12. "update the <TOPIC> to <NEW>" (soft override cue)
+        for m in _UPDATE_TOPIC_TO_Y_RE.finditer(sent):
+            if _is_negated_or_conditional_clause(sent, m.start()):
+                continue
+            topic = _clean_phrase(m.group(1))
+            rhs = _clean_phrase(m.group(2))
+            if (
+                topic
+                and rhs
+                and not _INFINITIVE_PURPOSE_START_RE.match(rhs)
+                and _extract_content_tokens(topic)
+            ):
+                soft = True
+                _add_unique(topic_hints, topic)
+
+        # 13. "switch to <NEW>" (soft override cue)
+        if not old_values:
+            for m in _SWITCH_TO_Y_RE.finditer(sent):
+                if _is_negated_or_conditional_clause(sent, m.start()):
+                    continue
+                rhs = _clean_phrase(m.group(1))
+                if rhs and not _INFINITIVE_PURPOSE_START_RE.match(rhs):
+                    soft = True
+
+        # 14. Soft "actually" ONLY when accompanied by a directive/constraint and NOT additive
+        # (guards against "that actually worked!", "actually, also add an index", questions)
+        if (
+            not hard
+            and _SOFT_ACTUALLY_RE.match(sent)
+            and not _ADDITIVE_AFTER_ACTUALLY_RE.match(sent)
+        ):
+            after_actually = re.sub(
+                r"^(?:(?:no|wait|sorry), )?actually,? ",
+                "",
+                sent,
+                count=1,
+                flags=re.IGNORECASE,
+            ).strip()
+            if _has_directive_sentence([after_actually]) or is_negative_constraint(after_actually):
+                soft = True
+
+    if not hard and not soft:
+        return None
+
+    if old_values or topic_hints:
+        unscoped_retraction = False
+
+    return _OverrideSignal(
+        kind="hard" if hard else "soft",
+        old_values=tuple(old_values),
+        topic_hints=tuple(topic_hints),
+        is_unscoped_retraction=unscoped_retraction,
+    )
 
 
 def is_override_turn(text: str) -> bool:
@@ -1075,28 +1198,27 @@ def is_chatter(text: str) -> bool:
 
     prose = _normalize_prose(clean)
     if not prose:
-        # If there was a fenced code block (and no prose), it's code rather than chatter.
         return "```" not in clean and "~~~" not in clean
+
+    # Pure punctuation / emoji / symbols (strictly O(N), never uses regex trim)
+    if not any(ch.isalnum() for ch in prose):
+        return True
+
+    # Short-circuit long inputs BEFORE clause analysis or override checks
+    if len(prose) > 140:
+        return False
 
     # Never classify a genuine directive, negative constraint, or override as chatter.
     if is_negative_constraint(clean) or _detect_override_signal(clean) is not None:
         return False
 
-    # Pure punctuation / emoji / symbols
-    stripped = _CHATTER_TRIM_RE.sub("", prose.lower())
-    if not stripped:
-        return True
-
-    if len(prose) > 140:
-        return False
-
-    # Every non-empty clause must be a known low-signal acknowledgement phrase
-    clauses = [c.strip() for c in _CLAUSE_SPLIT_RE.split(prose.lower()) if c.strip()]
+    compact = " ".join(prose.lower().split())
+    clauses = [c.strip() for c in _CLAUSE_SPLIT_RE.split(compact) if c.strip()]
     if not clauses:
         return True
 
     for clause in clauses:
-        norm = " ".join(_CHATTER_TRIM_RE.sub("", clause).split())
+        norm = " ".join(_trim_non_alnum(clause).split())
         if not norm:
             continue
         if norm not in _CHATTER_PHRASES:
@@ -1113,16 +1235,18 @@ def _score_supersede_candidate(
     signal: _OverrideSignal,
     override_text: str,
     override_tokens: frozenset[str],
-    candidate: PinEntry,
+    candidate_norm_lower: str,
     candidate_own_tokens: frozenset[str],
     candidate_chain_tokens: frozenset[str],
+    candidate_has_date: bool,
+    override_has_date: bool,
 ) -> int:
-    """Score how strongly ``signal`` targets ``candidate``. Return 0 for no match."""
+    """Score how strongly ``signal`` targets a candidate pin. Return 0 for no match."""
     score = 0
 
     # 1. Explicit old-value matches (highest signal)
     for old_val in signal.old_values:
-        if _phrase_in_text(old_val, candidate.text):
+        if _phrase_in_norm_text(old_val, candidate_norm_lower):
             score += 120
             continue
         old_tokens = _extract_content_tokens(old_val)
@@ -1139,7 +1263,7 @@ def _score_supersede_candidate(
 
     # 2. Explicit topic-hint matches ("ignore what I said earlier about auth")
     for hint in signal.topic_hints:
-        if _phrase_in_text(hint, candidate.text):
+        if _phrase_in_norm_text(hint, candidate_norm_lower):
             score += 90
             continue
         hint_tokens = _extract_content_tokens(hint)
@@ -1152,7 +1276,6 @@ def _score_supersede_candidate(
                 if chain_hit:
                     score += 35 * len(chain_hit)
                 else:
-                    # Prefix match for domain abbreviations (e.g., "auth" <-> "authentication")
                     for ht in hint_tokens:
                         if len(ht) >= 4 and any(
                             ct.startswith(ht) or ht.startswith(ct)
@@ -1162,36 +1285,28 @@ def _score_supersede_candidate(
                             score += 30
                             break
 
-    # 3. General content-token overlap (excluding stopwords & generic directive verbs)
+    # 3. General content-token overlap (1 word = 1 canonical stemmed token).
+    # Soft overrides ("actually, ...") MUST share >= 2 distinct content tokens so one
+    # incidental shared noun (e.g., "database" or "test") never falsely supersedes.
     own_overlap = override_tokens & candidate_own_tokens
     chain_overlap = override_tokens & candidate_chain_tokens
-
-    # If the override explicitly named old_values or topic_hints that had ZERO match
-    # against this candidate, be stricter about incidental single-word overlap.
     has_explicit_target = bool(signal.old_values or signal.topic_hints)
 
     if len(own_overlap) >= 2:
         score += 25 * len(own_overlap)
-    elif len(own_overlap) == 1 and not has_explicit_target:
+    elif len(own_overlap) == 1 and not has_explicit_target and signal.kind == "hard":
         tok = next(iter(own_overlap))
         if len(tok) >= 4:
             score += 25
     elif len(chain_overlap) >= 2:
         score += 18 * len(chain_overlap)
-    elif len(chain_overlap) == 1 and not has_explicit_target:
+    elif len(chain_overlap) == 1 and not has_explicit_target and signal.kind == "hard":
         tok = next(iter(chain_overlap))
-        if len(tok) >= 4 and signal.kind == "hard":
+        if len(tok) >= 4:
             score += 18
 
     # 4. Short date-only value override (e.g., "Use June 30." -> "Actually, use July 31.")
-    if (
-        score == 0
-        and not has_explicit_target
-        and _DATE_VALUE_RE.search(override_text)
-        and _DATE_VALUE_RE.search(candidate.text)
-    ):
-        # Only match bare date rules when they don't introduce conflicting topic nouns
-        # (filter out month names and day numbers).
+    if score == 0 and not has_explicit_target and override_has_date and candidate_has_date:
         override_non_date = {
             t
             for t in override_tokens
@@ -1213,7 +1328,7 @@ def _score_supersede_candidate(
 
 
 # ---------------------------------------------------------------------------
-# Main extraction pipeline
+# Main extraction pipeline (O(N) via inverted token index)
 # ---------------------------------------------------------------------------
 
 
@@ -1227,11 +1342,35 @@ def extract_pins(
     - Filters chatter/acknowledgements and non-directive turns.
     - Detects negative constraints and superseding corrections, linking multi-step
       override chains (``A -> B -> C``) via ``supersedes`` / ``superseded_by``.
-    - Deduplicates repeated active instructions cleanly.
+    - Deduplicates repeated active instructions cleanly while still allowing
+      repeated retractions (e.g., ``Scratch that.`` used twice on separate rules).
     """
     result: list[PinEntry] = []
-    # Maps pin_id -> (own_tokens, accumulated_chain_tokens)
-    pin_tokens: dict[str, tuple[frozenset[str], frozenset[str]]] = {}
+    # pin_id -> (order_idx, own_tokens, chain_tokens, norm_lower_prose, has_date)
+    pin_meta: dict[str, tuple[int, frozenset[str], frozenset[str], str, bool]] = {}
+    # Inverted index: canonical token -> active pins containing that token
+    token_index: dict[str, list[PinEntry]] = {}
+    # Prefix bucket (first 4 chars) for abbreviation topic hints ("auth" <-> "authentication")
+    prefix4_index: dict[str, list[PinEntry]] = {}
+    # Active pins that contain a calendar date value
+    date_pins: list[PinEntry] = []
+
+    def _index_pin(
+        pin: PinEntry,
+        own_tokens: frozenset[str],
+        chain_tokens: frozenset[str],
+        norm_lower: str,
+        has_date: bool,
+    ) -> None:
+        order_idx = len(result)
+        result.append(pin)
+        pin_meta[pin.pin_id] = (order_idx, own_tokens, chain_tokens, norm_lower, has_date)
+        for tok in chain_tokens:
+            token_index.setdefault(tok, []).append(pin)
+            if len(tok) >= 4:
+                prefix4_index.setdefault(tok[:4], []).append(pin)
+        if has_date:
+            date_pins.append(pin)
 
     # 1. Copy & deduplicate manual pins (never mutate caller's PinEntry objects)
     seen_manual_norms: set[str] = set()
@@ -1269,9 +1408,9 @@ def extract_pins(
         seen_manual_norms.add(norm)
         seen_pin_ids.add(copied.pin_id)
         manual_by_norm[norm] = copied
-        result.append(copied)
         toks = _extract_content_tokens(clean_text)
-        pin_tokens[copied.pin_id] = (toks, toks)
+        norm_lower = " ".join(_normalize_prose(clean_text).lower().split())
+        _index_pin(copied, toks, toks, norm_lower, bool(_DATE_VALUE_RE.search(norm_lower)))
 
     # 2. Sort user turns deterministically by (turn_index, seq, original_order)
     ordered_turns = [
@@ -1284,6 +1423,9 @@ def extract_pins(
 
     # Track normalized text of currently ACTIVE pins for deduplication
     active_norms: set[str] = set(seen_manual_norms)
+    # Track the pin produced by the immediately preceding non-chatter user turn so
+    # unscoped retractions ("Scratch that.", "Never mind.") never reach past unrelated turns.
+    prev_non_chatter_pin: PinEntry | None = None
 
     for turn in ordered_turns:
         clean_text = sanitize_unicode(turn.text).strip()
@@ -1297,58 +1439,97 @@ def extract_pins(
         neg = is_negative_constraint(clean_text)
         directive = neg or signal is not None or is_constraint_or_directive(clean_text)
         if not directive:
-            continue
-
-        # Deduplicate repeated identical/whitespace-equivalent active instructions
-        if norm in active_norms:
+            # Non-chatter, non-directive turn (e.g., question or status update) breaks
+            # adjacency for unscoped retractions.
+            prev_non_chatter_pin = None
             continue
 
         own_tokens = _extract_content_tokens(clean_text)
+        norm_lower = " ".join(_normalize_prose(clean_text).lower().split())
+        override_has_date = bool(_DATE_VALUE_RE.search(norm_lower))
         superseded_target: PinEntry | None = None
 
         if signal is not None:
-            # Find eligible earlier active pins (newest first)
-            candidates: list[PinEntry] = []
-            for prev in reversed(result):
-                if prev.superseded_by is not None:
-                    continue
-                # Only supersede a manual pin if it has an explicit earlier turn_index
-                if prev.source == "manual" and (
-                    prev.turn_index is None or prev.turn_index >= turn.turn_index
+            # Gather candidate active pins via inverted index in O(matched) time
+            query_tokens: set[str] = set(own_tokens)
+            for old_val in signal.old_values:
+                query_tokens.update(_extract_content_tokens(old_val))
+            for hint in signal.topic_hints:
+                query_tokens.update(_extract_content_tokens(hint))
+
+            candidate_map: dict[str, PinEntry] = {}
+
+            def _collect_from(bucket: list[PinEntry], out: dict[str, PinEntry]) -> None:
+                # Lazily prune superseded pins while collecting active candidates
+                alive: list[PinEntry] = []
+                for p in bucket:
+                    if p.superseded_by is None:
+                        alive.append(p)
+                        out[p.pin_id] = p
+                if len(alive) != len(bucket):
+                    bucket[:] = alive
+
+            for tok in query_tokens:
+                bucket = token_index.get(tok)
+                if bucket:
+                    _collect_from(bucket, candidate_map)
+
+            for hint in signal.topic_hints:
+                for ht in _extract_content_tokens(hint):
+                    if len(ht) >= 4:
+                        pbucket = prefix4_index.get(ht[:4])
+                        if pbucket:
+                            _collect_from(pbucket, candidate_map)
+
+            if override_has_date and not signal.old_values and not signal.topic_hints and date_pins:
+                _collect_from(date_pins, candidate_map)
+
+            # Sort matched candidates newest-first for deterministic recency tie-breaking
+            eligible: list[PinEntry] = []
+            for cand in candidate_map.values():
+                if cand.source == "manual" and (
+                    cand.turn_index is None or cand.turn_index >= turn.turn_index
                 ):
                     continue
-                candidates.append(prev)
+                eligible.append(cand)
+            eligible.sort(key=lambda p: pin_meta[p.pin_id][0], reverse=True)
 
             best_score = 0
             best_candidate: PinEntry | None = None
-            for cand in candidates:
-                cand_own, cand_chain = pin_tokens.get(cand.pin_id, (frozenset(), frozenset()))
+            for cand in eligible:
+                _, cand_own, cand_chain, cand_norm_lower, cand_has_date = pin_meta[cand.pin_id]
                 score = _score_supersede_candidate(
                     signal=signal,
                     override_text=clean_text,
                     override_tokens=own_tokens,
-                    candidate=cand,
+                    candidate_norm_lower=cand_norm_lower,
                     candidate_own_tokens=cand_own,
                     candidate_chain_tokens=cand_chain,
+                    candidate_has_date=cand_has_date,
+                    override_has_date=override_has_date,
                 )
-                # Strict > preserves recency preference on ties (candidates are newest first)
                 if score > best_score:
                     best_score = score
                     best_candidate = cand
 
             if best_candidate is not None and best_score >= 25:
                 superseded_target = best_candidate
-            elif signal.is_unscoped_retraction and candidates:
-                # Unscoped retraction ("scratch that", "ignore what I said earlier") targets
-                # the most recent active transcript pin (never an un-indexed manual pin).
-                for cand in candidates:
-                    if cand.source != "manual":
-                        superseded_target = cand
-                        break
+            elif (
+                signal.is_unscoped_retraction
+                and prev_non_chatter_pin is not None
+                and prev_non_chatter_pin.superseded_by is None
+                and prev_non_chatter_pin.source != "manual"
+            ):
+                # Unscoped retraction only targets the immediately preceding active
+                # transcript pin, never jumping over intervening unrelated turns.
+                superseded_target = prev_non_chatter_pin
 
-        # Determine final pin source:
-        # - "override" if we superseded a target OR it's a hard override signal
-        # - "auto" if it was only a soft cue (e.g. "actually, also add X") with no target match
+        # Deduplicate repeated identical/whitespace-equivalent active instructions,
+        # UNLESS this turn supersedes a distinct active pin (e.g., repeated "Scratch that.").
+        if superseded_target is None and norm in active_norms:
+            prev_non_chatter_pin = None
+            continue
+
         source = (
             "override"
             if (superseded_target is not None or (signal is not None and signal.kind == "hard"))
@@ -1357,7 +1538,6 @@ def extract_pins(
 
         pin_id = make_pin_id(source, norm, turn.turn_index)
         if pin_id in seen_pin_ids:
-            # Disambiguate deterministic ID if same turn_index has distinct seq
             pin_id = make_pin_id(source, f"{norm}#seq={turn.seq}", turn.turn_index)
         if pin_id in seen_pin_ids:
             continue
@@ -1379,12 +1559,13 @@ def extract_pins(
             superseded_target.superseded_by = new_pin.pin_id
             old_norm = normalize_pin_text(superseded_target.text)
             active_norms.discard(old_norm)
-            _, prev_chain = pin_tokens.get(superseded_target.pin_id, (frozenset(), frozenset()))
+            _, _, prev_chain, _, prev_has_date = pin_meta[superseded_target.pin_id]
             chain_tokens = own_tokens | prev_chain
+            override_has_date = override_has_date or prev_has_date
 
         seen_pin_ids.add(new_pin.pin_id)
         active_norms.add(norm)
-        pin_tokens[new_pin.pin_id] = (own_tokens, chain_tokens)
-        result.append(new_pin)
+        _index_pin(new_pin, own_tokens, chain_tokens, norm_lower, override_has_date)
+        prev_non_chatter_pin = new_pin
 
     return result
