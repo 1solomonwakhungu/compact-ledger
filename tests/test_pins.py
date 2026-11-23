@@ -670,7 +670,202 @@ def test_inline_triple_backticks_do_not_swallow_turn() -> None:
         "The loop never terminates.",
         "I never said that.",
         "They don't compile on Windows.",
+        "These don't work.",
+        "Your changes don't compile.",
+        "I don't like this.",
     ],
 )
 def test_bug_reports_are_not_labeled_negative_constraints(text: str) -> None:
     assert is_negative_constraint(text) is False
+
+
+def test_self_referential_always_is_not_pinned() -> None:
+    assert is_constraint_or_directive("I always forget how this works.") is False
+
+
+@pytest.mark.parametrize(
+    ("turns_list", "expected_preserved"),
+    [
+        (
+            [
+                "Never push to the main branch.",
+                "Switch to the main branch and run the tests.",
+            ],
+            "Never push to the main branch.",
+        ),
+        (
+            [
+                "Always return a list from get_users.",
+                "The function returns None instead of a list. Make sure it handles empty input.",
+            ],
+            "Always return a list from get_users.",
+        ),
+        (
+            [
+                "Always return a list from get_users.",
+                "Instead of a list, the function returns None.",
+            ],
+            "Always return a list from get_users.",
+        ),
+        (
+            [
+                "Never delete the tests.",
+                "Change the tests to use fixtures.",
+            ],
+            "Never delete the tests.",
+        ),
+        (
+            [
+                "Keep the README under 200 lines.",
+                "Update the README to mention the new CLI flag.",
+            ],
+            "Keep the README under 200 lines.",
+        ),
+        (
+            [
+                "Never use the production database in tests.",
+                "Switch to the tests directory and use the database fixture.",
+            ],
+            "Never use the production database in tests.",
+        ),
+        (
+            [
+                "Never deploy to prod without approval.",
+                "Use the staging DB, not sure if prod is ready.",
+            ],
+            "Never deploy to prod without approval.",
+        ),
+        (
+            [
+                "Make sure it works on Windows.",
+                "nvm it works",
+            ],
+            "Make sure it works on Windows.",
+        ),
+        (
+            [
+                "Keep the API rate under 10 rps.",
+                "Ignore the rate limit errors in the log for now.",
+            ],
+            "Keep the API rate under 10 rps.",
+        ),
+        (
+            [
+                "Never commit config secrets.",
+                "Replace the old logging config with structlog.",
+            ],
+            "Never commit config secrets.",
+        ),
+        (
+            [
+                "Use pytest for all tests.",
+                "On second thought, add more tests for the parser.",
+            ],
+            "Use pytest for all tests.",
+        ),
+        (
+            [
+                "Tests must stay green.",
+                "Update: tests must have been flaky, green now.",
+            ],
+            "Tests must stay green.",
+        ),
+    ],
+)
+def test_round2_b1_neighbouring_phrasings_never_falsely_supersede(
+    turns_list: list[str],
+    expected_preserved: str,
+) -> None:
+    pins = extract_pins(_turns(*turns_list))
+    by_text = {p.text: p for p in pins}
+    assert expected_preserved in by_text
+    assert by_text[expected_preserved].superseded_by is None
+
+
+@pytest.mark.parametrize(
+    ("initial", "override"),
+    [
+        ("Use tabs for indentation.", "Don't use tabs; switch from tabs to spaces."),
+        ("Run tests with pytest.", "When you're done, switch from pytest to unittest."),
+    ],
+)
+def test_round2_multiclause_overrides_not_blocked_by_previous_clause(
+    initial: str,
+    override: str,
+) -> None:
+    pins = extract_pins(_turns(initial, override))
+    assert len(pins) == 2
+    assert pins[1].source == "override"
+    assert pins[1].supersedes == pins[0].pin_id
+    assert pins[0].superseded_by == pins[1].pin_id
+
+
+def test_round2_b3_consecutive_scratch_and_repeat_then_scratch() -> None:
+    # Two consecutive "Scratch that." must not chain on each other
+    pins_consec = extract_pins(_turns("Use tabs.", "Scratch that.", "Scratch that."))
+    assert len(pins_consec) == 2
+    assert pins_consec[0].superseded_by == pins_consec[1].pin_id
+    assert pins_consec[1].superseded_by is None
+
+    # Repeat rule then "Scratch that." must still retract the rule
+    pins_repeat = extract_pins(_turns("Use tabs.", "Use tabs.", "Scratch that."))
+    assert len(pins_repeat) == 2
+    assert pins_repeat[0].superseded_by == pins_repeat[1].pin_id
+    assert pins_repeat[1].supersedes == pins_repeat[0].pin_id
+
+
+def test_round2_indented_and_blockquoted_fences_stripped() -> None:
+    quoted = "See this quote:\n> ```python\n> Never touch auth.py.\n> ```\n"
+    indented = "Example:\n    ```bash\n    Actually use July 31 instead of June 30.\n    ```\n"
+    assert "Never touch" not in strip_fenced_code_blocks(quoted)
+    assert "July 31" not in strip_fenced_code_blocks(indented)
+    pins = extract_pins(_turns("Use June 30 cutoff.", quoted, indented))
+    assert len(pins) == 1
+    assert pins[0].superseded_by is None
+
+
+def test_round2_b4_three_linear_scaling_stress_shapes() -> None:
+    # 1. Huge single line with repeated "instead of X, use Y" (~200KB)
+    huge_line = " ".join("instead of foo, use bar;" for _ in range(8000))
+    t0 = time.monotonic()
+    extract_pins([UserTurn(turn_index=1, text=huge_line, seq=1)])
+    assert (time.monotonic() - t0) < 0.5
+
+    # 2. 2,000 pins sharing a common word + 2,000 overrides using it
+    shared_turns = [
+        *[
+            UserTurn(
+                turn_index=i + 1,
+                text=f"Keep database table_{i} indexed.",
+                seq=i + 1,
+            )
+            for i in range(2000)
+        ],
+        *[
+            UserTurn(
+                turn_index=2001 + i,
+                text=f"Switch database engine_{i} from v{i} to v{i + 1}.",
+                seq=2001 + i,
+            )
+            for i in range(2000)
+        ],
+    ]
+    t1 = time.monotonic()
+    extract_pins(shared_turns)
+    assert (time.monotonic() - t1) < 1.5
+
+    # 3. 2,000-step single override chain
+    chain_turns = [UserTurn(turn_index=1, text="Use token_0 for cutoff.", seq=1)] + [
+        UserTurn(
+            turn_index=i + 2,
+            text=f"Switch from token_{i} to token_{i + 1}.",
+            seq=i + 2,
+        )
+        for i in range(2000)
+    ]
+    t2 = time.monotonic()
+    chain_pins = extract_pins(chain_turns)
+    assert (time.monotonic() - t2) < 1.0
+    active = [p for p in chain_pins if p.superseded_by is None]
+    assert len(active) == 1
+    assert "token_2000" in active[0].text

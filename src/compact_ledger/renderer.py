@@ -32,10 +32,10 @@ __all__ = [
 
 DEFAULT_MAX_CHARS = 6000
 _MAX_SUPERSEDED_SNIPPET_CHARS = 120
-# Under roomy budgets (>= 2000 chars) with multiple active pins, cap any single
-# unusually long pin so one 8KB log dump cannot starve all remaining [DO NOT] rules.
-_SINGLE_PIN_STARVATION_CAP = 1200
-_STARVATION_BUDGET_THRESHOLD = 2000
+# Minimum floor before reserving space for other active pins under overflow (preserves
+# strict monotonicity as max_chars grows while preventing one 8KB log from starving Tier 2).
+_STARVATION_FLOOR_CHARS = 1200
+_MAX_METADATA_DEPTH = 32
 
 _TRAJECTORY_PRIORITY: dict[str, int] = {
     "OSCILLATING": 0,
@@ -67,37 +67,78 @@ def _truncate_text(text: str, max_len: int) -> str:
     return text[: max_len - 3].rstrip() + "..."
 
 
-def _sanitize_json_value(value: Any) -> Any:
-    """Recursively sanitize strings (surrogates) and non-finite floats (NaN/Inf -> None)."""
+def _sanitize_json_value(value: Any, *, _depth: int = 0) -> Any:
+    """Sanitize arbitrary values into strict RFC-8259 JSON-safe primitives.
+
+    Guards against lone UTF-16 surrogates, non-finite floats (NaN/Inf -> None),
+    non-JSON containers (set/frozenset/bytes/arbitrary objects), and deep nesting
+    (never raises RecursionError or TypeError).
+    """
+    if value is None or isinstance(value, bool | int):
+        return value
     if isinstance(value, str):
         return sanitize_unicode(value)
     if isinstance(value, float):
         return value if math.isfinite(value) else None
+    if isinstance(value, bytes | bytearray | memoryview):
+        return sanitize_unicode(bytes(value).decode("utf-8", errors="replace"))
+    if _depth >= _MAX_METADATA_DEPTH:
+        return "<truncated>"
     if isinstance(value, dict):
-        return {sanitize_unicode(str(k)): _sanitize_json_value(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_sanitize_json_value(item) for item in value]
-    if isinstance(value, tuple):
-        return [_sanitize_json_value(item) for item in value]
-    return value
+        return {
+            sanitize_unicode(str(k)): _sanitize_json_value(v, _depth=_depth + 1)
+            for k, v in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_sanitize_json_value(item, _depth=_depth + 1) for item in value]
+    if isinstance(value, set | frozenset):
+        items = [_sanitize_json_value(item, _depth=_depth + 1) for item in value]
+        return sorted(items, key=lambda x: json.dumps(x, ensure_ascii=False, sort_keys=True))
+    return sanitize_unicode(str(value))
+
+
+def _compute_monotonic_pin_cap(
+    pin_text_lengths: Sequence[int],
+    max_chars: int,
+    *,
+    per_pin_overhead: int,
+) -> int | None:
+    """Return a monotonically non-decreasing per-pin cap ONLY when pins overflow ``max_chars``.
+
+    - If all pins fit verbatim in ``max_chars`` -> returns ``None`` (zero verbatim loss).
+    - If pins overflow AND ``max_chars > _STARVATION_FLOOR_CHARS`` AND there are multiple
+      active pins -> reserves just enough space for the other short pins (capped at
+      ``max_chars - _STARVATION_FLOOR_CHARS``) so ``cap(B) = B - min(other, max(0, B - 1200))``
+      is mathematically guaranteed to be monotonically non-decreasing for all ``B >= 0``.
+    """
+    if len(pin_text_lengths) <= 1 or max_chars <= _STARVATION_FLOOR_CHARS:
+        return None
+    total_estimated = sum(length + per_pin_overhead for length in pin_text_lengths)
+    if total_estimated + 120 <= max_chars:
+        return None
+
+    # Reserve space for the non-longest pins (capped per pin at 240 chars so only short
+    # rules are guaranteed room without starving a primary long rule).
+    max_len = max(pin_text_lengths)
+    skipped_max = False
+    other_needed = 0
+    for length in pin_text_lengths:
+        if not skipped_max and length == max_len:
+            skipped_max = True
+            continue
+        other_needed += min(length, 240) + per_pin_overhead
+
+    reserve = min(other_needed, max(0, max_chars - _STARVATION_FLOOR_CHARS))
+    cap = max_chars - reserve - per_pin_overhead - 80
+    if cap < _STARVATION_FLOOR_CHARS:
+        cap = _STARVATION_FLOOR_CHARS
+    return cap if cap < max_len else None
 
 
 def _partition_pins(
     pins: Sequence[PinEntry],
 ) -> tuple[list[PinEntry], list[PinEntry], list[PinEntry], list[PinEntry], dict[str, PinEntry]]:
-    """Partition pins into active manual, active overrides, active auto, and superseded.
-
-    Returns ``(manual, overrides, auto, superseded, pins_by_id)`` where:
-    - ``manual`` preserves original order.
-    - ``overrides`` and ``auto`` are ordered newest first.
-    - Superseded pins are NEVER included in the active lists.
-    - Malformed inputs (dangling ``superseded_by`` pointing to a missing pin, cycles via
-      ``superseded_by`` or ``supersedes``, or duplicate ``pin_id``s) never cause all pins
-      to vanish silently.
-    """
-    # Deduplicate by pin_id cleanly (first occurrence owns the ID for link resolution,
-    # while duplicate entries with identical pin_id are tracked per-index so one stale
-    # duplicate cannot silently hide an active sibling).
+    """Partition pins into active manual, active overrides, active auto, and superseded."""
     pins_by_id: dict[str, PinEntry] = {}
     id_to_indices: dict[str, list[int]] = {}
     for idx, p in enumerate(pins):
@@ -105,9 +146,6 @@ def _partition_pins(
         if p.pin_id not in pins_by_id:
             pins_by_id[p.pin_id] = p
 
-    # Build unified directed "old_id -> newer_id" edges from BOTH superseded_by and supersedes,
-    # only when the target pin_id actually exists in this snapshot (prevents dangling links
-    # from vanishing a pin whose replacement isn't present).
     superseded_by_map: dict[str, str] = {}
     superseded_indices: set[int] = set()
 
@@ -124,8 +162,6 @@ def _partition_pins(
                 superseded_indices.add(target_idx)
             superseded_by_map.setdefault(p.supersedes, p.pin_id)
 
-    # Break cycles of any length (expressed via superseded_by, supersedes, or mixed) by
-    # keeping the newest pin in each cycle active.
     visited_global: set[str] = set()
     for start_id in superseded_by_map:
         if start_id in visited_global:
@@ -264,12 +300,17 @@ def _cap_pin_body(body: str, per_pin_cap: int | None) -> str:
     return _truncate_text(body, per_pin_cap)
 
 
+def _sanitize_tag(tag: str) -> str:
+    """Prevent bracket characters inside a tag from forging fake [OVERRIDE]/[MANUAL] prefixes."""
+    return _flatten_single_line(tag).replace("[", "(").replace("]", ")")
+
+
 def _format_manual_pin(pin: PinEntry, per_pin_cap: int | None = None) -> str:
     prefixes: list[str] = ["[MANUAL]"]
     if pin.is_negative:
         prefixes.append("[DO NOT]")
     if pin.tags:
-        clean_tags = ", ".join(_flatten_single_line(t) for t in pin.tags if t.strip())
+        clean_tags = ", ".join(_sanitize_tag(t) for t in pin.tags if t.strip())
         if clean_tags:
             prefixes.append(f"[tags: {clean_tags}]")
     body = _cap_pin_body(_flatten_single_line(pin.text), per_pin_cap)
@@ -369,12 +410,13 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
     raw_attempts = _unresolved_raw_attempts(snapshot.attempts, covered_test_ids)
     modified_files = _dedupe_files(snapshot.modified_files)
 
-    # Prevent a single anomalously huge turn (e.g., an 8KB log dump inside an Update:)
-    # from starving all other active pins under normal budgets (>= 2000 chars).
-    active_pin_count = len(manual) + len(overrides) + len(auto)
-    per_pin_cap: int | None = None
-    if active_pin_count > 1 and max_chars >= _STARVATION_BUDGET_THRESHOLD:
-        per_pin_cap = min(_SINGLE_PIN_STARVATION_CAP, max(400, max_chars // 3))
+    # Monotonic starvation cap: ONLY applied when pins would otherwise overflow max_chars.
+    all_active_pins = [*manual, *overrides, *auto]
+    per_pin_cap = _compute_monotonic_pin_cap(
+        [len(_flatten_single_line(p.text)) for p in all_active_pins],
+        max_chars,
+        per_pin_overhead=45,
+    )
 
     tier1_items: list[str] = [
         *(_format_manual_pin(p, per_pin_cap) for p in manual),
@@ -410,16 +452,17 @@ def _render_markdown(snapshot: CompactionSnapshot, max_chars: int) -> str:
     full_header = f"## Compact Ledger (Session: {session_label})"
     compact_header = "## Compact Ledger"
 
-    # Choose compact header if full header doesn't fit cleanly or crowds out the first section
+    # Monotonic header selection: switch to full_header ONLY once the full first item
+    # also fits alongside full_header, so increasing max_chars never shrinks the first pin.
     first_non_empty = next(((t, items) for t, items, _ in sections if items), None)
     header = full_header
     if len(full_header) > max_chars and len(compact_header) <= max_chars:
         header = compact_header
     elif first_non_empty is not None:
-        first_title, _ = first_non_empty
-        min_needed_with_full = len(full_header) + len(f"\n\n### {first_title}\n- ") + 16
-        min_needed_with_compact = len(compact_header) + len(f"\n\n### {first_title}\n- ") + 16
-        if min_needed_with_full > max_chars and min_needed_with_compact <= max_chars:
+        first_title, first_items = first_non_empty
+        first_item_len = len(_flatten_single_line(first_items[0]))
+        full_with_first = len(full_header) + len(f"\n\n### {first_title}\n- ") + first_item_len
+        if full_with_first > max_chars and len(compact_header) <= max_chars:
             header = compact_header
 
     if len(header) > max_chars:
@@ -536,10 +579,13 @@ def _render_json(snapshot: CompactionSnapshot, max_chars: int) -> str:
     raw_attempts = _unresolved_raw_attempts(snapshot.attempts, covered_test_ids)
     modified_files = _dedupe_files(snapshot.modified_files)
 
-    active_pin_count = len(manual) + len(overrides) + len(auto)
-    per_pin_cap: int | None = None
-    if active_pin_count > 1 and max_chars >= _STARVATION_BUDGET_THRESHOLD:
-        per_pin_cap = min(_SINGLE_PIN_STARVATION_CAP, max(400, max_chars // 3))
+    # Monotonic starvation cap: ONLY applied when pins would otherwise overflow max_chars.
+    all_active_pins = [*manual, *overrides, *auto]
+    per_pin_cap = _compute_monotonic_pin_cap(
+        [len(sanitize_unicode(p.text)) for p in all_active_pins],
+        max_chars,
+        per_pin_overhead=180,
+    )
 
     manual_dicts = [_sanitize_pin_dict(p, per_pin_cap) for p in manual]
     override_dicts = [_sanitize_pin_dict(p, per_pin_cap) for p in overrides]
@@ -635,10 +681,6 @@ def _render_json(snapshot: CompactionSnapshot, max_chars: int) -> str:
         },
     ]
 
-    # Score tuple prioritizes preserving FULL untruncated Tier 1 pin text above optional
-    # envelope fields, guaranteeing monotonicity as max_chars grows (fixes B5).
-    # (full_tier1, included_tier1, tier1_chars, full_pins, included_pins, pin_chars,
-    #  tier3_count, file_count, -env_idx)
     Score = tuple[int, int, int, int, int, int, int, int, int]
 
     def _try_envelope(env_idx: int, template: dict[str, Any]) -> tuple[str, Score] | None:

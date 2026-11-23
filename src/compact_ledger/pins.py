@@ -1,10 +1,10 @@
 """Deterministic user constraint extraction and superseding correction engine.
 
-Zero third-party dependencies, zero LLM calls, strictly linear-time scanning
-(ReDoS-safe regexes and inverted-index candidate lookup). Extracts verbatim
-user directives, negative constraints, and superseding corrections from ordered
-transcript turns while filtering conversational chatter and preserving explicit
-manual pins.
+Zero third-party dependencies, zero LLM calls, strictly linear-time O(N)
+scanning (ReDoS-safe regexes, bounded lookback, and capped inverted-index
+candidate lookup). Extracts verbatim user directives, negative constraints,
+and superseding corrections from ordered transcript turns while filtering
+conversational chatter and preserving explicit manual pins.
 """
 
 from __future__ import annotations
@@ -30,11 +30,17 @@ __all__ = [
     "strip_fenced_code_blocks",
 ]
 
+# Bounded linear-time performance limits (guarantee O(N) worst-case complexity)
+_MAX_MATCHES_PER_SENTENCE = 8
+_NEGATION_LOOKBACK_CHARS = 120
+_MAX_BUCKET_SCAN = 64
+_MAX_CHAIN_TOKENS = 32
+
 # ---------------------------------------------------------------------------
 # Unicode / fenced-code helpers (strictly linear time, zero backtracking)
 # ---------------------------------------------------------------------------
 
-_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})(.*)$")
+_FENCE_OPEN_RE = re.compile(r"^[ \t>]*(`{3,}|~{3,})(.*)$")
 _SMART_APOSTROPHE_RE = re.compile(r"[\u2018\u2019\u2032]")
 _DASH_VARIANTS_RE = re.compile(r"[\u2013\u2014]")
 _WORD_TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -279,10 +285,11 @@ _NEG_STRONG_PATTERNS: tuple[re.Pattern[str], ...] = (
 _NEG_DONT_FALSE_POSITIVE_RE = re.compile(
     r"\b(?:why don't|"
     r"(?:i|we) (?:just )?don't (?:know|think|see|understand|remember|believe|"
-    r"mind|care|have a|get why|get how)|"
+    r"mind|care|like|have a|get why|get how)|"
     r"(?:if|when|whenever|since|because|although|though) (?:you|we|they|it) don't|"
     r"if (?:it|this|that) does not|"
-    r"(?:the [a-z0-9_.-]+(?: [a-z0-9_.-]+)?|they|it|this|that|tests?|builds?|hooks?|"
+    r"(?:(?:the|your|my|our|these|those) [a-z0-9_.-]+(?: [a-z0-9_.-]+)?|"
+    r"they|these|those|it|this|that|tests?|builds?|hooks?|changes?|"
     r"checks?|loops?|scripts?|files?) (?:still )?(?:don't|do not) "
     r"(?:pass|work|run|compile|build|finish|terminate|match|load|start|connect|"
     r"exist|return|appear|show|support|handle|include|have))\b",
@@ -296,7 +303,7 @@ _NEG_NEVER_FALSE_POSITIVE_RE = re.compile(
     r"noticed|encountered|said|asked|mentioned|requested|meant|wanted|changed|touched|"
     r"edited|broke|terminat\w*|finish\w*|pass\w*|complet\w*|return\w*|exits?|stops?|"
     r"resolves?|triggers?|used (?:it|this|that) before)|"
-    r"the [a-z0-9_.-]+(?: [a-z0-9_.-]+)? (?:still )?never "
+    r"(?:the|your|my|these|those) [a-z0-9_.-]+(?: [a-z0-9_.-]+)? (?:still )?never "
     r"(?:terminat\w*|finish\w*|pass\w*|work\w*|ran|run|runs|complet\w*|return\w*|"
     r"exits?|stops?|resolves?|triggers?|loads?|starts?|matches?|fires?))\b",
     re.IGNORECASE,
@@ -307,12 +314,17 @@ _NEG_NEVER_FALSE_POSITIVE_RE = re.compile(
 # ---------------------------------------------------------------------------
 
 _CONSTRAINT_KEYWORDS_RE = re.compile(
-    r"\b(?:must|have to|need(?:s)? to|required to|always|strictly|exclusively|"
+    r"\b(?:must(?! have\b)|have to|need(?:s)? to|required to|always|strictly|exclusively|"
     r"ensure|make sure|guarantee|enforce|preserve|maintain|stick (?:to|with)|"
     r"adhere to|comply with|remember (?:to|that)|"
     r"backward[s]?[- ]compatible|compatible with|stdlib only|zero[- ]dependenc(?:y|ies)|"
     r"fail[- ]open|deterministic)\b|"
     r"^(?:requirement|constraint|rule|important|note|policy|invariant):",
+    re.IGNORECASE,
+)
+
+_ALWAYS_FALSE_POSITIVE_RE = re.compile(
+    r"\b(?:i|we) always (?:forget|get|see|hit|run into|have trouble|wonder|mix up)\b",
     re.IGNORECASE,
 )
 
@@ -369,6 +381,13 @@ _ADDITIVE_AFTER_ACTUALLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Explicit permission-lifting phrases that CAN supersede a prior [DO NOT] negative constraint
+_LIFT_NEGATION_RE = re.compile(
+    r"\b(?:it's ok(?:ay)? to|it is ok(?:ay)? to|you can|feel free to|go ahead and|"
+    r"allowed to|now ok(?:ay)? to|revert|retract|ignore|forget|disregard|scratch that)\b",
+    re.IGNORECASE,
+)
+
 _HARD_NO_ACTUALLY_RE = re.compile(
     r"^(?:no, actually|actually,? no\b|wait, actually|on second thought)\b",
     re.IGNORECASE,
@@ -386,9 +405,10 @@ _IGNORE_FORGET_ABOUT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Only match meta-instruction nouns at phrase end (so "ignore the rate limit errors" never matches)
 _FORGET_ABOUT_DIRECT_RE = re.compile(
     r"\b(?:ignore|forget|disregard) (?:about )?the ([^,;!?]{1,60}) "
-    r"(?:rule|constraint|requirement|instruction|cutoff|limit|setting)\b",
+    r"(?:rule|constraint|requirement|instruction)(?:$|[,;:]| (?:for|about|now|please)\b)",
     re.IGNORECASE,
 )
 
@@ -399,8 +419,10 @@ _SCRATCH_THAT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Only capture a topic after "never mind" when it's an explicit noun phrase ("the X", "about X",
+# "my X", "that X"), NOT a finite clause like "nvm it works" or "never mind I found it"!
 _NEVER_MIND_RE = re.compile(
-    r"^(?:never ?mind|nvm)(?:$|[,;:-] ?(.*)$| (?:about )?([^,;!?]{1,60}))",
+    r"^(?:never ?mind|nvm)(?:$|[,;:-] ?(.*)$| (?:about |the |my |that )([^,;!?]{1,60}))",
     re.IGNORECASE,
 )
 
@@ -423,6 +445,13 @@ _RATHER_THAN_RE = re.compile(
 # Strictly linear on single-space normalized text (no unanchored \s+)
 _NOT_CONTRAST_RE = re.compile(
     r"(?:, | - )not ([^,;!?]{1,50})",
+    re.IGNORECASE,
+)
+
+_NOT_CONTRAST_NON_VALUE_START_RE = re.compile(
+    r"^(?:sure|really|yet|now|anymore|at all|bad|good|working|needed|necessary|"
+    r"ready|going|trying|able|just|only|even|quite|too|very|because|that|if|"
+    r"whether|when|while|unless|until|for|to|a good|a bad|worth|possible|clear)\b",
     re.IGNORECASE,
 )
 
@@ -464,7 +493,13 @@ _SWITCH_TO_Y_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Clause-level negation and conditional/hypothetical guards (prevents B2 false positives)
+# Navigation targets ("switch to the main branch", "switch to the tests directory")
+_WORKSPACE_NAV_TARGET_RE = re.compile(
+    r"\b(?:branch|directory|dir|folder|repo|repository|worktree|tab|window|terminal)\b",
+    re.IGNORECASE,
+)
+
+# Clause-level negation and conditional/hypothetical guards (O(1) bounded lookback)
 _CLAUSE_NEGATION_RE = re.compile(
     r"\b(?:do not|don't|never|must not|mustn't|shall not|should not|shouldn't|"
     r"cannot|can't|avoid|let's not|lets not|please not|not to|rather not|"
@@ -478,8 +513,15 @@ _CLAUSE_CONDITIONAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Infinitive purpose verbs after "to" (distinguishes "change tests to use fixtures" or
+# "update README to mention X" from value replacements like "change timeout to 60s")
 _INFINITIVE_PURPOSE_START_RE = re.compile(
-    r"^(?:get|see|check|find|verify|ensure|avoid|enable|disable|make|be|have|keep)\b",
+    r"^(?:get|see|check|find|verify|ensure|avoid|enable|disable|make|be|have|keep|"
+    r"use|mention|include|add|remove|delete|support|handle|accept|return|show|display|"
+    r"log|print|emit|run|test|pass|fail|fix|allow|prevent|block|validate|parse|render|"
+    r"format|sort|cache|load|read|write|save|store|send|fetch|call|import|export|"
+    r"reflect|match|document|explain|describe|cover|require|enforce|preserve|maintain|"
+    r"work|do|update|improve|simplify|clean|refactor|split|merge|ignore|skip)\b",
     re.IGNORECASE,
 )
 
@@ -677,6 +719,8 @@ class _OverrideSignal:
     old_values: tuple[str, ...]
     topic_hints: tuple[str, ...]
     is_unscoped_retraction: bool
+    is_explicit_retraction: bool
+    lifts_negation: bool
 
 
 # ---------------------------------------------------------------------------
@@ -699,11 +743,11 @@ def _trim_non_alnum(text: str) -> str:
 def strip_fenced_code_blocks(text: str) -> str:
     """Remove Markdown fenced code blocks (`` ``` `` or ``~~~``) in O(N) time.
 
+    Handles indented fences and blockquote-prefixed fences (``> ``` ``).
     Per CommonMark, a backtick opening fence cannot contain backticks in its info
     string, so inline triple-backtick spans (e.g., `` ```cmd``` do not run ``)
     are preserved as prose rather than treated as an unclosed code fence.
-    Unclosed multi-line fences consume the remainder of the text so pasted code
-    snippets never falsely trigger constraint or override detectors.
+    Unclosed multi-line fences consume the remainder of the text.
     """
     clean = sanitize_unicode(text)
     if "```" not in clean and "~~~" not in clean:
@@ -720,8 +764,6 @@ def strip_fenced_code_blocks(text: str) -> str:
             if match:
                 marker = match.group(1)
                 rest = match.group(2)
-                # CommonMark rule: backtick fence info strings cannot contain backticks;
-                # a same-line closing backtick run is an inline code span, not a block fence.
                 if marker[0] == "`" and "`" in rest:
                     out_lines.append(line)
                     continue
@@ -731,10 +773,9 @@ def strip_fenced_code_blocks(text: str) -> str:
                 continue
             out_lines.append(line)
         else:
-            stripped = line.lstrip(" \t")
+            stripped = line.lstrip(" \t>")
             if (
-                len(line) - len(stripped) <= 3
-                and stripped.startswith(fence_char * fence_len)
+                stripped.startswith(fence_char * fence_len)
                 and stripped.strip(fence_char).strip() == ""
             ):
                 in_fence = False
@@ -837,11 +878,23 @@ def _phrase_in_norm_text(phrase: str, norm_lower_text: str) -> bool:
     return re.search(pattern, norm_lower_text) is not None
 
 
+def _match_clause_start(sentence: str, match: re.Match[str]) -> int:
+    """Return index of the first word character inside ``match`` (skipping leading [,;:] )."""
+    pos = match.start()
+    end = match.end()
+    while pos < end and sentence[pos] in ",;: ":
+        pos += 1
+    return pos
+
+
 def _is_negated_or_conditional_clause(sentence: str, pos: int) -> bool:
-    """Return True if the clause preceding ``pos`` is negated or conditional/hypothetical."""
-    prefix = sentence[:pos]
-    # Trim to the current sub-clause (after last semicolon, colon, or "but"/"instead")
-    for sep in (";", ":", " but "):
+    """Return True if the sub-clause immediately preceding ``pos`` is negated or conditional.
+
+    Strictly O(1): only inspects a bounded ``_NEGATION_LOOKBACK_CHARS`` window before ``pos``.
+    """
+    window_start = max(0, pos - _NEGATION_LOOKBACK_CHARS)
+    prefix = sentence[window_start:pos]
+    for sep in (";", ":", ",", " but "):
         idx = prefix.lower().rfind(sep)
         if idx != -1:
             prefix = prefix[idx + len(sep) :]
@@ -851,6 +904,16 @@ def _is_negated_or_conditional_clause(sentence: str, pos: int) -> bool:
     if _CLAUSE_CONDITIONAL_RE.search(prefix):
         return True
     return _CLAUSE_NEGATION_RE.search(prefix) is not None
+
+
+def _bounded_finditer(pattern: re.Pattern[str], text: str) -> list[re.Match[str]]:
+    """Return up to ``_MAX_MATCHES_PER_SENTENCE`` matches to guarantee O(N) runtime."""
+    matches: list[re.Match[str]] = []
+    for m in pattern.finditer(text):
+        matches.append(m)
+        if len(matches) >= _MAX_MATCHES_PER_SENTENCE:
+            break
+    return matches
 
 
 # ---------------------------------------------------------------------------
@@ -903,8 +966,14 @@ def _has_directive_sentence(sentences: Sequence[str]) -> bool:
             if _NON_DIRECTIVE_REQUEST_VERB_RE.match(cleaned):
                 continue
 
-        if _CONSTRAINT_KEYWORDS_RE.search(cleaned):
-            return True
+        kw_match = _CONSTRAINT_KEYWORDS_RE.search(cleaned)
+        if kw_match:
+            if kw_match.group(0).lower() == "always" and _ALWAYS_FALSE_POSITIVE_RE.search(cleaned):
+                scrubbed = _ALWAYS_FALSE_POSITIVE_RE.sub(" ", cleaned)
+                if _CONSTRAINT_KEYWORDS_RE.search(scrubbed):
+                    return True
+            else:
+                return True
         if _RESTRICTIVE_DIRECTIVE_RE.search(cleaned):
             return True
         if _IMPERATIVE_START_RE.match(cleaned):
@@ -935,6 +1004,8 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
     hard = False
     soft = False
     unscoped_retraction = False
+    explicit_retraction = False
+    lifts_negation = False
     old_values: list[str] = []
     topic_hints: list[str] = []
 
@@ -943,83 +1014,15 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
         if cleaned and cleaned.lower() not in {v.lower() for v in target}:
             target.append(cleaned)
 
-    has_any_directive = _has_directive_sentence(non_question_sentences) or is_negative_constraint(
-        " ".join(non_question_sentences)
-    )
-
     for raw_sent in non_question_sentences:
         sent = _strip_terminal_punct(raw_sent)
         if not sent:
             continue
 
-        # 1. Explicit override headers ("Correction:", "Override:", "New rule:")
-        if _EXPLICIT_OVERRIDE_HEADER_RE.match(sent):
-            hard = True
+        if _LIFT_NEGATION_RE.search(sent):
+            lifts_negation = True
 
-        # 1b. "Update: <body>" is ONLY an override if <body> is a directive/constraint
-        # (guards against status lines like "Update: the tests pass now.")
-        upd_match = _UPDATE_HEADER_RE.match(sent)
-        if upd_match:
-            body = upd_match.group(1).strip()
-            body_sents = _split_sentences(body)
-            if _has_directive_sentence(body_sents) or is_negative_constraint(body):
-                hard = True
-
-        # 2. Explicit ignore/forget previous instruction (unless negated/conditional)
-        for m in _IGNORE_FORGET_ABOUT_RE.finditer(sent):
-            if _is_negated_or_conditional_clause(sent, m.start()):
-                continue
-            hard = True
-            topic = m.group(1)
-            if topic and topic.strip():
-                _add_unique(topic_hints, topic)
-            else:
-                unscoped_retraction = True
-
-        for m in _FORGET_ABOUT_DIRECT_RE.finditer(sent):
-            if _is_negated_or_conditional_clause(sent, m.start()):
-                continue
-            hard = True
-            _add_unique(topic_hints, m.group(1))
-
-        # 3. Scratch that / strike that / cancel that (only at clause boundary)
-        if _SCRATCH_THAT_RE.match(sent):
-            hard = True
-            unscoped_retraction = True
-
-        # 4. Never mind ...
-        nm_match = _NEVER_MIND_RE.match(sent)
-        if nm_match:
-            after_punct = nm_match.group(1)
-            topic_arg = nm_match.group(2)
-            if topic_arg and _extract_content_tokens(topic_arg):
-                hard = True
-                _add_unique(topic_hints, topic_arg)
-                _add_unique(old_values, topic_arg)
-            elif after_punct is not None:
-                # "Never mind, use 30s" -> retraction; "Never mind, I found it" -> conversational!
-                tail = after_punct.strip()
-                if not tail or _has_directive_sentence([tail]) or is_negative_constraint(tail):
-                    hard = True
-                    unscoped_retraction = True
-            else:
-                # Bare "Never mind."
-                hard = True
-                unscoped_retraction = True
-
-        # 5. "no, actually ..." / "wait, actually ..." / "on second thought ..."
-        if _HARD_NO_ACTUALLY_RE.match(sent):
-            after = _HARD_NO_ACTUALLY_RE.sub("", sent, count=1).lstrip(",:;- ")
-            if not after or _has_directive_sentence([after]) or is_negative_constraint(after):
-                hard = True
-
-        # 6. "instead of <OLD>, use <NEW>" (prefix form has built-in directive verb)
-        for m in _INSTEAD_OF_PREFIX_RE.finditer(sent):
-            if _is_negated_or_conditional_clause(sent, m.start()):
-                continue
-            hard = True
-            _add_unique(old_values, m.group(1))
-
+        # Per-sentence directive check (never leaks across unrelated sentences in one turn)
         sent_after_actually = (
             re.sub(
                 r"^(?:(?:no|wait|sorry), )?actually,? ",
@@ -1031,54 +1034,131 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
             if _SOFT_ACTUALLY_RE.match(sent)
             else ""
         )
-        sent_has_directive = has_any_directive or (
-            bool(sent_after_actually)
-            and (
-                _has_directive_sentence([sent_after_actually])
-                or is_negative_constraint(sent_after_actually)
+        sent_has_directive = (
+            _has_directive_sentence([sent])
+            or is_negative_constraint(sent)
+            or (
+                bool(sent_after_actually)
+                and (
+                    _has_directive_sentence([sent_after_actually])
+                    or is_negative_constraint(sent_after_actually)
+                )
             )
         )
 
-        # 6b. "<NEW> instead of <OLD>" ONLY in directive/override sentences
-        # (guards against bug reports like "The function returns None instead of a list.")
+        # 1. Explicit override headers ("Correction:", "Override:", "New rule:")
+        if _EXPLICIT_OVERRIDE_HEADER_RE.match(sent):
+            hard = True
+
+        # 1b. "Update: <body>" is ONLY an override if <body> is a directive/constraint
+        upd_match = _UPDATE_HEADER_RE.match(sent)
+        if upd_match:
+            body = upd_match.group(1).strip()
+            body_sents = _split_sentences(body)
+            if _has_directive_sentence(body_sents) or is_negative_constraint(body):
+                hard = True
+
+        # 2. Explicit ignore/forget previous instruction (unless negated/conditional)
+        for m in _bounded_finditer(_IGNORE_FORGET_ABOUT_RE, sent):
+            if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
+                continue
+            hard = True
+            explicit_retraction = True
+            topic = m.group(1)
+            if topic and topic.strip():
+                _add_unique(topic_hints, topic)
+            else:
+                unscoped_retraction = True
+
+        for m in _bounded_finditer(_FORGET_ABOUT_DIRECT_RE, sent):
+            if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
+                continue
+            hard = True
+            explicit_retraction = True
+            _add_unique(topic_hints, m.group(1))
+
+        # 3. Scratch that / strike that / cancel that (only at clause boundary)
+        if _SCRATCH_THAT_RE.match(sent):
+            hard = True
+            explicit_retraction = True
+            unscoped_retraction = True
+
+        # 4. Never mind ... (noun-phrase topic OR bare/directive retraction only)
+        nm_match = _NEVER_MIND_RE.match(sent)
+        if nm_match:
+            after_punct = nm_match.group(1)
+            topic_arg = nm_match.group(2)
+            if topic_arg and _extract_content_tokens(topic_arg):
+                hard = True
+                explicit_retraction = True
+                _add_unique(topic_hints, topic_arg)
+                _add_unique(old_values, topic_arg)
+            elif after_punct is not None:
+                tail = after_punct.strip()
+                if not tail or _has_directive_sentence([tail]) or is_negative_constraint(tail):
+                    hard = True
+                    explicit_retraction = True
+                    unscoped_retraction = True
+            else:
+                hard = True
+                explicit_retraction = True
+                unscoped_retraction = True
+
+        # 5. "no, actually ..." / "wait, actually ..." / "on second thought ..."
+        if _HARD_NO_ACTUALLY_RE.match(sent):
+            after = _HARD_NO_ACTUALLY_RE.sub("", sent, count=1).lstrip(",:;- ")
+            if not after or _has_directive_sentence([after]) or is_negative_constraint(after):
+                hard = True
+
+        # 6. "instead of <OLD>, <NEW>" requires directive context in <NEW>
+        for m in _bounded_finditer(_INSTEAD_OF_PREFIX_RE, sent):
+            if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
+                continue
+            tail = (m.group(2) or "").strip()
+            matched_full = m.group(0)
+            has_comma_only = ", " in matched_full and not re.search(
+                r"\b(?:use|do|keep|set|make|pick|choose|go with|try|run|write|return|"
+                r"output|format|switch to)\b",
+                matched_full,
+                re.IGNORECASE,
+            )
+            if has_comma_only and not (
+                _has_directive_sentence([tail]) or is_negative_constraint(tail)
+            ):
+                continue
+            hard = True
+            _add_unique(old_values, m.group(1))
+
+        # 6b. "<NEW> instead of <OLD>" ONLY when THIS sentence is a directive/override
         if sent_has_directive or hard:
-            for m in _INSTEAD_OF_SUFFIX_RE.finditer(sent):
-                if _is_negated_or_conditional_clause(sent, m.start()):
+            for m in _bounded_finditer(_INSTEAD_OF_SUFFIX_RE, sent):
+                if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
+                    continue
+                # Avoid matching prefix form that failed the directive check above
+                if m.start() == 0 and not sent_has_directive:
                     continue
                 hard = True
                 _add_unique(old_values, m.group(1))
 
-        # 7. "rather than <OLD>" (only in directive sentences)
+        # 7. "rather than <OLD>" (only when THIS sentence is a directive)
         if sent_has_directive:
-            for m in _RATHER_THAN_RE.finditer(sent):
-                if _is_negated_or_conditional_clause(sent, m.start()):
+            for m in _bounded_finditer(_RATHER_THAN_RE, sent):
+                if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
                     continue
                 hard = True
                 _add_unique(old_values, m.group(1))
 
-        # 8. ", not <OLD>" contrast inside a directive sentence
+        # 8. ", not <OLD>" contrast inside THIS directive sentence
         if sent_has_directive:
-            for m in _NOT_CONTRAST_RE.finditer(sent):
+            for m in _bounded_finditer(_NOT_CONTRAST_RE, sent):
                 candidate_old = _clean_phrase(m.group(1))
-                if candidate_old and candidate_old.lower() not in {
-                    "sure",
-                    "really",
-                    "yet",
-                    "now",
-                    "anymore",
-                    "at all",
-                    "bad",
-                    "good",
-                    "working",
-                    "needed",
-                    "necessary",
-                }:
+                if candidate_old and not _NOT_CONTRAST_NON_VALUE_START_RE.match(candidate_old):
                     hard = True
                     _add_unique(old_values, candidate_old)
 
         # 9. "switch/change/update/move <topic?> from <OLD> to <NEW>" (directive position only)
-        for m in _FROM_X_TO_Y_RE.finditer(sent):
-            if _is_negated_or_conditional_clause(sent, m.start()):
+        for m in _bounded_finditer(_FROM_X_TO_Y_RE, sent):
+            if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
                 continue
             rhs = _clean_phrase(m.group(3))
             if not rhs or _INFINITIVE_PURPOSE_START_RE.match(rhs):
@@ -1089,16 +1169,16 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
             _add_unique(old_values, m.group(2))
 
         # 10. "replace <OLD> with <NEW>" (directive position only)
-        for m in _REPLACE_X_WITH_Y_RE.finditer(sent):
-            if _is_negated_or_conditional_clause(sent, m.start()):
+        for m in _bounded_finditer(_REPLACE_X_WITH_Y_RE, sent):
+            if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
                 continue
             hard = True
             _add_unique(old_values, m.group(1))
 
         # 11. "change/switch <OLD> to <NEW>" (directive position, not from..to, not infinitive)
         if not old_values:
-            for m in _CHANGE_X_TO_Y_RE.finditer(sent):
-                if _is_negated_or_conditional_clause(sent, m.start()):
+            for m in _bounded_finditer(_CHANGE_X_TO_Y_RE, sent):
+                if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
                     continue
                 lhs = _clean_phrase(m.group(1))
                 rhs = _clean_phrase(m.group(2))
@@ -1112,9 +1192,9 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
                     _add_unique(old_values, lhs)
                     _add_unique(topic_hints, lhs)
 
-        # 12. "update the <TOPIC> to <NEW>" (soft override cue)
-        for m in _UPDATE_TOPIC_TO_Y_RE.finditer(sent):
-            if _is_negated_or_conditional_clause(sent, m.start()):
+        # 12. "update the <TOPIC> to <NEW>" (soft override cue; skip infinitives)
+        for m in _bounded_finditer(_UPDATE_TOPIC_TO_Y_RE, sent):
+            if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
                 continue
             topic = _clean_phrase(m.group(1))
             rhs = _clean_phrase(m.group(2))
@@ -1127,31 +1207,31 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
                 soft = True
                 _add_unique(topic_hints, topic)
 
-        # 13. "switch to <NEW>" (soft override cue)
+        # 13. "switch to <NEW>" (soft override cue; skip infinitives & workspace navigation)
         if not old_values:
-            for m in _SWITCH_TO_Y_RE.finditer(sent):
-                if _is_negated_or_conditional_clause(sent, m.start()):
+            for m in _bounded_finditer(_SWITCH_TO_Y_RE, sent):
+                if _is_negated_or_conditional_clause(sent, _match_clause_start(sent, m)):
                     continue
                 rhs = _clean_phrase(m.group(1))
-                if rhs and not _INFINITIVE_PURPOSE_START_RE.match(rhs):
+                if (
+                    rhs
+                    and not _INFINITIVE_PURPOSE_START_RE.match(rhs)
+                    and not _WORKSPACE_NAV_TARGET_RE.search(rhs)
+                ):
                     soft = True
 
         # 14. Soft "actually" ONLY when accompanied by a directive/constraint and NOT additive
-        # (guards against "that actually worked!", "actually, also add an index", questions)
         if (
             not hard
             and _SOFT_ACTUALLY_RE.match(sent)
             and not _ADDITIVE_AFTER_ACTUALLY_RE.match(sent)
+            and sent_after_actually
+            and (
+                _has_directive_sentence([sent_after_actually])
+                or is_negative_constraint(sent_after_actually)
+            )
         ):
-            after_actually = re.sub(
-                r"^(?:(?:no|wait|sorry), )?actually,? ",
-                "",
-                sent,
-                count=1,
-                flags=re.IGNORECASE,
-            ).strip()
-            if _has_directive_sentence([after_actually]) or is_negative_constraint(after_actually):
-                soft = True
+            soft = True
 
     if not hard and not soft:
         return None
@@ -1164,6 +1244,8 @@ def _detect_override_signal(text: str) -> _OverrideSignal | None:
         old_values=tuple(old_values),
         topic_hints=tuple(topic_hints),
         is_unscoped_retraction=unscoped_retraction,
+        is_explicit_retraction=explicit_retraction,
+        lifts_negation=lifts_negation,
     )
 
 
@@ -1208,7 +1290,6 @@ def is_chatter(text: str) -> bool:
     if len(prose) > 140:
         return False
 
-    # Never classify a genuine directive, negative constraint, or override as chatter.
     if is_negative_constraint(clean) or _detect_override_signal(clean) is not None:
         return False
 
@@ -1233,8 +1314,8 @@ def is_chatter(text: str) -> bool:
 
 def _score_supersede_candidate(
     signal: _OverrideSignal,
-    override_text: str,
     override_tokens: frozenset[str],
+    candidate: PinEntry,
     candidate_norm_lower: str,
     candidate_own_tokens: frozenset[str],
     candidate_chain_tokens: frozenset[str],
@@ -1243,51 +1324,75 @@ def _score_supersede_candidate(
 ) -> int:
     """Score how strongly ``signal`` targets a candidate pin. Return 0 for no match."""
     score = 0
+    direct_value_or_topic_match = False
 
-    # 1. Explicit old-value matches (highest signal)
+    # 1. Explicit old-value matches (highest signal).
+    # For multi-word old_values (e.g. "old logging config"), require ALL tokens to match
+    # (or >= 2 tokens covering >= 50%) so a single incidental word ("config") never misfires.
     for old_val in signal.old_values:
         if _phrase_in_norm_text(old_val, candidate_norm_lower):
             score += 120
+            direct_value_or_topic_match = True
             continue
         old_tokens = _extract_content_tokens(old_val)
-        if old_tokens:
-            own_hit = old_tokens & candidate_own_tokens
-            if own_hit == old_tokens:
-                score += 100
-            elif own_hit:
-                score += 45 * len(own_hit)
-            else:
-                chain_hit = old_tokens & candidate_chain_tokens
-                if chain_hit == old_tokens:
-                    score += 70
+        if not old_tokens:
+            continue
+        own_hit = old_tokens & candidate_own_tokens
+        if own_hit == old_tokens:
+            score += 100
+            direct_value_or_topic_match = True
+        elif len(old_tokens) >= 2 and len(own_hit) >= 2 and len(own_hit) * 2 >= len(old_tokens):
+            score += 45 * len(own_hit)
+            direct_value_or_topic_match = True
+        else:
+            chain_hit = old_tokens & candidate_chain_tokens
+            if chain_hit == old_tokens:
+                score += 70
+                direct_value_or_topic_match = True
 
     # 2. Explicit topic-hint matches ("ignore what I said earlier about auth")
     for hint in signal.topic_hints:
         if _phrase_in_norm_text(hint, candidate_norm_lower):
             score += 90
+            direct_value_or_topic_match = True
             continue
         hint_tokens = _extract_content_tokens(hint)
-        if hint_tokens:
-            own_hit = hint_tokens & candidate_own_tokens
-            if own_hit:
-                score += 50 * len(own_hit)
+        if not hint_tokens:
+            continue
+        own_hit = hint_tokens & candidate_own_tokens
+        if own_hit == hint_tokens or (len(hint_tokens) == 1 and own_hit):
+            score += 50 * len(own_hit)
+            direct_value_or_topic_match = True
+        else:
+            chain_hit = hint_tokens & candidate_chain_tokens
+            if chain_hit == hint_tokens or (len(hint_tokens) == 1 and chain_hit):
+                score += 35 * len(chain_hit)
+                direct_value_or_topic_match = True
             else:
-                chain_hit = hint_tokens & candidate_chain_tokens
-                if chain_hit:
-                    score += 35 * len(chain_hit)
-                else:
-                    for ht in hint_tokens:
-                        if len(ht) >= 4 and any(
-                            ct.startswith(ht) or ht.startswith(ct)
-                            for ct in candidate_chain_tokens
-                            if len(ct) >= 4
-                        ):
-                            score += 30
-                            break
+                for ht in hint_tokens:
+                    if len(ht) >= 4 and any(
+                        ct.startswith(ht) or ht.startswith(ct)
+                        for ct in candidate_chain_tokens
+                        if len(ct) >= 4
+                    ):
+                        score += 30
+                        direct_value_or_topic_match = True
+                        break
+
+    # Safety invariant for [DO NOT] negative constraints: never supersede an active
+    # negative constraint via weak/soft overlap alone — require an explicit retraction,
+    # explicit permission-lifting phrase, or direct old-value/topic match.
+    if (
+        candidate.is_negative
+        and not signal.is_explicit_retraction
+        and not signal.lifts_negation
+        and not direct_value_or_topic_match
+    ):
+        return 0
 
     # 3. General content-token overlap (1 word = 1 canonical stemmed token).
-    # Soft overrides ("actually, ...") MUST share >= 2 distinct content tokens so one
-    # incidental shared noun (e.g., "database" or "test") never falsely supersedes.
+    # Require >= 2 distinct shared content tokens (or 1 highly specific >= 9-char domain
+    # term on a hard override without explicit targets, e.g., "indentation").
     own_overlap = override_tokens & candidate_own_tokens
     chain_overlap = override_tokens & candidate_chain_tokens
     has_explicit_target = bool(signal.old_values or signal.topic_hints)
@@ -1296,13 +1401,13 @@ def _score_supersede_candidate(
         score += 25 * len(own_overlap)
     elif len(own_overlap) == 1 and not has_explicit_target and signal.kind == "hard":
         tok = next(iter(own_overlap))
-        if len(tok) >= 4:
+        if len(tok) >= 9:
             score += 25
     elif len(chain_overlap) >= 2:
         score += 18 * len(chain_overlap)
     elif len(chain_overlap) == 1 and not has_explicit_target and signal.kind == "hard":
         tok = next(iter(chain_overlap))
-        if len(tok) >= 4:
+        if len(tok) >= 9:
             score += 18
 
     # 4. Short date-only value override (e.g., "Use June 30." -> "Actually, use July 31.")
@@ -1328,7 +1433,7 @@ def _score_supersede_candidate(
 
 
 # ---------------------------------------------------------------------------
-# Main extraction pipeline (O(N) via inverted token index)
+# Main extraction pipeline (strictly O(N) via capped inverted token index)
 # ---------------------------------------------------------------------------
 
 
@@ -1348,12 +1453,14 @@ def extract_pins(
     result: list[PinEntry] = []
     # pin_id -> (order_idx, own_tokens, chain_tokens, norm_lower_prose, has_date)
     pin_meta: dict[str, tuple[int, frozenset[str], frozenset[str], str, bool]] = {}
-    # Inverted index: canonical token -> active pins containing that token
+    # Inverted index: canonical token -> active pins containing that token (newest at tail)
     token_index: dict[str, list[PinEntry]] = {}
     # Prefix bucket (first 4 chars) for abbreviation topic hints ("auth" <-> "authentication")
     prefix4_index: dict[str, list[PinEntry]] = {}
     # Active pins that contain a calendar date value
     date_pins: list[PinEntry] = []
+    # Track pins that were bare unscoped retractions so consecutive "Scratch that." never chain
+    bare_retraction_ids: set[str] = set()
 
     def _index_pin(
         pin: PinEntry,
@@ -1373,9 +1480,9 @@ def extract_pins(
             date_pins.append(pin)
 
     # 1. Copy & deduplicate manual pins (never mutate caller's PinEntry objects)
-    seen_manual_norms: set[str] = set()
     seen_pin_ids: set[str] = set()
     manual_by_norm: dict[str, PinEntry] = {}
+    active_by_norm: dict[str, PinEntry] = {}
 
     for mp in manual_pins:
         clean_text = sanitize_unicode(mp.text).strip()
@@ -1405,9 +1512,9 @@ def extract_pins(
             is_negative=mp.is_negative,
             tags=[sanitize_unicode(t).strip() for t in mp.tags if sanitize_unicode(t).strip()],
         )
-        seen_manual_norms.add(norm)
         seen_pin_ids.add(copied.pin_id)
         manual_by_norm[norm] = copied
+        active_by_norm[norm] = copied
         toks = _extract_content_tokens(clean_text)
         norm_lower = " ".join(_normalize_prose(clean_text).lower().split())
         _index_pin(copied, toks, toks, norm_lower, bool(_DATE_VALUE_RE.search(norm_lower)))
@@ -1421,8 +1528,6 @@ def extract_pins(
         )
     ]
 
-    # Track normalized text of currently ACTIVE pins for deduplication
-    active_norms: set[str] = set(seen_manual_norms)
     # Track the pin produced by the immediately preceding non-chatter user turn so
     # unscoped retractions ("Scratch that.", "Never mind.") never reach past unrelated turns.
     prev_non_chatter_pin: PinEntry | None = None
@@ -1439,8 +1544,6 @@ def extract_pins(
         neg = is_negative_constraint(clean_text)
         directive = neg or signal is not None or is_constraint_or_directive(clean_text)
         if not directive:
-            # Non-chatter, non-directive turn (e.g., question or status update) breaks
-            # adjacency for unscoped retractions.
             prev_non_chatter_pin = None
             continue
 
@@ -1450,7 +1553,7 @@ def extract_pins(
         superseded_target: PinEntry | None = None
 
         if signal is not None:
-            # Gather candidate active pins via inverted index in O(matched) time
+            # Gather up to _MAX_BUCKET_SCAN newest active candidates per token (strictly O(1))
             query_tokens: set[str] = set(own_tokens)
             for old_val in signal.old_values:
                 query_tokens.update(_extract_content_tokens(old_val))
@@ -1459,37 +1562,40 @@ def extract_pins(
 
             candidate_map: dict[str, PinEntry] = {}
 
-            def _collect_from(bucket: list[PinEntry], out: dict[str, PinEntry]) -> None:
-                # Lazily prune superseded pins while collecting active candidates
-                alive: list[PinEntry] = []
-                for p in bucket:
+            def _collect_recent(bucket: list[PinEntry], out: dict[str, PinEntry]) -> None:
+                found = 0
+                for p in reversed(bucket):
                     if p.superseded_by is None:
-                        alive.append(p)
                         out[p.pin_id] = p
-                if len(alive) != len(bucket):
-                    bucket[:] = alive
+                        found += 1
+                        if found >= _MAX_BUCKET_SCAN:
+                            break
+                # Periodically compact buckets when tail contains many dead entries
+                if len(bucket) > _MAX_BUCKET_SCAN * 4 and found < _MAX_BUCKET_SCAN:
+                    bucket[:] = [p for p in bucket if p.superseded_by is None]
 
             for tok in query_tokens:
                 bucket = token_index.get(tok)
                 if bucket:
-                    _collect_from(bucket, candidate_map)
+                    _collect_recent(bucket, candidate_map)
 
             for hint in signal.topic_hints:
                 for ht in _extract_content_tokens(hint):
                     if len(ht) >= 4:
                         pbucket = prefix4_index.get(ht[:4])
                         if pbucket:
-                            _collect_from(pbucket, candidate_map)
+                            _collect_recent(pbucket, candidate_map)
 
             if override_has_date and not signal.old_values and not signal.topic_hints and date_pins:
-                _collect_from(date_pins, candidate_map)
+                _collect_recent(date_pins, candidate_map)
 
-            # Sort matched candidates newest-first for deterministic recency tie-breaking
             eligible: list[PinEntry] = []
             for cand in candidate_map.values():
                 if cand.source == "manual" and (
                     cand.turn_index is None or cand.turn_index >= turn.turn_index
                 ):
+                    continue
+                if cand.pin_id in bare_retraction_ids:
                     continue
                 eligible.append(cand)
             eligible.sort(key=lambda p: pin_meta[p.pin_id][0], reverse=True)
@@ -1500,8 +1606,8 @@ def extract_pins(
                 _, cand_own, cand_chain, cand_norm_lower, cand_has_date = pin_meta[cand.pin_id]
                 score = _score_supersede_candidate(
                     signal=signal,
-                    override_text=clean_text,
                     override_tokens=own_tokens,
+                    candidate=cand,
                     candidate_norm_lower=cand_norm_lower,
                     candidate_own_tokens=cand_own,
                     candidate_chain_tokens=cand_chain,
@@ -1519,15 +1625,23 @@ def extract_pins(
                 and prev_non_chatter_pin is not None
                 and prev_non_chatter_pin.superseded_by is None
                 and prev_non_chatter_pin.source != "manual"
+                and prev_non_chatter_pin.pin_id not in bare_retraction_ids
             ):
-                # Unscoped retraction only targets the immediately preceding active
-                # transcript pin, never jumping over intervening unrelated turns.
                 superseded_target = prev_non_chatter_pin
+
+        # Consecutive bare unscoped retraction ("Scratch that." twice in a row) is a no-op
+        is_bare_retraction = bool(
+            signal is not None and signal.is_unscoped_retraction and not own_tokens
+        )
+        if is_bare_retraction and superseded_target is None:
+            continue
 
         # Deduplicate repeated identical/whitespace-equivalent active instructions,
         # UNLESS this turn supersedes a distinct active pin (e.g., repeated "Scratch that.").
-        if superseded_target is None and norm in active_norms:
-            prev_non_chatter_pin = None
+        # Keep prev_non_chatter_pin pointing to the existing active pin so a following
+        # "Scratch that." still retracts it (fixes B3 repeat-then-scratch edge case).
+        if superseded_target is None and norm in active_by_norm:
+            prev_non_chatter_pin = active_by_norm[norm]
             continue
 
         source = (
@@ -1558,13 +1672,26 @@ def extract_pins(
         if superseded_target is not None:
             superseded_target.superseded_by = new_pin.pin_id
             old_norm = normalize_pin_text(superseded_target.text)
-            active_norms.discard(old_norm)
+            if active_by_norm.get(old_norm) is superseded_target:
+                active_by_norm.pop(old_norm, None)
             _, _, prev_chain, _, prev_has_date = pin_meta[superseded_target.pin_id]
-            chain_tokens = own_tokens | prev_chain
+            # Cap inherited chain tokens to _MAX_CHAIN_TOKENS so long chains stay O(1)/step
+            merged = set(own_tokens)
+            if len(merged) < _MAX_CHAIN_TOKENS:
+                remaining_slots = _MAX_CHAIN_TOKENS - len(merged)
+                for pt in sorted(prev_chain):
+                    if pt not in merged:
+                        merged.add(pt)
+                        remaining_slots -= 1
+                        if remaining_slots <= 0:
+                            break
+            chain_tokens = frozenset(merged)
             override_has_date = override_has_date or prev_has_date
 
         seen_pin_ids.add(new_pin.pin_id)
-        active_norms.add(norm)
+        active_by_norm[norm] = new_pin
+        if is_bare_retraction:
+            bare_retraction_ids.add(new_pin.pin_id)
         _index_pin(new_pin, own_tokens, chain_tokens, norm_lower, override_has_date)
         prev_non_chatter_pin = new_pin
 
