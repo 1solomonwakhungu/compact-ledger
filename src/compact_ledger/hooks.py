@@ -26,7 +26,6 @@ from compact_ledger.pins import extract_pins
 from compact_ledger.renderer import DEFAULT_MAX_CHARS, render_snapshot
 from compact_ledger.store import (
     ENV_STORE_DIR,
-    CorruptSnapshotError,
     SessionStore,
     find_project_root,
 )
@@ -244,18 +243,14 @@ def create_and_save_snapshot(
             )
         raise ValueError("--session-id is required when transcript has no embedded session_id.")
 
-    # Load existing manual pins if present; tolerate corrupt files so save_snapshot can quarantine.
-    existing_manual: list[PinEntry] = []
-    try:
-        existing_manual = store.list_manual_pins(effective_session_id)
-    except CorruptSnapshotError:
-        existing_manual = []
-
+    # Do NOT pre-load manual pins outside save_snapshot's session lock: save_snapshot
+    # merges on-disk manual pins atomically under the lock so a concurrent `unpin`
+    # between transcript parsing and save is never resurrected.
     snapshot = build_snapshot_from_transcript(
         parsed,
         session_id=effective_session_id,
         transcript_path=path,
-        manual_pins=existing_manual,
+        manual_pins=(),
         extra_metadata=extra_metadata,
     )
     saved = store.save_snapshot(snapshot)

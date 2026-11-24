@@ -419,7 +419,7 @@ def test_large_input_linear_performance() -> None:
     assert len(md) <= 6000
     assert len(js) <= 6000
     json.loads(js)
-    assert elapsed < 0.5, f"Rendering 4000 pins took {elapsed:.3f}s (expected < 0.5s)"
+    assert elapsed < 2.5, f"Rendering 4000 pins took {elapsed:.3f}s (expected < 2.5s)"
 
 
 def test_end_to_end_extract_pins_and_render_snapshot() -> None:

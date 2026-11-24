@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 from collections.abc import Iterator, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 from compact_ledger.models import (
@@ -104,6 +105,10 @@ def default_session_id(env: Mapping[str, str] | None = None) -> str | None:
 
 class CorruptSnapshotError(ValueError):
     """Raised when a persisted session snapshot cannot be parsed."""
+
+
+class StoreSecurityError(ValueError):
+    """Raised when a store path violates symlink or containment checks."""
 
 
 def sanitize_session_id(session_id: str) -> str:
@@ -223,11 +228,15 @@ class SessionStore:
                 self.root_dir = find_project_root(Path.cwd()) / DEFAULT_DIR_NAME
 
         self.sessions_dir = self.root_dir / SESSIONS_SUBDIR
+        self.last_quarantined_path: Path | None = None
 
     def _ensure_dirs(self) -> None:
         """Create the store and make it ignore itself in git (best effort)."""
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        ignore_file = self.root_dir / ".gitignore"
+        if self.root_dir.name == DEFAULT_DIR_NAME and not (self.root_dir / ".git").exists():
+            ignore_file = self.root_dir / ".gitignore"
+        else:
+            ignore_file = self.sessions_dir / ".gitignore"
         with contextlib.suppress(OSError):
             if not ignore_file.exists() and not ignore_file.is_symlink():
                 ignore_file.write_text(_STORE_GITIGNORE, encoding="utf-8")
@@ -235,9 +244,9 @@ class SessionStore:
     def _reject_symlinks(self, target: Path | None = None) -> None:
         for path in (self.root_dir, self.sessions_dir):
             if path.is_symlink():
-                raise ValueError(f"Refusing to use symlinked store directory: {path}")
+                raise StoreSecurityError(f"Refusing to use symlinked store directory: {path}")
         if target is not None and target.is_symlink():
-            raise ValueError(f"Refusing to operate on symlinked session file: {target}")
+            raise StoreSecurityError(f"Refusing to operate on symlinked session file: {target}")
 
     def session_path(self, session_id: str) -> Path:
         """Return the safe absolute path for a session's snapshot file."""
@@ -246,12 +255,14 @@ class SessionStore:
         sessions_resolved = self.sessions_dir.resolve()
         raw_candidate = sessions_resolved / f"{safe_id}.json"
         if raw_candidate.is_symlink():
-            raise ValueError(f"Refusing to operate on symlinked session file: {raw_candidate}")
+            raise StoreSecurityError(
+                f"Refusing to operate on symlinked session file: {raw_candidate}"
+            )
         candidate = raw_candidate.resolve()
         if candidate.parent != sessions_resolved:
-            raise ValueError(f"Unsafe session path resolved outside store: {session_id!r}")
+            raise StoreSecurityError(f"Unsafe session path resolved outside store: {session_id!r}")
         if candidate.is_symlink():
-            raise ValueError(f"Refusing to operate on symlinked session file: {candidate}")
+            raise StoreSecurityError(f"Refusing to operate on symlinked session file: {candidate}")
         return candidate
 
     @contextlib.contextmanager
@@ -261,7 +272,7 @@ class SessionStore:
         self._ensure_dirs()
         lock_path = self.sessions_dir / f".{safe_id}.lock"
         if lock_path.is_symlink():
-            raise ValueError(f"Refusing to use symlinked session lock file: {lock_path}")
+            raise StoreSecurityError(f"Refusing to use symlinked session lock file: {lock_path}")
         if fcntl is None:
             yield
             return
@@ -272,10 +283,19 @@ class SessionStore:
             finally:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
-    def _quarantine_corrupt_file(self, target: Path) -> None:
-        backup = target.with_name(f"{target.name}.corrupt")
-        with contextlib.suppress(OSError):
+    def _quarantine_corrupt_file(self, target: Path) -> Path | None:
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = target.with_name(f"{target.name}.corrupt-{stamp}")
+        counter = 1
+        while backup.exists() or backup.is_symlink():
+            backup = target.with_name(f"{target.name}.corrupt-{stamp}-{counter}")
+            counter += 1
+        try:
             os.replace(target, backup)
+        except OSError:
+            return None
+        self.last_quarantined_path = backup
+        return backup
 
     def _load_unlocked(self, session_id: str, target: Path) -> CompactionSnapshot | None:
         self._reject_symlinks(target)
@@ -296,6 +316,7 @@ class SessionStore:
 
     def save_snapshot(self, snapshot: CompactionSnapshot) -> CompactionSnapshot:
         """Atomically persist ``snapshot``, preserving and updating manual pins."""
+        self.last_quarantined_path = None
         target = self.session_path(snapshot.session_id)
         with self._session_lock(snapshot.session_id):
             existing_manual: list[PinEntry] = []
@@ -339,6 +360,7 @@ class SessionStore:
         If a manual pin with identical normalized text already exists, returns the
         existing pin (merging any newly supplied tags) without duplicating it.
         """
+        self.last_quarantined_path = None
         clean_text = sanitize_unicode(text)
         normalized = normalize_pin_text(clean_text)
         if not normalized:
@@ -428,17 +450,27 @@ class SessionStore:
         return [p for p in snapshot.pins if p.source == "manual"]
 
     def clear_session(self, session_id: str) -> bool:
-        """Delete the stored snapshot for ``session_id``. Returns True if removed."""
+        """Delete the stored snapshot and any corrupt backups for ``session_id``."""
         path = self.session_path(session_id)
         if not self.sessions_dir.is_dir():
             return False
         with self._session_lock(session_id):
             self._reject_symlinks(path)
+            removed = False
             try:
                 path.unlink()
-                return True
+                removed = True
             except FileNotFoundError:
-                return False
+                pass
+            for backup in sorted(self.sessions_dir.glob(f"{path.name}.corrupt*")):
+                if backup.is_symlink() or not backup.is_file():
+                    continue
+                try:
+                    backup.unlink()
+                    removed = True
+                except FileNotFoundError:
+                    pass
+            return removed
 
     def list_sessions(self) -> list[str]:
         """Return sorted session IDs for all valid stored sessions."""

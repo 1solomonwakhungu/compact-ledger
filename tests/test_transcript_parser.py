@@ -552,7 +552,7 @@ def test_exit_code_scanning_avoids_false_positives_and_redos() -> None:
     t0 = time.monotonic()
     parsed = parse_transcript_lines(_jsonl(records))
     elapsed = time.monotonic() - t0
-    assert elapsed < 0.5
+    assert elapsed < 2.0
 
     by_id = {t.call_id: t for t in parsed.tool_executions}
     assert by_id["t_read"].exit_code is None

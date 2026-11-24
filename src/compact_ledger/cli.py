@@ -40,6 +40,7 @@ from compact_ledger.store import (
     ENV_SESSION_ID,
     CorruptSnapshotError,
     SessionStore,
+    StoreSecurityError,
     default_session_id,
 )
 
@@ -475,12 +476,19 @@ def _cmd_snapshot(args: argparse.Namespace, store: SessionStore) -> int:
             session_id=args.session_id,
             transcript_format=args.transcript_format,
         )
+    except (StoreSecurityError, FileNotFoundError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
-    except FileNotFoundError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+
+    if store.last_quarantined_path is not None:
+        print(
+            f"Warning: existing snapshot for session {saved.session_id!r} was corrupt and "
+            f"quarantined to {store.last_quarantined_path}.",
+            file=sys.stderr,
+        )
 
     manual_count = sum(1 for p in saved.pins if p.source == "manual")
     override_count = sum(
@@ -526,7 +534,7 @@ def _cmd_inject(args: argparse.Namespace, store: SessionStore) -> int:
 
     try:
         snapshot = store.load_snapshot(session_id)
-    except CorruptSnapshotError as exc:
+    except (CorruptSnapshotError, StoreSecurityError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except ValueError as exc:
@@ -579,9 +587,19 @@ def _cmd_pin(args: argparse.Namespace, store: SessionStore) -> int:
             tags=args.tags,
             is_negative=args.negative,
         )
+    except StoreSecurityError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
+
+    if store.last_quarantined_path is not None:
+        print(
+            f"Warning: existing snapshot for session {session_id!r} was corrupt and "
+            f"quarantined to {store.last_quarantined_path}.",
+            file=sys.stderr,
+        )
 
     if args.as_json:
         payload = {
@@ -602,7 +620,7 @@ def _cmd_unpin(args: argparse.Namespace, store: SessionStore) -> int:
 
     try:
         removed = store.remove_manual_pin(session_id, args.target)
-    except CorruptSnapshotError as exc:
+    except (CorruptSnapshotError, StoreSecurityError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     except ValueError as exc:
@@ -624,7 +642,7 @@ def _cmd_status(args: argparse.Namespace, store: SessionStore) -> int:
     if args.session_id is not None:
         try:
             snapshot = store.load_snapshot(args.session_id)
-        except CorruptSnapshotError as exc:
+        except (CorruptSnapshotError, StoreSecurityError) as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
         except ValueError as exc:
@@ -722,6 +740,9 @@ def _cmd_clear(args: argparse.Namespace, store: SessionStore) -> int:
 
     try:
         removed = store.clear_session(session_id)
+    except StoreSecurityError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2

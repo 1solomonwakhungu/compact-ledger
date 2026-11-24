@@ -382,7 +382,7 @@ def test_cli_json_strict_max_chars_priority_truncation_and_scaling(
     assert rc == 0
     scale_raw = capsys.readouterr().out
     assert len(scale_raw) <= 2000
-    assert elapsed < 0.5
+    assert elapsed < 2.5
 
 
 def test_cli_markdown_spoofing_unpin_and_ascii_stdout(

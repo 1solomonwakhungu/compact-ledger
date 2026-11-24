@@ -12,7 +12,11 @@ import pytest
 
 from compact_ledger.cli import main
 from compact_ledger.doctor import run_doctor
-from compact_ledger.hooks import handle_pre_compact, handle_session_start
+from compact_ledger.hooks import (
+    create_and_save_snapshot,
+    handle_pre_compact,
+    handle_session_start,
+)
 from compact_ledger.models import CompactionSnapshot, PinEntry, ToolExecution, UserTurn
 from compact_ledger.parsers.runners import parse_runner_output
 from compact_ledger.parsers.transcript import parse_transcript_lines
@@ -319,3 +323,159 @@ def test_standalone_eval_runner_script_passes() -> None:
     assert report["total"] == 24
     assert report["passed"] == 24
     assert report["failed"] == 0
+
+
+def test_custom_store_dir_dot_in_git_repo_does_not_create_repo_gitignore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    monkeypatch.chdir(repo)
+
+    rc = main(["pin", "--store-dir", ".", "--session-id", "s1", "Never push to main."])
+    assert rc == 0
+    # Must NEVER create ./.gitignore ignoring the user's entire git repository
+    assert not (repo / ".gitignore").exists()
+    # Instead writes .gitignore inside sessions/
+    assert (repo / "sessions" / ".gitignore").is_file()
+    assert "*" in (repo / "sessions" / ".gitignore").read_text(encoding="utf-8")
+
+    # Default .compact-ledger store still creates .compact-ledger/.gitignore
+    default_store = SessionStore(base_dir=repo)
+    default_store.add_manual_pin("s2", "Default store rule.")
+    assert (repo / ".compact-ledger" / ".gitignore").is_file()
+    assert not (repo / ".gitignore").exists()
+
+
+def test_corrupt_quarantine_creates_unique_backups_and_cli_pin_warns_on_stderr(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    store_dir = tmp_path / "store"
+    store = SessionStore(store_dir=store_dir)
+    store.add_manual_pin("s1", "First pin")
+    snap_path = store.session_path("s1")
+
+    # First corruption
+    snap_path.write_text("{corrupt-1", encoding="utf-8")
+    rc1 = main(["pin", "--store-dir", str(store_dir), "--session-id", "s1", "Recovered 1"])
+    assert rc1 == 0
+    err1 = capsys.readouterr().err
+    assert "Warning:" in err1 and ".corrupt-" in err1
+
+    # Second corruption must create a SECOND distinct backup without overwriting the first
+    snap_path.write_text("{corrupt-2", encoding="utf-8")
+    rc2 = main(["pin", "--store-dir", str(store_dir), "--session-id", "s1", "Recovered 2"])
+    assert rc2 == 0
+    err2 = capsys.readouterr().err
+    assert "Warning:" in err2 and ".corrupt-" in err2
+
+    backups = sorted(store.sessions_dir.glob(f"{snap_path.name}.corrupt-*"))
+    assert len(backups) == 2
+    contents = {b.read_text(encoding="utf-8") for b in backups}
+    assert contents == {"{corrupt-1", "{corrupt-2"}
+
+
+def test_clear_session_removes_snapshot_and_corrupt_backups(tmp_path: Path) -> None:
+    store = SessionStore(store_dir=tmp_path / "store")
+    store.add_manual_pin("s1", "Rule 1")
+    snap_path = store.session_path("s1")
+    snap_path.write_text("{bad-1", encoding="utf-8")
+    store.add_manual_pin("s1", "Rule 2")
+    snap_path.write_text("{bad-2", encoding="utf-8")
+    store.add_manual_pin("s1", "Rule 3")
+
+    assert len(list(store.sessions_dir.glob(f"{snap_path.name}.corrupt*"))) == 2
+    assert store.clear_session("s1") is True
+    assert not snap_path.exists()
+    assert list(store.sessions_dir.glob(f"{snap_path.name}.corrupt*")) == []
+    assert store.clear_session("s1") is False
+
+    # Also returns True when only a legacy/timestamped .corrupt backup remains
+    orphan = snap_path.with_name(f"{snap_path.name}.corrupt-orphan")
+    orphan.write_text("{orphan", encoding="utf-8")
+    assert store.clear_session("s1") is True
+    assert not orphan.exists()
+
+
+def test_pre_compact_does_not_resurrect_pin_removed_by_concurrent_unpin(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = SessionStore(store_dir=tmp_path / "store")
+    sid = "race-unpin"
+    store.add_manual_pin(sid, "Temporary rule to unpin")
+    store.add_manual_pin(sid, "Rule that stays")
+
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": sid,
+                "message": {"role": "user", "content": "Never touch db/migrations/."},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    from compact_ledger import hooks as hooks_mod
+
+    orig_parse = hooks_mod.parse_transcript
+
+    def _parse_with_concurrent_unpin(*args: object, **kwargs: object) -> object:
+        result = orig_parse(*args, **kwargs)  # type: ignore[arg-type]
+        # Simulate user running `compact-ledger unpin` while PreCompact is mid-parse
+        assert store.remove_manual_pin(sid, "Temporary rule to unpin") is True
+        return result
+
+    monkeypatch.setattr(hooks_mod, "parse_transcript", _parse_with_concurrent_unpin)
+
+    saved, _ = create_and_save_snapshot(transcript, store, session_id=sid)
+    manual_texts = [p.text for p in saved.pins if p.source == "manual"]
+    assert manual_texts == ["Rule that stays"]
+    assert "Temporary rule to unpin" not in manual_texts
+
+
+def test_cli_symlink_store_errors_return_exit_code_1_consistently(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    if sys.platform == "win32":
+        pytest.skip("POSIX symlink test")
+
+    real_dir = tmp_path / "real-store"
+    real_dir.mkdir()
+    sym_store = tmp_path / "sym-store"
+    sym_store.symlink_to(real_dir)
+
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": "s1",
+                "message": {"role": "user", "content": "Never push to main."},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    commands = [
+        ["status", "--store-dir", str(sym_store)],
+        ["status", "--store-dir", str(sym_store), "--session-id", "s1"],
+        ["pin", "--store-dir", str(sym_store), "--session-id", "s1", "Rule"],
+        ["unpin", "--store-dir", str(sym_store), "--session-id", "s1", "Rule"],
+        ["clear", "--store-dir", str(sym_store), "--session-id", "s1"],
+        ["inject", "--store-dir", str(sym_store), "--session-id", "s1"],
+        ["snapshot", "--store-dir", str(sym_store), "--transcript", str(transcript)],
+    ]
+    for argv in commands:
+        rc = main(argv)
+        err = capsys.readouterr().err
+        assert rc == 1, f"Expected exit 1 for {argv!r}, got {rc} (stderr={err!r})"
+        assert "symlinked" in err

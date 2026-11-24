@@ -212,8 +212,11 @@ def test_list_clear_and_corrupt_snapshot_handling(tmp_path: Path) -> None:
     recovered = store.save_snapshot(CompactionSnapshot(session_id="sess-corrupt"))
     assert recovered.session_id == "sess-corrupt"
     assert store.load_snapshot("sess-corrupt") is not None
-    # Corrupt file was quarantined rather than silently destroyed
-    assert corrupt_path.with_name(f"{corrupt_path.name}.corrupt").is_file()
+    # Corrupt file was quarantined with a unique timestamped backup rather than silently destroyed
+    backups = list(store.sessions_dir.glob(f"{corrupt_path.name}.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].is_file()
+    assert store.last_quarantined_path == backups[0]
 
     assert store.clear_session("sess-b") is True
     assert store.clear_session("sess-b") is False
