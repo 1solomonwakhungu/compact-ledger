@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone entry point for running the seeded 20-case compact-ledger eval suite."""
+"""Standalone entry point for running the seeded compact-ledger eval suite."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import sys
 from collections.abc import Sequence
 
 from compact_ledger.evals import (
+    SEEDED_EVAL_CASES,
     format_eval_report_json,
     format_eval_report_text,
     run_eval_suite,
@@ -16,7 +17,9 @@ from compact_ledger.evals import (
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Run the 20-case deterministic compact-ledger evaluation suite."
+        description=(
+            f"Run the {len(SEEDED_EVAL_CASES)}-case deterministic compact-ledger evaluation suite."
+        )
     )
     parser.add_argument(
         "--format",

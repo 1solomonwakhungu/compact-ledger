@@ -317,7 +317,9 @@ def handle_pre_compact(
 
         extra_meta: dict[str, Any] = {"hook_event": "PreCompact"}
         with contextlib.suppress(OSError, RuntimeError):
-            project_dir = resolve_project_dir(payload_cwd, env=env, fallback_cwd=fallback_cwd)
+            project_dir = find_project_root(
+                resolve_project_dir(payload_cwd, env=env, fallback_cwd=fallback_cwd)
+            )
             extra_meta["project_dir"] = sanitize_unicode(str(project_dir.resolve()))
         trigger = payload.get("trigger")
         if isinstance(trigger, str) and trigger.strip():

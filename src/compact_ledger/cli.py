@@ -602,7 +602,10 @@ def _cmd_unpin(args: argparse.Namespace, store: SessionStore) -> int:
 
     try:
         removed = store.remove_manual_pin(session_id, args.target)
-    except (ValueError, CorruptSnapshotError) as exc:
+    except CorruptSnapshotError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
@@ -786,8 +789,7 @@ def _cmd_init(args: argparse.Namespace) -> int:
     if missing is not None:
         print(
             f"Warning: {missing!r} is not on PATH, so these hooks will do nothing until it "
-            "is. Install it (`uv tool install "
-            "git+https://github.com/1solomonwakhungu/compact-ledger.git`) or pass "
+            "is. Install it (`uv tool install compact-ledger`) or pass "
             "--command with a runnable prefix.",
             file=sys.stderr,
         )
