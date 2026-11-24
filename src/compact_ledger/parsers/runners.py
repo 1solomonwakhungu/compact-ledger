@@ -1420,25 +1420,33 @@ def _normalize_js_test_id(file_path: str | None, raw_name: str) -> str:
     return cleaned
 
 
+def _is_decimal_number(text: str) -> bool:
+    """Return True if ``text`` is an ASCII integer or decimal like ``8`` or ``1.25``."""
+    if not text or text.startswith(".") or text.endswith("."):
+        return False
+    parts = text.split(".")
+    return len(parts) <= 2 and all(part.isascii() and part.isdigit() for part in parts)
+
+
 def _strip_trailing_js_duration(text: str) -> str:
     """Linear-time removal of trailing Jest/Vitest timing like `8ms`, `1.2s`, `(5 ms)`."""
     parts = text.split()
     if len(parts) < 2:
         return " ".join(parts)
     last = parts[-1]
-    # Form 1: `(5 ms)` -> last two tokens are `(<digits>` and `ms)` / `s)`
+    # Form 1: `(5 ms)` / `(1.2 s)` -> last two tokens are `(<num>` and `ms)` / `s)`
     if (
         len(parts) >= 3
         and last in ("ms)", "s)")
         and parts[-2].startswith("(")
-        and parts[-2][1:].isdigit()
+        and _is_decimal_number(parts[-2][1:])
     ):
         return " ".join(parts[:-2])
-    # Form 2: `(5ms)` or `5ms` or `5s`
+    # Form 2: `(5ms)` or `5ms` or `1.2s`
     inner = last[1:-1] if (last.startswith("(") and last.endswith(")")) else last
-    if inner.endswith("ms") and inner[:-2].isdigit():
+    if inner.endswith("ms") and _is_decimal_number(inner[:-2]):
         return " ".join(parts[:-1])
-    if inner.endswith("s") and inner[:-1].isdigit():
+    if inner.endswith("s") and _is_decimal_number(inner[:-1]):
         return " ".join(parts[:-1])
     return " ".join(parts)
 
