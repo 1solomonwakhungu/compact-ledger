@@ -244,7 +244,10 @@ class SessionStore:
         self._reject_symlinks()
         safe_id = sanitize_session_id(session_id)
         sessions_resolved = self.sessions_dir.resolve()
-        candidate = (sessions_resolved / f"{safe_id}.json").resolve()
+        raw_candidate = sessions_resolved / f"{safe_id}.json"
+        if raw_candidate.is_symlink():
+            raise ValueError(f"Refusing to operate on symlinked session file: {raw_candidate}")
+        candidate = raw_candidate.resolve()
         if candidate.parent != sessions_resolved:
             raise ValueError(f"Unsafe session path resolved outside store: {session_id!r}")
         if candidate.is_symlink():
@@ -257,6 +260,8 @@ class SessionStore:
         safe_id = sanitize_session_id(session_id)
         self._ensure_dirs()
         lock_path = self.sessions_dir / f".{safe_id}.lock"
+        if lock_path.is_symlink():
+            raise ValueError(f"Refusing to use symlinked session lock file: {lock_path}")
         if fcntl is None:
             yield
             return
@@ -425,11 +430,15 @@ class SessionStore:
     def clear_session(self, session_id: str) -> bool:
         """Delete the stored snapshot for ``session_id``. Returns True if removed."""
         path = self.session_path(session_id)
-        try:
-            path.unlink()
-            return True
-        except FileNotFoundError:
+        if not self.sessions_dir.is_dir():
             return False
+        with self._session_lock(session_id):
+            self._reject_symlinks(path)
+            try:
+                path.unlink()
+                return True
+            except FileNotFoundError:
+                return False
 
     def list_sessions(self) -> list[str]:
         """Return sorted session IDs for all valid stored sessions."""

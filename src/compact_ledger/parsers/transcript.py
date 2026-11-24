@@ -45,7 +45,8 @@ _SHELL_TOOL_NAMES = frozenset(
 
 _ASCII_INT_RE = re.compile(r"-?[0-9]{1,18}")
 _HEADER_EXIT_CODE_RE = re.compile(
-    r"^(?:Exit code[:\s]+|Command exited with (?:non-zero )?status\s+|Process exited with code\s+)"
+    r"^(?:Exit code[:\s]+|Command exited with (?:non-zero )?(?:status|code)\s+|"
+    r"Process exited with code\s+)"
     r"(-?[0-9]{1,9})\b",
     re.IGNORECASE,
 )
@@ -53,6 +54,7 @@ _CODEX_HEADER_PREFIXES = (
     "Chunk ID:",
     "Wall time:",
     "Process exited with code ",
+    "Command exited with ",
     "Exit code:",
     "Original token count:",
     "Script completed\n",

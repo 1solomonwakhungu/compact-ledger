@@ -12,10 +12,11 @@ uv run compact-ledger eval --verbose
 uv run compact-ledger eval --format json
 ```
 
-Or directly via the helper script in this folder:
+Or directly via the helper scripts in this folder:
 
 ```bash
 uv run python evals/run_evals.py --verbose
+uv run python evals/bench.py
 ```
 
 ## Coverage (24 Seeded Multi-Turn Cases)

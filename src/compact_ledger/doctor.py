@@ -20,12 +20,14 @@ from compact_ledger.hooks import (
     _matcher_covers_event,
     _parse_tokens,
 )
+from compact_ledger.models import CompactionSnapshot
 from compact_ledger.store import (
     DEFAULT_DIR_NAME,
     ENV_STORE_DIR,
     CorruptSnapshotError,
     SessionStore,
     find_project_root,
+    sanitize_session_id,
 )
 
 __all__ = [
@@ -40,7 +42,7 @@ __all__ = [
 DOCTOR_SCHEMA_VERSION = 1
 CheckStatus = Literal["ok", "warn", "fail"]
 
-_INSTALL_CMD = "uv tool install git+https://github.com/1solomonwakhungu/compact-ledger.git"
+_INSTALL_CMD = "uv tool install compact-ledger"
 _LOCAL_CLAUDE_SETTINGS_RELPATH = Path(".claude") / "settings.local.json"
 _INSTALLED_PLUGINS_RELPATH = Path(".claude") / "plugins" / "installed_plugins.json"
 
@@ -189,10 +191,7 @@ def _check_python_version(version_info: tuple[int, int, int]) -> DoctorCheck:
         name="python_version",
         status="fail",
         summary=f"Python {ver_str} is below required >= 3.11",
-        fix=(
-            "uv tool install --python 3.12 "
-            "git+https://github.com/1solomonwakhungu/compact-ledger.git"
-        ),
+        fix="uv tool install --python 3.12 compact-ledger",
         details={"version": ver_str, "executable": sys.executable},
     )
 
@@ -840,19 +839,23 @@ def _check_store(store: SessionStore, project_root: Path) -> DoctorCheck:
 
     try:
         if sessions_dir.is_dir():
-            sessions = store.list_sessions()
+            valid_sessions: set[str] = set()
             for entry in sorted(sessions_dir.glob("*.json")):
                 if entry.is_symlink() or not entry.is_file() or entry.name.startswith("."):
                     continue
                 try:
                     raw_data = json.loads(entry.read_text(encoding="utf-8"))
                     sid = raw_data.get("session_id") if isinstance(raw_data, dict) else None
-                    if not isinstance(sid, str) or not sid.strip():
+                    if (
+                        not isinstance(sid, str)
+                        or not sid.strip()
+                        or "\x00" in sid
+                        or sanitize_session_id(sid) != entry.stem
+                    ):
                         corrupt_count += 1
                         continue
-                    snap = store.load_snapshot(sid)
-                    if snap is None:
-                        continue
+                    snap = CompactionSnapshot.from_dict(raw_data)
+                    valid_sessions.add(snap.session_id)
                     if snap.metadata.get("hook_event") == "PreCompact":
                         hook_sessions += 1
                     total_pins += len(snap.pins)
@@ -869,6 +872,7 @@ def _check_store(store: SessionStore, project_root: Path) -> DoctorCheck:
                     RecursionError,
                 ):
                     corrupt_count += 1
+            sessions = sorted(valid_sessions)
     except OSError as exc:
         return DoctorCheck(
             name="store",

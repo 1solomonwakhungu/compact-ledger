@@ -1957,18 +1957,54 @@ def _sentence_is_directive(sentence: str) -> bool:
     return is_negative_constraint(sentence) or _has_directive_sentence([sentence])
 
 
+def _is_pure_retraction_sentence(sentence: str) -> bool:
+    sig = _detect_override_signal(sentence)
+    return bool(
+        sig is not None
+        and sig.is_explicit_retraction
+        and not sig.adopted_targets
+        and not is_negative_constraint(sentence)
+    )
+
+
 def _group_directive_sentences(sentences: Sequence[str]) -> list[str]:
-    """Group sentences so each group holds exactly one directive plus its trailing context."""
+    """Group sentences so each group holds one directive (or retraction+replacement) + context."""
+    n = len(sentences)
+    if n == 0:
+        return []
+
+    is_retraction = [_is_pure_retraction_sentence(s) for s in sentences]
+    is_directive = [
+        False if is_retraction[i] else _sentence_is_directive(sentences[i]) for i in range(n)
+    ]
+
+    # O(N) suffix flag: True if a non-retraction directive appears strictly after index i.
+    has_following_directive = [False] * n
+    seen_directive = False
+    for i in range(n - 1, -1, -1):
+        has_following_directive[i] = seen_directive
+        if is_directive[i]:
+            seen_directive = True
+
     groups: list[list[str]] = []
     lead: list[str] = []
-    for sent in sentences:
-        if _sentence_is_directive(sent):
+    for i, sent in enumerate(sentences):
+        if is_retraction[i] and has_following_directive[i]:
+            lead.append(sent)
+        elif is_directive[i] or is_retraction[i]:
             groups.append([*lead, sent])
             lead = []
+        elif lead:
+            lead.append(sent)
         elif groups:
             groups[-1].append(sent)
         else:
             lead.append(sent)
+    if lead:
+        if groups:
+            groups[-1].extend(lead)
+        else:
+            groups.append(lead)
     return [" ".join(group) for group in groups]
 
 
@@ -2476,6 +2512,17 @@ def extract_pins(
                     ban_norm = normalize_pin_text(ban.text)
                     if ban_norm:
                         active_by_norm[ban_norm] = ban
+                    _, _, ban_chain, _, ban_has_date, _ = pin_meta[ban.pin_id]
+                    for tok in ban_chain:
+                        bucket = token_index.setdefault(tok, [])
+                        if ban not in bucket:
+                            bucket.append(ban)
+                        if len(tok) >= 4:
+                            pbucket = prefix4_index.setdefault(tok[:4], [])
+                            if ban not in pbucket:
+                                pbucket.append(ban)
+                    if ban_has_date and ban not in date_pins:
+                        date_pins.append(ban)
 
         if primary_was_contradicted_ban and superseded_target is not None:
             extra_retired_by.setdefault(new_pin.pin_id, []).append(superseded_target)

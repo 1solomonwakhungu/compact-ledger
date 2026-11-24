@@ -11,7 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -19,11 +19,26 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run checks
         run: |
-          if [ ! -f pyproject.toml ]; then
-            echo "Bootstrap commit (no pyproject.toml yet); skipping."
-            exit 0
-          fi
           uv sync --dev
           uv run ruff check .
           uv run ruff format --check .
           uv run pytest -v
+          uv run compact-ledger eval
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - name: Build and verify isolated wheel install
+        run: |
+          uv build
+          uv venv /tmp/cl-smoke-venv
+          uv pip install --python /tmp/cl-smoke-venv/bin/python --no-deps dist/*.whl
+          /tmp/cl-smoke-venv/bin/compact-ledger --version
+          /tmp/cl-smoke-venv/bin/compact-ledger eval
+          /tmp/cl-smoke-venv/bin/compact-ledger pin --store-dir /tmp/cl-smoke-store --session-id ci-smoke "Never push to main" --negative
+          /tmp/cl-smoke-venv/bin/compact-ledger inject --store-dir /tmp/cl-smoke-store --session-id ci-smoke
+          /tmp/cl-smoke-venv/bin/compact-ledger clear --store-dir /tmp/cl-smoke-store --session-id ci-smoke
