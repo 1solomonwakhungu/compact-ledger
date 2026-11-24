@@ -24,6 +24,7 @@ from compact_ledger.models import CompactionSnapshot
 from compact_ledger.store import (
     DEFAULT_DIR_NAME,
     ENV_STORE_DIR,
+    SESSIONS_SUBDIR,
     CorruptSnapshotError,
     SessionStore,
     find_project_root,
@@ -725,14 +726,17 @@ def _nearest_existing_ancestor(path: Path) -> Path | None:
 
 
 def _store_is_gitignored(store_root: Path, project_root: Path) -> bool:
-    store_ignore = store_root / ".gitignore"
-    try:
-        if store_ignore.is_file() and not store_ignore.is_symlink():
-            lines = [ln.strip() for ln in store_ignore.read_text(encoding="utf-8").splitlines()]
-            if "*" in lines or "/*" in lines:
-                return True
-    except (OSError, UnicodeDecodeError):
-        pass
+    candidates = [store_root / ".gitignore"]
+    if store_root.name != DEFAULT_DIR_NAME or (store_root / ".git").exists():
+        candidates.insert(0, store_root / SESSIONS_SUBDIR / ".gitignore")
+    for ignore_file in candidates:
+        try:
+            if ignore_file.is_file() and not ignore_file.is_symlink():
+                lines = [ln.strip() for ln in ignore_file.read_text(encoding="utf-8").splitlines()]
+                if "*" in lines or "/*" in lines:
+                    return True
+        except (OSError, UnicodeDecodeError):
+            pass
 
     repo_ignore = project_root / ".gitignore"
     store_names = {DEFAULT_DIR_NAME, store_root.name}
@@ -896,7 +900,10 @@ def _check_store(store: SessionStore, project_root: Path) -> DoctorCheck:
     }
 
     if exists and not gitignored:
-        ignore_path = root / ".gitignore"
+        if root.name == DEFAULT_DIR_NAME and not (root / ".git").exists():
+            ignore_path = root / ".gitignore"
+        else:
+            ignore_path = sessions_dir / ".gitignore"
         ignore_quoted = shlex.quote(str(ignore_path))
         ignore_is_symlink = False
         with contextlib.suppress(OSError):

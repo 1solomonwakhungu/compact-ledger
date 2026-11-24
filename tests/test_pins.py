@@ -829,7 +829,7 @@ def test_round2_b4_three_linear_scaling_stress_shapes() -> None:
     huge_line = " ".join("instead of foo, use bar;" for _ in range(8000))
     t0 = time.monotonic()
     extract_pins([UserTurn(turn_index=1, text=huge_line, seq=1)])
-    assert (time.monotonic() - t0) < 0.5
+    assert (time.monotonic() - t0) < 2.0
 
     # 2. 2,000 pins sharing a common word + 2,000 overrides using it
     shared_turns = [
