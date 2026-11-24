@@ -1,13 +1,13 @@
 # compact-ledger Launch Assets
 
-Ready-to-post copy for Show HN, Reddit, X, and the `v0.1.0` GitHub release. Every number below comes from `uv run python evals/bench.py`, `uv run compact-ledger eval`, and `uv run pytest` on macOS (`Darwin arm64`, Python 3.13.14).
+Ready-to-post copy for Show HN, Reddit, X, and the `v0.1.1` GitHub release. Every number below comes from `uv run python evals/bench.py`, `uv run compact-ledger eval`, and `uv run pytest` on macOS (`Darwin arm64`, Python 3.13.14).
 
 ---
 
 ## 1. Show HN
 
 **Title:**
-Show HN: Compact-Ledger – Deterministic PreCompact memory for Claude Code and Codex
+Show HN: Compact-Ledger – PreCompact memory for Claude Code (Codex via CLI)
 
 **Body:**
 Hi HN,
@@ -16,7 +16,7 @@ I built `compact-ledger` because context compaction kept wrecking long Claude Co
 
 `compact-ledger` is a small Python package (3.11+, zero runtime dependencies, zero LLM calls) that plugs into Claude Code's `PreCompact` and `SessionStart` hooks. Right before compaction it reads the session JSONL transcript, extracts four things into a local file-locked JSON snapshot under `.compact-ledger/`, and injects a strictly budgeted Markdown block on `compact` or `resume`:
 
-1. Manual pins (`compact-ledger pin "..."`) and superseding corrections, printed with what they retired: `[OVERRIDE] Actually use July 31 instead of June 30... (supersedes: Use June 30 as the billing cutoff date...)`. If a correction adopts something an earlier negative rule forbade (e.g. "Never use spaces" followed by "Actually use 2 spaces instead of tabs"), it retires the conflicting ban while leaving scoped bans like "Never use spaces in filenames" intact.
+1. Manual pins (`compact-ledger pin "..."`) and superseding corrections, printed with what they retired: `[OVERRIDE] Actually use July 31 instead of June 30... (supersedes: Use June 30 as the billing cutoff date...)`. When a correction explicitly adopts something a general negative rule forbade (e.g. "Never use spaces." followed by "Actually use 2 spaces instead of tabs."), it retires the general ban while leaving scoped bans like "Never use spaces in filenames." active.
 2. Active positive and `[DO NOT]` rules extracted per-rule from long opening briefs, with chatter and harness-authored messages (`Stop hook feedback:`, `<system-reminder>`, interrupted tool notices) filtered out.
 3. Structured test failure trajectories across `pytest`, `vitest`, `jest`, `go test`, and generic commands, classified as `PROGRESSING`, `OSCILLATING`, `STALLED`, `SINGLE_FAILURE`, or `RESOLVED` with observed values oldest first (e.g. `[400 -> 200 -> 400; expected 100]`), plus `[THRASH/REVERT]` warnings when an edit reverts an earlier hunk while failures persist.
 4. Modified files in the session, relativized to the project root.
@@ -27,7 +27,7 @@ Measured numbers on an Apple Silicon Mac (Python 3.13.14, reproducible via `uv r
 - In-process: `add_manual_pin` (atomic write + `fsync`) 0.42 ms median; `render_snapshot` 0.01 ms; `pre-compact` 1.40 ms on a 4.7 KB transcript and 11.68 ms on a 162 KB transcript (80 failing edit/test cycles); `session-start` 0.11 ms.
 - Cold CLI subprocess (including Python startup): 51-55 ms median for `pin`, `inject`, `hook pre-compact`, and `hook session-start`.
 - Output size: the 162 KB transcript compresses to 1,098 chars (~274 tokens); a 4.7 KB realistic session renders to 1,146 chars (~286 tokens).
-- Verification: 341 unit/integration tests and 24/24 seeded end-to-end eval cases passing in ~53 ms (`uvx compact-ledger eval`).
+- Verification: 346 unit/integration tests and 24/24 seeded end-to-end eval cases passing in ~50 ms (`uvx compact-ledger eval`).
 
 Honest limits:
 - Automatic compaction hooks are Claude Code native. Codex CLI does not expose a compaction hook yet, so Codex rollouts (including code-mode `exec` and `apply_patch` events) work via the CLI commands (`compact-ledger snapshot`, `inject`, `pin`).
@@ -58,14 +58,15 @@ Every long Claude Code session hits `/compact` eventually, and the compaction su
 
 I built `compact-ledger` to fix this deterministically with no LLM call and zero third-party Python dependencies (Python 3.11+ stdlib only).
 
-Before compaction, the `PreCompact` hook reads the session JSONL transcript and writes an atomic snapshot under `.compact-ledger/` (auto-gitignored). On `SessionStart` (`compact|resume`), it injects a short Markdown ledger capped at 6,000 chars by default:
+Before compaction, the `PreCompact` hook reads the session JSONL transcript and writes an atomic snapshot under `.compact-ledger/` (auto-gitignored). On `SessionStart` (`compact|resume`), it injects a short Markdown ledger capped at 6,000 chars by default. Excerpt of the block injected on resume:
 
 ```markdown
 ## Compact Ledger (Session: billing-refactor)
+Recorded verbatim before compaction. Pins, overrides and constraints are the user's standing instructions: where the compaction summary disagrees, follow these. Failure lines list values already observed, oldest first; do not retry an approach that produced them.
 
 ### Manual Pins & Active Overrides
 - [MANUAL] [tags: arch] Zero third-party runtime dependencies.
-- [OVERRIDE] Actually use July 31 instead of June 30 for the billing cutoff. (supersedes: Use June 30 as the billing cutoff date for the fiscal-year rollover.)
+- [OVERRIDE] Actually use July 31 instead of June 30 for the billing cutoff. Finance moved the fiscal year. (supersedes: Use June 30 as the billing cutoff date for the fiscal-year rollover.)
 
 ### User Constraints
 - [DO NOT] [turn 1] Never touch migrations under db/migrations/ — the DBA team owns those.
@@ -132,7 +133,7 @@ You can also install the agent skill (`npx skills add 1solomonwakhungu/compact-l
 Real numbers (`uv run python evals/bench.py`, Python 3.13 on Apple Silicon):
 - Parses a 162 KB transcript (80 failing edit/test loops) in 11.7 ms in-process and compresses it to 1,098 chars (~274 tokens).
 - Cold CLI commands run in ~51-55 ms median (mostly Python startup).
-- 341 unit/integration tests and 24/24 seeded eval cases passing in ~53 ms (`uvx compact-ledger eval`).
+- 346 unit/integration tests and 24/24 seeded eval cases passing in ~50 ms (`uvx compact-ledger eval`).
 
 GitHub: https://github.com/1solomonwakhungu/compact-ledger
 
@@ -141,64 +142,72 @@ GitHub: https://github.com/1solomonwakhungu/compact-ledger
 ## 3. X / Twitter Launch Thread
 
 **Tweet 1 (Hook + Demo):**
-Context compaction breaks long coding sessions in three predictable ways:
-1. It drops "never touch X" rules from turn 1.
-2. It mixes up mid-session corrections ("use July 31, not June 30").
-3. It erases failed test values, so the agent repeats edits that already failed.
+Compaction breaks long coding sessions:
+1. Drops "never touch X" rules from turn 1.
+2. Mixes up corrections ("use July 31, not June 30").
+3. Erases failed test values.
 
-I built `compact-ledger`: a zero-LLM, stdlib-only PreCompact + SessionStart memory injector for Claude Code and Codex.
-
+Built `compact-ledger`: zero-LLM PreCompact memory for Claude Code (Codex via CLI).
 https://github.com/1solomonwakhungu/compact-ledger
 
 **Tweet 2 (What the agent sees):**
-Right before `/compact`, it parses the session JSONL transcript and writes a bounded ledger injected on resume:
+Before `/compact`, it parses the transcript and injects a bounded ledger:
 
-- `[MANUAL]` pins you or the agent explicitly locked
-- `[OVERRIDE] Actually use July 31... (supersedes: Use June 30...)`
-- `[DO NOT]` rules split per-rule from long opening briefs
-- `[OSCILLATING] test_tax_cap (pytest) [400 -> 200 -> 400; expected 100]`
-- `[THRASH/REVERT] src/billing/tax.py (2 edits, 5 failures)`
+- `[MANUAL]` locked pins
+- `[OVERRIDE] Use July 31... (supersedes: Use June 30...)`
+- `[DO NOT]` rules split per-rule
+- `[OSCILLATING] test_tax_cap [400 -> 200 -> 400]`
+- `[THRASH/REVERT] tax.py`
 
-**Tweet 3 (Numbers, no fluff):**
-Real numbers (`uv run python evals/bench.py`, Python 3.13 on Apple Silicon):
-- Zero LLM calls, zero third-party runtime deps
-- 162 KB transcript (80 failing edit/test cycles) -> parsed in 11.7 ms in-process -> compressed to 1,098 chars (~274 tokens)
-- Cold CLI hook runtime including Python startup: 51-54 ms median
-- 341 tests + 24/24 seeded evals passing in ~53 ms
+**Tweet 3 (Benchmarks):**
+Measured via `uv run python evals/bench.py` (Python 3.13, Apple Silicon):
+- Zero LLM calls, zero runtime deps
+- 162 KB transcript -> parsed in 11.7 ms in-process, rendered to 1,098 chars (~274 tokens)
+- Cold CLI hooks: 51-54 ms median
+- 346 tests + 24/24 evals in ~50 ms
 
 **Tweet 4 (Safety & limits):**
-Hooks always fail open (exit 0 with empty stdout on bad input or errors) so a hook bug never disrupts a live session.
+Hooks fail open (exit 0 on errors) so they never block a session.
 
-Honest limits: automatic hooks are Claude Code native (Codex uses CLI `snapshot`/`inject`/`pin`), rule extraction is heuristic (use `compact-ledger pin` for critical rules), and storage is session-scoped under `.compact-ledger/` (auto-gitignored).
+Honest limits: automatic hooks are Claude Code native (Codex uses CLI `snapshot`/`inject`/`pin`), rule extraction is heuristic (use `compact-ledger pin` for hard rules), and snapshots are session-scoped.
 
 **Tweet 5 (Try it):**
-Try the 24-case eval suite with no install:
+Try the 24-case eval suite:
 `uvx compact-ledger eval`
 
-Install in Claude Code as a plugin:
+Claude Code plugin:
 `/plugin marketplace add 1solomonwakhungu/compact-ledger`
 `/plugin install compact-ledger@compact-ledger`
 
-Or install the Agent Skill (Claude Code, Codex, Cursor, OpenCode):
+Agent Skill:
 `npx skills add 1solomonwakhungu/compact-ledger`
 
 ---
 
-## 4. GitHub Release Notes (`v0.1.0`)
+## 4. GitHub Release Notes (`v0.1.1`)
 
-```markdown
-## compact-ledger v0.1.0
+````markdown
+## compact-ledger v0.1.1
 
-First public release of `compact-ledger`, a deterministic, zero-LLM `PreCompact` + `SessionStart` memory injector for AI coding agents.
+Release `v0.1.1` follows the initial `0.1.0` PyPI upload with store/symlink hardening, concurrent-write race fixes, Codex/JS runner parser improvements, reproducible benchmarks, and CI wheel verification.
 
-### What's included
+### What's new since `0.1.0`
 
-- **Verbatim user rules & superseding corrections**: Extracts positive and negative (`[DO NOT]`) constraints one pin per rule from long briefs, links mid-session overrides with `(supersedes: ...)`, handles multi-step override chains (`A -> B -> C`), retires contradictory negative rules safely when an override adopts a previously forbidden option, and filters conversational chatter and harness-authored messages (`Stop hook feedback:`, `<system-reminder>`, Codex `<environment_context>` / background command notices).
-- **Manual pin priority**: `compact-ledger pin` / `unpin` stores high-priority rules that outrank extracted constraints and test history and survive across re-snapshots. Reads `$CLAUDE_CODE_SESSION_ID` automatically inside Claude Code.
-- **Test attempt trajectories & edit-thrash detection**: Parses `pytest`, `vitest`, `jest`, `go test`, and generic failing commands into classified trajectories (`OSCILLATING`, `STALLED`, `PROGRESSING`, `SINGLE_FAILURE`, `RESOLVED`) with scope-aware resolution checks, plus `[THRASH/REVERT]` warnings when file edits loop or revert while failures persist.
-- **Claude Code & Codex transcript support**: Native Claude Code `PreCompact` + `SessionStart` (`compact|resume`) fail-open hooks (`compact-ledger init --write`), bundled Claude Code plugin (`.claude-plugin/`, `hooks/hooks.json`, `bin/compact-ledger`), Agent Skill (`skills/compact-ledger/SKILL.md`), and end-to-end Codex rollout parsing (code-mode `exec`, `item_completed` `CommandExecution`/`FileChange`/`UserMessage`, `function_call`, `apply_patch`).
-- **Strict budget enforcement & local safety**: Guaranteed `len(output) <= --max-chars` (default `6000`) in both Markdown and JSON formats; atomic file-locked JSON writes under `<project-root>/.compact-ledger/` with auto-generated `.gitignore`, symlink rejection, and corrupt-file quarantine.
-- **Diagnostics & packaged eval suite**: `compact-ledger doctor` checks PATH, Python >= 3.11, hook wiring, plugin health, and store status; `compact-ledger eval` runs 24 seeded multi-turn evaluation cases from any directory.
+- **Store safety & quarantine hardening**:
+  - Custom `--store-dir` paths (such as `--store-dir .` inside a git repo) now write `.gitignore` inside `sessions/` instead of creating a root `./.gitignore` with `*`.
+  - Intra-store session symlinks and symlinked `.lock` files are rejected before `.resolve()` / `open()`, and CLI commands consistently exit `1` on store symlink violations.
+  - Corrupt snapshots are quarantined to unique timestamped backups (`<session>.json.corrupt-<timestamp>`) without overwriting prior backups, `compact-ledger pin` / `snapshot` print a stderr warning naming the backup, and `compact-ledger clear` removes both snapshots and `.corrupt*` backups.
+  - Serialized `clear_session()` under the per-session file lock and removed pre-lock manual pin loading in `create_and_save_snapshot()` so a concurrent `unpin` during `PreCompact` is never resurrected.
+- **Override grouping & parser fixes**:
+  - Multi-sentence retractions followed by a replacement (e.g. `"Ignore my previous rule about pnpm. Stick with npm."`) now stay a single `[OVERRIDE]` unit and retire contradictory general negative constraints.
+  - Reactivated negative constraints are re-indexed after bucket compaction.
+  - Jest/Vitest inline test names now strip decimal durations (`1.25s`, `12.5ms`, `(1.5 s)`), Codex/shell headers recognize `Command exited with code N`, and `PreCompact` from a subdirectory relativizes paths against the project root.
+  - `compact-ledger doctor` validates snapshot filename stems on a single read (preventing double-counting from mismatched stray JSON files).
+- **CI, packaging & benchmarks**:
+  - Migrated `pyproject.toml` to PEP 639 (`license = "MIT"`, `license-files = ["LICENSE"]`, `hatchling>=1.27`).
+  - Expanded GitHub Actions CI to Python 3.11, 3.12, and 3.13 with `compact-ledger eval` and an isolated `--no-deps` wheel install smoke test.
+  - Added `evals/bench.py` for reproducible in-process latency, cold CLI latency, and transcript-to-ledger footprint measurements.
+  - Updated `README.md` with absolute GitHub URLs (fixing relative links on PyPI), measured benchmarks, and aligned `SKILL.md` tag and exit-code docs.
 
 ### Install
 
@@ -221,11 +230,11 @@ uvx compact-ledger eval
 
 ### Verification
 
-- **Tests**: 341/341 unit and integration tests passing on Python 3.11, 3.12, and 3.13.
-- **Eval suite**: 24/24 seeded cases passing (100.0%) in ~53 ms.
+- **Tests**: 346/346 unit and integration tests passing on Python 3.11, 3.12, and 3.13.
+- **Eval suite**: 24/24 seeded cases passing (100.0%) in ~50 ms.
 - **Benchmarks** (`uv run python evals/bench.py`, Darwin arm64, Python 3.13.14):
   - In-process: `add_manual_pin` 0.42 ms, `render_snapshot` 0.01 ms, `hook pre-compact` 1.40 ms (4.7 KB) / 11.68 ms (162 KB), `hook session-start` 0.11 ms.
   - Cold CLI subprocess (including Python startup): 51.0-54.9 ms median.
   - Footprint: 162 KB transcript -> 1,098 chars (~274 tokens) injected Markdown.
 - **Runtime dependencies**: None (Python >= 3.11 standard library only).
-```
+````

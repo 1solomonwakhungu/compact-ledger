@@ -11,9 +11,9 @@ Long coding sessions hit context compaction right when precision matters most. L
 3. **Structured attempt & edit-thrash ledger (Tier 3)**: ordered failure trajectories across `pytest`, `vitest`, `jest`, `go test`, and generic commands (`PROGRESSING`, `OSCILLATING`, `STALLED`, `RESOLVED`) plus `[THRASH/REVERT]` warnings when edits loop or revert.
 4. **Modified files summary (Tier 4)**: deduplicated list of files touched in the session.
 
-- **Zero LLM calls** — 100% deterministic, local, reproducible output.
+- **Zero LLM calls** — deterministic, local, reproducible output.
 - **Zero third-party runtime dependencies** — Python `>=3.11` standard library only.
-- **Linear-time & lightweight** — O(N) scanning with atomic JSON storage (parses a 162 KB transcript in ~12 ms in-process; ~51–55 ms cold CLI including Python startup; runs all 24 seeded eval cases in ~53 ms).
+- **Linear-time & lightweight** — O(N) scanning with atomic JSON storage (parses a 162 KB transcript in ~12 ms in-process; ~51–55 ms cold CLI including Python startup; runs all 24 seeded eval cases in ~50 ms).
 - **Fail-open hooks** — hook commands exit `0` without polluting stdout on malformed input, bad flags, broken pipes, or unexpected errors (unless `--strict` is passed) so a hook issue never disrupts a live agent session.
 
 ---
@@ -149,9 +149,9 @@ Rule detection is pattern-based. Pin anything the user would be upset to see for
 the same guidance and a table for reading each ledger tag; the plugin installs it, or copy it
 into `.claude/skills/compact-ledger/`.
 
-Exit codes: `0` ok, `1` not found, corrupt store/settings, or runtime error, `2` usage error
-(such as invalid flags or missing `--session-id`). Hook commands always exit `0` unless
-`--strict` is passed.
+Exit codes: `0` ok (including `clear` on a missing session), `1` not found, corrupt
+store/settings, symlink violation, or runtime error, `2` usage error (such as invalid flags
+or missing `--session-id`). Hook commands always exit `0` unless `--strict` is passed.
 
 ---
 
@@ -242,7 +242,7 @@ All session commands accept `--store-dir <dir>` (or `COMPACT_LEDGER_DIR`). For `
 | `compact-ledger snapshot --transcript <path> [--session-id <id>] [--format auto\|claude-code\|codex\|generic] [--json]` | Parse a JSONL transcript, preserve manual pins, compute overrides/trajectories/thrash, and save an atomic snapshot. |
 | `compact-ledger inject [--session-id <id>] [--max-chars 6000] [--format markdown\|json]` | Render the stored snapshot strictly within `--max-chars`. |
 | `compact-ledger status [--session-id <id>] [--json]` | List stored sessions (the current one is marked `*`), or show one session's counts and manual pins. |
-| `compact-ledger clear [--session-id <id>]` | Delete the stored snapshot for a session. |
+| `compact-ledger clear [--session-id <id>]` | Delete the stored snapshot and any `.corrupt*` backups for a session (exits `0` even if absent). |
 | `compact-ledger hook pre-compact [--store-dir <dir>] [--strict]` | Claude Code `PreCompact` stdin hook handler (fail-open unless `--strict`). |
 | `compact-ledger hook session-start [--store-dir <dir>] [--max-chars 6000] [--always] [--strict]` | Claude Code `SessionStart` stdin hook handler (injects on `compact`/`resume` or `--always`; fail-open unless `--strict`). |
 | `compact-ledger eval [--format text\|json] [--verbose]` | Run the packaged 24-case deterministic evaluation suite from any working directory. |
