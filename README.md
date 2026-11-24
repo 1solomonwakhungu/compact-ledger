@@ -13,7 +13,7 @@ Long coding sessions hit context compaction right when precision matters most. L
 
 - **Zero LLM calls** — 100% deterministic, local, reproducible output.
 - **Zero third-party runtime dependencies** — Python `>=3.11` standard library only.
-- **Linear-time & lightweight** — O(N) scanning with atomic JSON storage (runs all 24 seeded eval cases in ~30 ms and scales linearly with transcript size).
+- **Linear-time & lightweight** — O(N) scanning with atomic JSON storage (parses a 162 KB transcript in ~12 ms in-process; ~51–55 ms cold CLI including Python startup; runs all 24 seeded eval cases in ~53 ms).
 - **Fail-open hooks** — hook commands exit `0` without polluting stdout on malformed input, bad flags, broken pipes, or unexpected errors (unless `--strict` is passed) so a hook issue never disrupts a live agent session.
 
 ---
@@ -145,12 +145,13 @@ compact-ledger status --session-id "$CLAUDE_CODE_SESSION_ID"    # pin IDs and te
 ```
 
 Rule detection is pattern-based. Pin anything the user would be upset to see forgotten.
-[skills/compact-ledger/SKILL.md](skills/compact-ledger/SKILL.md) is a ready-made skill with
+[skills/compact-ledger/SKILL.md](https://github.com/1solomonwakhungu/compact-ledger/blob/main/skills/compact-ledger/SKILL.md) is a ready-made skill with
 the same guidance and a table for reading each ledger tag; the plugin installs it, or copy it
 into `.claude/skills/compact-ledger/`.
 
-Exit codes: `0` ok, `1` not found or runtime error, `2` usage error. Hook commands always
-exit `0` unless `--strict` is passed.
+Exit codes: `0` ok, `1` not found, corrupt store/settings, or runtime error, `2` usage error
+(such as invalid flags or missing `--session-id`). Hook commands always exit `0` unless
+`--strict` is passed.
 
 ---
 
@@ -248,7 +249,37 @@ All session commands accept `--store-dir <dir>` (or `COMPACT_LEDGER_DIR`). For `
 
 ---
 
-## Evaluation Suite (24 Seeded Cases)
+## Benchmarks & Evaluation Suite
+
+### Measured Performance & Footprint
+
+Measured with `uv run python evals/bench.py` on macOS (`Darwin arm64`, Python `3.13.14`):
+
+| Benchmark | Median | p95 | Notes |
+| --- | ---: | ---: | --- |
+| `add_manual_pin` (in-process, atomic write + `fsync`) | 0.42 ms | 0.56 ms | File-locked atomic JSON replace |
+| `render_snapshot` (in-process, 6,000-char cap) | 0.01 ms | 0.01 ms | Priority-ordered Markdown renderer |
+| `hook pre-compact` (in-process, 4.7 KB transcript) | 1.40 ms | 1.73 ms | Full parse + pins + trajectories + save |
+| `hook pre-compact` (in-process, 162 KB transcript) | 11.68 ms | 12.38 ms | 80 failing edit/test cycles, O(N) scan |
+| `hook session-start` (in-process, load + render) | 0.11 ms | 0.12 ms | Disk load + bounded JSON output |
+| `compact-ledger pin` (cold CLI subprocess) | 54.87 ms | 59.40 ms | Includes Python interpreter startup |
+| `compact-ledger inject` (cold CLI subprocess) | 52.41 ms | 56.95 ms | Includes Python interpreter startup |
+| `compact-ledger hook pre-compact` (cold CLI) | 53.55 ms | 56.35 ms | 4.7 KB transcript, includes startup |
+| `compact-ledger hook session-start` (cold CLI) | 50.98 ms | 52.58 ms | Includes Python interpreter startup |
+
+**Footprint (from the same benchmark run):**
+- **4,719 B** realistic session transcript -> **4,939 B** snapshot JSON -> **1,146 chars (~286 tokens)** injected Markdown.
+- **161,841 B** (162 KB) transcript with 80 failing edit/test cycles -> **1,098 chars (~274 tokens)** injected Markdown.
+- Strict budget enforcement: `--max-chars 1200` emits `1,146` chars; `--max-chars 400` emits `400` chars (never exceeding the cap).
+
+Reproduce locally:
+
+```bash
+uv run python evals/bench.py        # human-readable table
+uv run python evals/bench.py --json # machine-readable JSON
+```
+
+### Evaluation Suite (24 Seeded Cases)
 
 `compact-ledger` ships with 24 realistic multi-turn evaluation cases covering Claude Code, Codex (including code-mode `exec` / `apply_patch` rollouts), and generic JSONL transcripts, long multi-rule briefs, contradictory negative-constraint overrides, override chains, harness-feedback & false-positive guards, `pytest`/`vitest`/`jest`/`go test`/generic trajectories, edit-thrash detection, strict budget truncation, and full hook round-trips.
 
@@ -257,30 +288,30 @@ Run it anywhere with `compact-ledger eval` (or `uv run compact-ledger eval`):
 ```text
 compact-ledger eval (24 seeded cases)
 ------------------------------------------------------------------------
-[PASS] 01_negative_constraints_claude_code                  (constraints )  1.08 ms
-[PASS] 02_codex_transcript_constraints_and_edits            (constraints )  0.77 ms
-[PASS] 03_manual_pin_priority_over_auto_and_ledger          (constraints )  1.14 ms
-[PASS] 04_superseding_date_correction                       (overrides   )  0.76 ms
-[PASS] 05_ignore_earlier_and_switch_from_x_to_y             (overrides   )  0.72 ms
-[PASS] 06_three_step_override_chain_a_b_c                   (overrides   )  0.86 ms
-[PASS] 07_false_positive_guard_casual_actually              (overrides   )  0.68 ms
-[PASS] 08_unrelated_topic_isolation                         (overrides   )  0.76 ms
-[PASS] 09_pytest_progressing_trajectory                     (trajectories)  1.04 ms
-[PASS] 10_pytest_oscillating_trajectory                     (trajectories)  0.78 ms
-[PASS] 11_pytest_stalled_and_raises_parametrized            (trajectories)  0.75 ms
-[PASS] 12_pytest_scoped_vs_unscoped_resolution              (trajectories)  0.94 ms
-[PASS] 13_vitest_and_jest_ansi_trajectories                 (trajectories)  0.97 ms
-[PASS] 14_go_test_and_generic_fallback_trajectories         (trajectories)  1.07 ms
-[PASS] 15_edit_thrash_hunk_revert_and_stalled_loop          (thrash      )  0.84 ms
-[PASS] 16_clean_edit_then_pass_no_false_thrash              (thrash      )  1.08 ms
-[PASS] 17_tight_budget_pins_survive_400_1200_6000           (budget      )  3.29 ms
-[PASS] 18_long_override_does_not_starve_negative_constraints (budget     )  1.90 ms
-[PASS] 19_hook_pre_compact_to_session_start_roundtrip       (hooks       )  1.47 ms
-[PASS] 20_hook_session_start_gating_and_fail_open           (hooks       )  0.44 ms
-[PASS] 21_long_brief_single_rule_override                   (overrides   )  0.92 ms
-[PASS] 22_contradictory_negative_constraint_override        (overrides   )  0.80 ms
-[PASS] 23_harness_feedback_filtering                        (constraints )  0.85 ms
-[PASS] 24_codex_code_mode_exec_trajectories_and_edits       (trajectories)  1.15 ms
+[PASS] 01_negative_constraints_claude_code                  (constraints )  1.63 ms
+[PASS] 02_codex_transcript_constraints_and_edits            (constraints )  0.97 ms
+[PASS] 03_manual_pin_priority_over_auto_and_ledger          (constraints )  1.48 ms
+[PASS] 04_superseding_date_correction                       (overrides   )  1.08 ms
+[PASS] 05_ignore_earlier_and_switch_from_x_to_y             (overrides   )  1.09 ms
+[PASS] 06_three_step_override_chain_a_b_c                   (overrides   )  1.20 ms
+[PASS] 07_false_positive_guard_casual_actually              (overrides   )  0.74 ms
+[PASS] 08_unrelated_topic_isolation                         (overrides   )  0.99 ms
+[PASS] 09_pytest_progressing_trajectory                     (trajectories)  1.36 ms
+[PASS] 10_pytest_oscillating_trajectory                     (trajectories)  1.19 ms
+[PASS] 11_pytest_stalled_and_raises_parametrized            (trajectories)  1.06 ms
+[PASS] 12_pytest_scoped_vs_unscoped_resolution              (trajectories)  1.14 ms
+[PASS] 13_vitest_and_jest_ansi_trajectories                 (trajectories)  1.66 ms
+[PASS] 14_go_test_and_generic_fallback_trajectories         (trajectories)  1.56 ms
+[PASS] 15_edit_thrash_hunk_revert_and_stalled_loop          (thrash      )  1.25 ms
+[PASS] 16_clean_edit_then_pass_no_false_thrash              (thrash      )  1.17 ms
+[PASS] 17_tight_budget_pins_survive_400_1200_6000           (budget      )  3.31 ms
+[PASS] 18_long_override_does_not_starve_negative_constraints (budget     )  3.69 ms
+[PASS] 19_hook_pre_compact_to_session_start_roundtrip       (hooks       )  2.49 ms
+[PASS] 20_hook_session_start_gating_and_fail_open           (hooks       )  0.87 ms
+[PASS] 21_long_brief_single_rule_override                   (overrides   )  3.12 ms
+[PASS] 22_contradictory_negative_constraint_override        (overrides   )  1.19 ms
+[PASS] 23_harness_feedback_filtering                        (constraints )  2.12 ms
+[PASS] 24_codex_code_mode_exec_trajectories_and_edits       (trajectories)  2.27 ms
 ------------------------------------------------------------------------
 Category breakdown:
   - constraints    4/4 passed
@@ -290,10 +321,10 @@ Category breakdown:
   - budget         2/2 passed
   - hooks          2/2 passed
 ------------------------------------------------------------------------
-Total: 24/24 passed (100.0%) in 30.2 ms
+Total: 24/24 passed (100.0%) in 48.5 ms
 ```
 
-See [evals/README.md](evals/README.md) for category details or run `uv run compact-ledger eval --format json` for machine-readable output.
+See [evals/README.md](https://github.com/1solomonwakhungu/compact-ledger/blob/main/evals/README.md) for category details or run `uv run compact-ledger eval --format json` for machine-readable output.
 
 ---
 
