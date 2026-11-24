@@ -8,7 +8,7 @@ from compact_ledger.pins import extract_pins
 from compact_ledger.renderer import DEFAULT_MAX_CHARS, render_snapshot
 from compact_ledger.store import SessionStore
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "DEFAULT_MAX_CHARS",
