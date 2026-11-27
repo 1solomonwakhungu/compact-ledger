@@ -20,6 +20,7 @@ import { TonalAccordion } from "@/components/tonal/accordion";
 import { KpiGrid } from "@/components/tonal/kpi-grid";
 import { CopyButton } from "@/components/copy-button";
 import { CompactionSimulator } from "@/components/compaction-simulator";
+import { BrandMark } from "@/components/brand-mark";
 import {
   BENCHMARK_KPIS,
   BENCHMARK_ROWS,
@@ -43,38 +44,6 @@ const NAV_LINKS = [
   { href: "#cli", label: "CLI" },
   { href: "#faq", label: "FAQ" },
 ] as const;
-
-function BrandMark() {
-  return (
-    <svg
-      viewBox="0 0 24 24"
-      aria-hidden="true"
-      className="h-6 w-6 shrink-0"
-    >
-      <rect
-        x="1"
-        y="1"
-        width="22"
-        height="22"
-        rx="7"
-        fill="var(--t-surface-muted)"
-        stroke="var(--t-border-subtle)"
-        strokeWidth="1"
-      />
-      <rect x="5" y="6" width="14" height="3" rx="1.5" fill="var(--t-blue)" />
-      <rect x="5" y="10.75" width="11" height="2.5" rx="1.25" fill="var(--t-ink)" />
-      <rect
-        x="5"
-        y="15.25"
-        width="7.5"
-        height="2.5"
-        rx="1.25"
-        fill="var(--t-ink-muted)"
-      />
-      <circle cx="17.25" cy="16.5" r="1.75" fill="var(--t-success)" />
-    </svg>
-  );
-}
 
 export function LandingPage() {
   const [theme, setTheme] = React.useState<"light" | "dark">("light");
@@ -121,7 +90,7 @@ export function LandingPage() {
               href="#"
               className="flex items-center gap-2.5 text-[16px] sm:text-[17px] font-medium tracking-[-0.02em] text-[var(--t-ink)] shrink-0 rounded-[8px] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[var(--t-blue)]"
             >
-              <BrandMark />
+              <BrandMark className="h-7 w-7 shrink-0" />
               <span>compact-ledger</span>
             </a>
 
