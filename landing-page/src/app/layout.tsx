@@ -1,7 +1,8 @@
 import type { Metadata } from "next";
+import { SITE_LINKS } from "@/lib/content";
 import "./globals.css";
 
-const SITE_URL = "https://compact-ledger.harlo.dev";
+const SITE_URL = SITE_LINKS.homepage;
 
 export const metadata: Metadata = {
   metadataBase: new URL(SITE_URL),

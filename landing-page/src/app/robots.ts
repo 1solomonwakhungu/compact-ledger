@@ -1,4 +1,5 @@
 import type { MetadataRoute } from "next";
+import { SITE_LINKS } from "@/lib/content";
 
 export default function robots(): MetadataRoute.Robots {
   return {
@@ -6,6 +7,6 @@ export default function robots(): MetadataRoute.Robots {
       userAgent: "*",
       allow: "/",
     },
-    sitemap: "https://compact-ledger.harlo.dev/sitemap.xml",
+    sitemap: `${SITE_LINKS.homepage}/sitemap.xml`,
   };
 }

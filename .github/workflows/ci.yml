@@ -38,6 +38,7 @@ jobs:
       - name: Build and verify isolated wheel install
         run: |
           uv build
+          python3 -c "import glob, tarfile; names = tarfile.open(glob.glob('dist/*.tar.gz')[0]).getnames(); assert not any('landing-page/' in n for n in names), names"
           uv venv /tmp/cl-smoke-venv
           uv pip install --python /tmp/cl-smoke-venv/bin/python --no-deps dist/*.whl
           /tmp/cl-smoke-venv/bin/compact-ledger --version
@@ -53,7 +54,7 @@ jobs:
         working-directory: landing-page
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: "22"
           cache: "npm"

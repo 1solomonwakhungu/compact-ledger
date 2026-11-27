@@ -668,7 +668,8 @@ export function LandingPage() {
                 --max-chars 400 → 400 chars
               </div>
               <div className="text-[12.5px] text-[var(--t-ink-secondary)] mt-1">
-                --max-chars 1200 emits 1,146 chars; never exceeds the cap
+                Bench fixture at --max-chars 1200 emits 1,146 chars (vs 1,161
+                chars on the README simulator above)
               </div>
             </div>
           </SurfaceTile>
@@ -829,7 +830,32 @@ export function LandingPage() {
           </div>
 
           <SurfaceTile tone="white" bordered padding="none" className="overflow-hidden">
-            <div className="overflow-x-auto">
+            {/* Mobile stacked cards (prevents mid-flag wrapping on narrow phones) */}
+            <div className="md:hidden divide-y divide-[var(--t-border-subtle)]">
+              {CLI_COMMANDS.map((row) => (
+                <div key={row.command} className="p-5 flex flex-col gap-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="font-mono font-semibold text-[13px] text-[var(--t-blue)]">
+                      compact-ledger {row.command}
+                    </div>
+                    <span className="inline-flex rounded-full bg-[var(--t-surface-muted)] px-2.5 py-0.5 font-mono text-[11px] text-[var(--t-ink-secondary)] whitespace-nowrap shrink-0">
+                      {row.exitBehavior}
+                    </span>
+                  </div>
+                  <div className="rounded-[10px] bg-[var(--t-surface)] border border-[var(--t-border-subtle)] px-3 py-1.5 overflow-x-auto">
+                    <code className="font-mono text-[11.5px] text-[var(--t-ink-muted)] whitespace-nowrap">
+                      {row.flags}
+                    </code>
+                  </div>
+                  <p className="text-[13px] text-[var(--t-ink-secondary)] leading-[1.55]">
+                    {row.description}
+                  </p>
+                </div>
+              ))}
+            </div>
+
+            {/* Desktop table */}
+            <div className="hidden md:block overflow-x-auto">
               <table className="w-full text-left border-collapse text-[13.5px]">
                 <thead>
                   <tr className="bg-[var(--t-surface)] border-b border-[var(--t-border-subtle)] text-[11.5px] uppercase tracking-wider text-[var(--t-ink-muted)]">
@@ -846,11 +872,11 @@ export function LandingPage() {
                       key={row.command}
                       className="hover:bg-[var(--t-surface)]/70 transition-colors"
                     >
-                      <td className="py-3.5 pl-6 pr-4 align-top whitespace-nowrap">
-                        <div className="font-mono font-semibold text-[13px] text-[var(--t-blue)]">
+                      <td className="py-3.5 pl-6 pr-4 align-top">
+                        <div className="font-mono font-semibold text-[13px] text-[var(--t-blue)] whitespace-nowrap">
                           compact-ledger {row.command}
                         </div>
-                        <div className="font-mono text-[11.5px] text-[var(--t-ink-muted)] mt-0.5 whitespace-normal max-w-xs">
+                        <div className="font-mono text-[11.5px] text-[var(--t-ink-muted)] mt-0.5 max-w-sm">
                           {row.flags}
                         </div>
                       </td>

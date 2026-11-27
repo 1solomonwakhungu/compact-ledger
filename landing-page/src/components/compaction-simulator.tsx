@@ -202,7 +202,10 @@ export function CompactionSimulator() {
               {preset.command}
             </span>
           </div>
-          <div className="flex items-center gap-2 shrink-0 text-[12.5px] font-mono tabular-nums">
+          <div
+            aria-live="polite"
+            className="flex items-center gap-2 shrink-0 text-[12.5px] font-mono tabular-nums"
+          >
             <TonalChip tone={actualChars <= preset.maxChars ? "mint" : "danger"}>
               {actualChars.toLocaleString()} / {preset.maxChars.toLocaleString()}{" "}
               chars (~{approxTokens} tokens)
@@ -213,11 +216,12 @@ export function CompactionSimulator() {
         {/* Budget fill bar */}
         <div
           className="h-2 w-full rounded-full bg-[var(--t-elevated)] border border-[var(--t-border-subtle)] overflow-hidden"
-          role="progressbar"
+          role="meter"
           aria-label="Character budget usage"
           aria-valuenow={actualChars}
           aria-valuemin={0}
           aria-valuemax={preset.maxChars}
+          aria-valuetext={`${actualChars.toLocaleString()} of ${preset.maxChars.toLocaleString()} characters (${fillPercent}%)`}
         >
           <div
             className="h-full rounded-full bg-[var(--t-blue)] transition-all duration-300 [transition-timing-function:var(--t-ease)]"
@@ -240,10 +244,11 @@ export function CompactionSimulator() {
                       ? "warning"
                       : "neutral"
                 }
-                className="text-[11px] px-2.5 py-0.5"
+                className="text-[11px] px-2.5 py-0.5 whitespace-nowrap"
               >
                 <span>{t.label.split(" · ")[0]}</span>
-                <span className="opacity-75">
+                <span aria-hidden="true">·</span>
+                <span>
                   {t.state === "full"
                     ? "kept"
                     : t.state === "partial"
@@ -278,50 +283,55 @@ export function CompactionSimulator() {
                   <span className="font-mono text-[15px]">/compact</span>
                 </h3>
                 <p className="text-[12.5px] text-[var(--t-ink-muted)]">
-                  Messy multi-turn transcript ·{" "}
+                  Illustrative turn trace ·{" "}
                   <span className="font-mono">billing-refactor</span>
                 </p>
               </div>
-              <TonalChip tone="neutral">Raw events</TonalChip>
+              <TonalChip tone="neutral" className="whitespace-nowrap shrink-0">
+                Raw events
+              </TonalChip>
             </div>
 
             <ol className="flex flex-col gap-2.5">
-              {BILLING_SESSION_EVENTS.map((ev) => (
-                <li
-                  key={ev.id}
-                  className={`rounded-[16px] bg-[var(--t-elevated)] border border-[var(--t-border-subtle)] p-3.5 flex flex-col gap-1.5 ${
-                    ev.disposition === "DROPPED" ||
-                    ev.disposition === "SUPERSEDED"
-                      ? "opacity-75"
-                      : ""
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-[11.5px] font-mono text-[var(--t-ink-muted)]">
-                      {ev.turn} · {ev.actor}
-                    </span>
-                    <TonalChip
-                      tone={ev.chipTone}
-                      className="text-[10.5px] px-2 py-0.5 font-mono"
-                    >
-                      {ev.disposition}
-                    </TonalChip>
-                  </div>
-                  <p
-                    className={`text-[13px] leading-[1.5] text-[var(--t-ink)] ${
-                      ev.disposition === "SUPERSEDED" ||
-                      ev.disposition === "DROPPED"
-                        ? "line-through decoration-[var(--t-ink-muted)]/60"
-                        : ""
+              {BILLING_SESSION_EVENTS.map((ev) => {
+                const isInactive =
+                  ev.disposition === "DROPPED" ||
+                  ev.disposition === "SUPERSEDED";
+                return (
+                  <li
+                    key={ev.id}
+                    className={`rounded-[16px] p-3.5 flex flex-col gap-1.5 border ${
+                      isInactive
+                        ? "bg-[var(--t-surface)] border-dashed border-[var(--t-border)]"
+                        : "bg-[var(--t-elevated)] border-[var(--t-border-subtle)]"
                     }`}
                   >
-                    {ev.text}
-                  </p>
-                  <p className="text-[11.5px] text-[var(--t-ink-muted)]">
-                    {ev.detail}
-                  </p>
-                </li>
-              ))}
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11.5px] font-mono text-[var(--t-ink-muted)]">
+                        {ev.turn} · {ev.actor}
+                      </span>
+                      <TonalChip
+                        tone={ev.chipTone}
+                        className="text-[10.5px] px-2 py-0.5 font-mono whitespace-nowrap shrink-0"
+                      >
+                        {ev.disposition}
+                      </TonalChip>
+                    </div>
+                    <p
+                      className={`text-[13px] leading-[1.5] ${
+                        isInactive
+                          ? "text-[var(--t-ink-secondary)] line-through decoration-[var(--t-ink-muted)]"
+                          : "text-[var(--t-ink)]"
+                      }`}
+                    >
+                      {ev.text}
+                    </p>
+                    <p className="text-[11.5px] text-[var(--t-ink-muted)]">
+                      {ev.detail}
+                    </p>
+                  </li>
+                );
+              })}
             </ol>
           </SurfaceTile>
         )}
@@ -351,10 +361,7 @@ export function CompactionSimulator() {
               <CopyButton text={preset.markdown} label="Copy ledger" compact />
             </div>
 
-            <div
-              aria-live="polite"
-              className="rounded-[16px] bg-[var(--t-surface)] border border-[var(--t-border-subtle)] p-4 sm:p-5 overflow-x-auto font-mono text-[12.5px] leading-[1.65]"
-            >
+            <div className="rounded-[16px] bg-[var(--t-surface)] border border-[var(--t-border-subtle)] p-4 sm:p-5 overflow-x-auto font-mono text-[12.5px] leading-[1.65]">
               {preset.markdown
                 .split("\n")
                 .map((line, idx) => renderLedgerLine(line, idx))}
@@ -380,8 +387,8 @@ export function CompactionSimulator() {
                 <span className="font-medium text-[var(--t-ink)] block">
                   Strict cap guarantee
                 </span>
-                Preamble drops first, then Tier 4 → Tier 3 → Tier 2. Tier 1
-                always wins.
+                Preamble and resolved tests drop first, then Tier 4 → Tier 3 →
+                Tier 2; at 400 chars even Tier 1 stays &lt;= max-chars.
               </div>
             </div>
           </SurfaceTile>

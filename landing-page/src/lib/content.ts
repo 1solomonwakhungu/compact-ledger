@@ -148,13 +148,22 @@ export const BILLING_SESSION_EVENTS: SessionEvent[] = [
     detail: "Harness-written feedback excluded from user rules",
   },
   {
-    id: "test-trajectories",
+    id: "test-proration",
     turn: "Turns 3–8",
     actor: "Test Runner",
-    text: "test_proration: 400 -> 200 -> 150 (expected 100); test_tax_cap: 400 -> 200 -> 400 (expected 100)",
-    disposition: "OSCILLATING",
+    text: "tests/test_billing.py::test_proration: 400 -> 200 -> 150 (expected 100)",
+    disposition: "PROGRESSING",
     chipTone: "warning",
-    detail: "Tier 3 · Exact observed values preserved oldest first",
+    detail: "Tier 3 · Moving toward expected value; observed values listed oldest first",
+  },
+  {
+    id: "test-tax-cap",
+    turn: "Turns 3–8",
+    actor: "Test Runner",
+    text: "tests/test_billing.py::test_tax_cap: 400 -> 200 -> 400 (expected 100)",
+    disposition: "OSCILLATING",
+    chipTone: "danger",
+    detail: "Tier 3 · Looping back to a previously observed failure value",
   },
   {
     id: "edit-thrash",
@@ -316,7 +325,7 @@ export const PRIORITY_TIERS: TierCard[] = [
     highlights: [
       "Filters conversational chatter (“ok sounds good”, “thanks!”) and questions",
       "Drops harness-authored blocks (Stop hook feedback:, <system-reminder>, Codex wrappers)",
-      "Re-indexes reactivated constraints deterministically after compaction",
+      "Reactivates retired constraints automatically when a later override is retracted",
     ],
   },
   {
@@ -382,8 +391,8 @@ compact-ledger snapshot --transcript ~/.codex/sessions/.../rollout-*.jsonl
 # Render the strictly bounded ledger for handoff or resume
 compact-ledger inject --session-id <session-id>
 
-# Pin a critical constraint manually (--session-id optional inside Claude Code)
-compact-ledger pin "Never push to main" --negative --tag git`;
+# Pin a critical constraint manually for the session
+compact-ledger pin "Never push to main" --negative --tag git --session-id <session-id>`;
 
 export const BENCHMARK_KPIS: KpiMetric[] = [
   {
