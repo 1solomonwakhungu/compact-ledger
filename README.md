@@ -1,3 +1,9 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/compact-ledger-logo-dark-256.png" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/brand/compact-ledger-logo-256.png" />
+  <img alt="compact-ledger" src="docs/brand/compact-ledger-logo-256.png" width="72" height="72" />
+</picture>
+
 # compact-ledger
 
 **Deterministic `PreCompact` + `SessionStart` memory injector for AI coding agents.**

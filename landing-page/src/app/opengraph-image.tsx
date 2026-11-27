@@ -38,38 +38,25 @@ export default function OpenGraphImage() {
                 width: 40,
                 height: 40,
                 borderRadius: 12,
-                background: "#202124",
+                background: "#131314",
+                border: "1px solid rgba(255, 255, 255, 0.1)",
                 display: "flex",
-                flexDirection: "column",
+                alignItems: "center",
                 justifyContent: "center",
-                gap: 4,
-                padding: "0 9px",
               }}
             >
-              <div
-                style={{
-                  width: 22,
-                  height: 4,
-                  borderRadius: 2,
-                  background: "#8AB4F8",
-                }}
-              />
-              <div
-                style={{
-                  width: 16,
-                  height: 3.5,
-                  borderRadius: 2,
-                  background: "#FFFFFF",
-                }}
-              />
-              <div
-                style={{
-                  width: 11,
-                  height: 3.5,
-                  borderRadius: 2,
-                  background: "#9AA0A6",
-                }}
-              />
+              <svg
+                width="28"
+                height="28"
+                viewBox="0 0 32 32"
+                fill="none"
+              >
+                <rect x="8" y="5" width="16" height="4" rx="2" fill="#8AB4F8" />
+                <path
+                  d="M8 13.5A1.5 1.5 0 0 1 9.5 12H22.5A1.5 1.5 0 0 1 24 13.5V25C24 26.2 22.65 26.92 21.66 26.22L16.88 22.85C16.35 22.48 15.65 22.48 15.12 22.85L10.34 26.22C9.35 26.92 8 26.2 8 25V13.5Z"
+                  fill="#E3E3E3"
+                />
+              </svg>
             </div>
             <span
               style={{
