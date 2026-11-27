@@ -45,3 +45,21 @@ jobs:
           /tmp/cl-smoke-venv/bin/compact-ledger pin --store-dir /tmp/cl-smoke-store --session-id ci-smoke "Never push to main" --negative
           /tmp/cl-smoke-venv/bin/compact-ledger inject --store-dir /tmp/cl-smoke-store --session-id ci-smoke
           /tmp/cl-smoke-venv/bin/compact-ledger clear --store-dir /tmp/cl-smoke-store --session-id ci-smoke
+
+  landing-page:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: landing-page
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: landing-page/package-lock.json
+      - name: Install, typecheck, and build landing page
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build

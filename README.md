@@ -2,6 +2,8 @@
 
 **Deterministic `PreCompact` + `SessionStart` memory injector for AI coding agents.**
 
+Website: [compact-ledger.harlo.dev](https://compact-ledger.harlo.dev)
+
 Long coding sessions hit context compaction right when precision matters most. Lossy summaries routinely drop or blur verbatim user rules, forget mid-session corrections (*"actually use July 31, not June 30"*), and erase the exact assertion values observed across failed test runs — causing the post-compaction agent to break constraints or repeat dead-end edits.
 
 `compact-ledger` parses the session transcript right before compaction and re-injects a short, strictly budgeted ledger on resume:

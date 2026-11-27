@@ -25,7 +25,7 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/1solomonwakhungu/compact-ledger"
+Homepage = "https://compact-ledger.harlo.dev"
 Repository = "https://github.com/1solomonwakhungu/compact-ledger"
 Issues = "https://github.com/1solomonwakhungu/compact-ledger/issues"
 
@@ -40,6 +40,9 @@ dev = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/compact_ledger"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["landing-page", "docs/launch.md", "PLAN.md", "AGENTS.md", ".github"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
