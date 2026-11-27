@@ -257,7 +257,7 @@ All session commands accept `--store-dir <dir>` (or `COMPACT_LEDGER_DIR`). For `
 
 ---
 
-## Benchmarks & Evaluation Suite
+## Benchmarks
 
 ### Measured Performance & Footprint
 
@@ -286,53 +286,6 @@ Reproduce locally:
 uv run python evals/bench.py        # human-readable table
 uv run python evals/bench.py --json # machine-readable JSON
 ```
-
-### Evaluation Suite (24 Seeded Cases)
-
-`compact-ledger` ships with 24 realistic multi-turn evaluation cases covering Claude Code, Codex (including code-mode `exec` / `apply_patch` rollouts), and generic JSONL transcripts, long multi-rule briefs, contradictory negative-constraint overrides, override chains, harness-feedback & false-positive guards, `pytest`/`vitest`/`jest`/`go test`/generic trajectories, edit-thrash detection, strict budget truncation, and full hook round-trips.
-
-Run it anywhere with `compact-ledger eval` (or `uv run compact-ledger eval`):
-
-```text
-compact-ledger eval (24 seeded cases)
-------------------------------------------------------------------------
-[PASS] 01_negative_constraints_claude_code                  (constraints )  1.63 ms
-[PASS] 02_codex_transcript_constraints_and_edits            (constraints )  0.97 ms
-[PASS] 03_manual_pin_priority_over_auto_and_ledger          (constraints )  1.48 ms
-[PASS] 04_superseding_date_correction                       (overrides   )  1.08 ms
-[PASS] 05_ignore_earlier_and_switch_from_x_to_y             (overrides   )  1.09 ms
-[PASS] 06_three_step_override_chain_a_b_c                   (overrides   )  1.20 ms
-[PASS] 07_false_positive_guard_casual_actually              (overrides   )  0.74 ms
-[PASS] 08_unrelated_topic_isolation                         (overrides   )  0.99 ms
-[PASS] 09_pytest_progressing_trajectory                     (trajectories)  1.36 ms
-[PASS] 10_pytest_oscillating_trajectory                     (trajectories)  1.19 ms
-[PASS] 11_pytest_stalled_and_raises_parametrized            (trajectories)  1.06 ms
-[PASS] 12_pytest_scoped_vs_unscoped_resolution              (trajectories)  1.14 ms
-[PASS] 13_vitest_and_jest_ansi_trajectories                 (trajectories)  1.66 ms
-[PASS] 14_go_test_and_generic_fallback_trajectories         (trajectories)  1.56 ms
-[PASS] 15_edit_thrash_hunk_revert_and_stalled_loop          (thrash      )  1.25 ms
-[PASS] 16_clean_edit_then_pass_no_false_thrash              (thrash      )  1.17 ms
-[PASS] 17_tight_budget_pins_survive_400_1200_6000           (budget      )  3.31 ms
-[PASS] 18_long_override_does_not_starve_negative_constraints (budget     )  3.69 ms
-[PASS] 19_hook_pre_compact_to_session_start_roundtrip       (hooks       )  2.49 ms
-[PASS] 20_hook_session_start_gating_and_fail_open           (hooks       )  0.87 ms
-[PASS] 21_long_brief_single_rule_override                   (overrides   )  3.12 ms
-[PASS] 22_contradictory_negative_constraint_override        (overrides   )  1.19 ms
-[PASS] 23_harness_feedback_filtering                        (constraints )  2.12 ms
-[PASS] 24_codex_code_mode_exec_trajectories_and_edits       (trajectories)  2.27 ms
-------------------------------------------------------------------------
-Category breakdown:
-  - constraints    4/4 passed
-  - overrides      7/7 passed
-  - trajectories   7/7 passed
-  - thrash         2/2 passed
-  - budget         2/2 passed
-  - hooks          2/2 passed
-------------------------------------------------------------------------
-Total: 24/24 passed (100.0%) in 48.5 ms
-```
-
-See [evals/README.md](https://github.com/1solomonwakhungu/compact-ledger/blob/main/evals/README.md) for category details or run `uv run compact-ledger eval --format json` for machine-readable output.
 
 ---
 
